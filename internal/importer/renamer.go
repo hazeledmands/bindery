@@ -138,6 +138,95 @@ func MoveDir(src, dst string) error {
 	return os.RemoveAll(src)
 }
 
+// CopyFile copies src to dst without removing the source. It is the "copy"
+// import mode counterpart to MoveFile. The source is left intact so that
+// torrent clients continue seeding from the original download location.
+func CopyFile(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
+		return fmt.Errorf("create dir: %w", err)
+	}
+	return copyFile(src, dst)
+}
+
+// HardlinkFile creates a hard link at dst pointing to the same inode as src.
+// Both paths must be on the same filesystem — if they are not, os.Link returns
+// an error and no fallback is attempted (silently falling back to a move would
+// break seeding, which is the whole point of choosing hardlink mode).
+func HardlinkFile(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
+		return fmt.Errorf("create dir: %w", err)
+	}
+	if err := os.Link(src, dst); err != nil {
+		return fmt.Errorf("hardlink %q → %q: %w (download dir and library must be on the same filesystem)", src, dst, err)
+	}
+	return nil
+}
+
+// CopyDir copies a directory tree from src to dst without removing the source.
+// Used by "copy" import mode for audiobook folders so the download client can
+// continue seeding from the original location.
+func CopyDir(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return fmt.Errorf("stat source dir: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("source is not a directory: %s", src)
+	}
+	if _, err := os.Stat(dst); err == nil {
+		return fmt.Errorf("destination already exists: %s", dst)
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
+		return fmt.Errorf("create parent dir: %w", err)
+	}
+	if err := copyDir(src, dst); err != nil {
+		_ = os.RemoveAll(dst)
+		return fmt.Errorf("copy dir: %w", err)
+	}
+	return nil
+}
+
+// HardlinkDir mirrors a directory tree from src into dst by hard-linking every
+// regular file. Directory entries are created normally. Both trees must be on
+// the same filesystem — no fallback is attempted on cross-filesystem failure.
+func HardlinkDir(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return fmt.Errorf("stat source dir: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("source is not a directory: %s", src)
+	}
+	if _, err := os.Stat(dst); err == nil {
+		return fmt.Errorf("destination already exists: %s", dst)
+	}
+	if err := os.MkdirAll(dst, 0o750); err != nil {
+		return fmt.Errorf("create dest dir: %w", err)
+	}
+	err = filepath.Walk(src, func(path string, fi os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, rerr := filepath.Rel(src, path)
+		if rerr != nil {
+			return rerr
+		}
+		target := filepath.Join(dst, rel)
+		if fi.IsDir() {
+			return os.MkdirAll(target, fi.Mode())
+		}
+		if err := os.Link(path, target); err != nil {
+			return fmt.Errorf("hardlink %q → %q: %w (download dir and library must be on the same filesystem)", path, target, err)
+		}
+		return nil
+	})
+	if err != nil {
+		_ = os.RemoveAll(dst)
+		return err
+	}
+	return nil
+}
+
 // copyDir recursively copies srcDir contents into dstDir, preserving the
 // internal layout. dstDir will be created (including parents).
 func copyDir(srcDir, dstDir string) error {
