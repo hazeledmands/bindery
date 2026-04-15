@@ -204,3 +204,64 @@ func TestValidateOutboundURL_PublicAllowed(t *testing.T) {
 		t.Errorf("unexpected block for public IP: %v", err)
 	}
 }
+
+// TestValidateOutboundURL_Exported exercises the public entrypoint, which in
+// turn drives the live netResolver. "localhost" is resolved from the local
+// hosts file on every supported platform, so this runs without network access.
+func TestValidateOutboundURL_Exported(t *testing.T) {
+	// Live resolver should resolve "localhost" to 127.0.0.1 / ::1 and the
+	// loopback check should reject it under both policies.
+	if err := ValidateOutboundURL("http://localhost/", PolicyStrict); err == nil {
+		t.Error("expected block for localhost under strict")
+	}
+	if err := ValidateOutboundURL("http://localhost/", PolicyLAN); err == nil {
+		t.Error("expected block for localhost under LAN")
+	}
+}
+
+func TestValidateOutboundURL_BadURL(t *testing.T) {
+	// url.Parse rejects control chars in the URL.
+	if err := ValidateOutboundURL("http://example.com/\x7f", PolicyStrict); err == nil {
+		t.Error("expected error for malformed URL")
+	}
+	// Missing host.
+	if err := ValidateOutboundURL("http:///path", PolicyStrict); err == nil {
+		t.Error("expected error for URL without host")
+	}
+}
+
+func TestValidateOutboundURL_DNSFailure(t *testing.T) {
+	// An unreachable/nonexistent hostname must be rejected (fail-closed).
+	r := fakeResolver{m: map[string][]net.IP{}}
+	if err := validate("http://nope.invalid/", PolicyStrict, r); err == nil {
+		t.Error("expected DNS failure to reject the URL")
+	}
+}
+
+func TestPolicyFromEnv(t *testing.T) {
+	const key = "BINDERY_TEST_SSRF_POLICY"
+
+	// Unset → default preserved.
+	t.Setenv(key, "")
+	if got := PolicyFromEnv(PolicyStrict, key); got != PolicyStrict {
+		t.Errorf("unset: want PolicyStrict, got %v", got)
+	}
+
+	// "1" → LAN.
+	t.Setenv(key, "1")
+	if got := PolicyFromEnv(PolicyStrict, key); got != PolicyLAN {
+		t.Errorf("'1': want PolicyLAN, got %v", got)
+	}
+
+	// "true" (case-insensitive) → LAN.
+	t.Setenv(key, "TRUE")
+	if got := PolicyFromEnv(PolicyStrict, key); got != PolicyLAN {
+		t.Errorf("'TRUE': want PolicyLAN, got %v", got)
+	}
+
+	// Any other value → default.
+	t.Setenv(key, "maybe")
+	if got := PolicyFromEnv(PolicyStrict, key); got != PolicyStrict {
+		t.Errorf("'maybe': want PolicyStrict, got %v", got)
+	}
+}

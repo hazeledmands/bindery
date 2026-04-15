@@ -219,6 +219,52 @@ func TestTest_Failure(t *testing.T) {
 	}
 }
 
+func TestNew_DefaultValidator(t *testing.T) {
+	// New() wires in the production SSRF validator (strict policy). Confirm
+	// that a loopback URL is rejected, proving the validator is plumbed.
+	n := New(nil)
+	if n == nil {
+		t.Fatal("New returned nil")
+	}
+	if n.validate == nil {
+		t.Fatal("New did not install a validator")
+	}
+	if err := n.validate("http://127.0.0.1/hook"); err == nil {
+		t.Error("default validator should reject loopback")
+	}
+}
+
+func TestSetValidator_Override(t *testing.T) {
+	n := New(nil)
+	called := 0
+	n.SetValidator(func(string) error {
+		called++
+		return nil
+	})
+	// send() with a no-op validator should now accept loopback.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	notif := &models.Notification{URL: srv.URL}
+	if err := n.send(context.Background(), notif, map[string]interface{}{}); err != nil {
+		t.Fatalf("send with override: %v", err)
+	}
+	if called != 1 {
+		t.Errorf("overridden validator calls: want 1, got %d", called)
+	}
+}
+
+func TestSend_ValidatorRejects(t *testing.T) {
+	// send() must return the validator's error without making an HTTP call.
+	n := New(nil)
+	// Point at a public URL so only the validator rejection path fires.
+	notif := &models.Notification{URL: "http://10.0.0.1/hook"} // RFC1918 → strict rejects
+	if err := n.send(context.Background(), notif, map[string]interface{}{}); err == nil {
+		t.Fatal("expected validator to reject RFC1918 under strict policy")
+	}
+}
+
 func TestUserAgentHeader(t *testing.T) {
 	var gotUA string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
