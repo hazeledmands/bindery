@@ -7,6 +7,8 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/vavallee/bindery/internal/db"
@@ -108,6 +110,29 @@ func TestMigrate_ImportReadarr_BadMultipart(t *testing.T) {
 	h.ImportReadarr(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("non-multipart: expected 400, got %d", rec.Code)
+	}
+}
+
+func TestUploadTempDir_NoEnv(t *testing.T) {
+	t.Setenv("BINDERY_DB_PATH", "")
+	if got := uploadTempDir(); got != "" {
+		t.Errorf("no env: want empty, got %q", got)
+	}
+}
+
+func TestUploadTempDir_CreatesDirNextToDB(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "bindery.db")
+	t.Setenv("BINDERY_DB_PATH", dbPath)
+
+	got := uploadTempDir()
+	want := filepath.Join(root, "tmp")
+	if got != want {
+		t.Errorf("path: want %q, got %q", want, got)
+	}
+	// Must exist (MkdirAll).
+	if st, err := os.Stat(got); err != nil || !st.IsDir() {
+		t.Errorf("expected dir at %q (err=%v)", got, err)
 	}
 }
 
