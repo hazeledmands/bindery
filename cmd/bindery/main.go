@@ -169,7 +169,8 @@ func main() {
 	indexerHandler := api.NewIndexerHandler(indexerRepo, bookRepo, authorRepo, idxSearcher, settingsRepo, blocklistRepo)
 	dlClientHandler := api.NewDownloadClientHandler(dlClientRepo)
 	queueHandler := api.NewQueueHandler(downloadRepo, dlClientRepo, bookRepo, historyRepo)
-	libraryHandler := api.NewLibraryHandler(importScanner)
+	importScanner.WithSettings(settingsRepo)
+	libraryHandler := api.NewLibraryHandler(importScanner).WithSettings(settingsRepo)
 	fileHandler := api.NewFileHandler(bookRepo)
 	historyHandler := api.NewHistoryHandler(historyRepo, blocklistRepo)
 	blocklistHandler := api.NewBlocklistHandler(blocklistRepo)
@@ -358,6 +359,7 @@ func main() {
 
 		// Library
 		r.Post("/library/scan", libraryHandler.Scan)
+		r.Get("/library/scan/status", libraryHandler.ScanStatus)
 
 		// Calibre integration — settings live under /setting/calibre.*,
 		// this endpoint just validates + probes the configured install.
