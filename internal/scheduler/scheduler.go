@@ -280,6 +280,9 @@ func (s *Scheduler) searchWanted() {
 	}
 
 	for _, book := range wanted {
+		if book.Excluded {
+			continue
+		}
 		s.SearchAndGrabBook(ctx, book)
 	}
 }
