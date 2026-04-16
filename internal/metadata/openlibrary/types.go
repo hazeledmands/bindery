@@ -123,10 +123,10 @@ type subjectBooksResponse struct {
 // subjectWork is a single work entry inside subjectBooksResponse.
 // Note: the subjects API uses "cover_id" (not "cover_i" like the search API).
 type subjectWork struct {
-	Key     string `json:"key"`   // "/works/OL123W"
+	Key     string `json:"key"` // "/works/OL123W"
 	Title   string `json:"title"`
 	Authors []struct {
-		Key  string `json:"key"`  // "/authors/OL123A"
+		Key  string `json:"key"` // "/authors/OL123A"
 		Name string `json:"name"`
 	} `json:"authors"`
 	CoverID          *int     `json:"cover_id"`
