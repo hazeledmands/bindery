@@ -20,18 +20,19 @@ func NewDownloadClientRepo(db *sql.DB) *DownloadClientRepo {
 }
 
 // populateVirtualCredentials maps the storage columns to the virtual Username/Password
-// fields for qBittorrent clients (which store credentials in url_base and api_key).
+// fields for clients that store credentials in url_base and api_key (qBittorrent,
+// Transmission).
 func populateVirtualCredentials(c *models.DownloadClient) {
-	if c.Type == "qbittorrent" {
+	if c.Type == "qbittorrent" || c.Type == "transmission" {
 		c.Username = c.URLBase
 		c.Password = c.APIKey
 	}
 }
 
 // applyVirtualCredentials maps the virtual Username/Password fields back to the
-// storage columns for qBittorrent clients before writing to the database.
+// storage columns for credential-based clients before writing to the database.
 func applyVirtualCredentials(c *models.DownloadClient) {
-	if c.Type == "qbittorrent" {
+	if c.Type == "qbittorrent" || c.Type == "transmission" {
 		c.URLBase = c.Username
 		c.APIKey = c.Password
 	}
@@ -103,21 +104,26 @@ func (r *DownloadClientRepo) GetFirstEnabled(ctx context.Context) (*models.Downl
 }
 
 // GetFirstEnabledByProtocol returns the highest-priority enabled client that
-// matches the given protocol ("usenet" → sabnzbd, "torrent" → qbittorrent).
-// Returns (nil, nil) if no matching client is configured.
+// matches the given protocol ("usenet" -> sabnzbd, "torrent" -> qbittorrent or
+// transmission). Returns (nil, nil) if no matching client is configured.
 func (r *DownloadClientRepo) GetFirstEnabledByProtocol(ctx context.Context, protocol string) (*models.DownloadClient, error) {
-	clientType := "sabnzbd"
-	if protocol == "torrent" {
-		clientType = "qbittorrent"
-	}
-
 	var c models.DownloadClient
 	var enabled, useSSL int
-	err := r.db.QueryRowContext(ctx, `
-		SELECT id, name, type, host, port, api_key, use_ssl, url_base, category, priority, enabled, created_at, updated_at
-		FROM download_clients WHERE enabled=1 AND type=? ORDER BY priority LIMIT 1`, clientType).
-		Scan(&c.ID, &c.Name, &c.Type, &c.Host, &c.Port, &c.APIKey,
-			&useSSL, &c.URLBase, &c.Category, &c.Priority, &enabled, &c.CreatedAt, &c.UpdatedAt)
+	var err error
+
+	if protocol == "torrent" {
+		err = r.db.QueryRowContext(ctx, `
+			SELECT id, name, type, host, port, api_key, use_ssl, url_base, category, priority, enabled, created_at, updated_at
+			FROM download_clients WHERE enabled=1 AND type IN ('qbittorrent','transmission') ORDER BY priority LIMIT 1`).
+			Scan(&c.ID, &c.Name, &c.Type, &c.Host, &c.Port, &c.APIKey,
+				&useSSL, &c.URLBase, &c.Category, &c.Priority, &enabled, &c.CreatedAt, &c.UpdatedAt)
+	} else {
+		err = r.db.QueryRowContext(ctx, `
+			SELECT id, name, type, host, port, api_key, use_ssl, url_base, category, priority, enabled, created_at, updated_at
+			FROM download_clients WHERE enabled=1 AND type=? ORDER BY priority LIMIT 1`, "sabnzbd").
+			Scan(&c.ID, &c.Name, &c.Type, &c.Host, &c.Port, &c.APIKey,
+				&useSSL, &c.URLBase, &c.Category, &c.Priority, &enabled, &c.CreatedAt, &c.UpdatedAt)
+	}
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
@@ -134,13 +140,17 @@ func (r *DownloadClientRepo) GetFirstEnabledByProtocol(ctx context.Context, prot
 // ordered by priority. Used when multiple clients of the same type exist and
 // the caller needs to pick the best one by category.
 func (r *DownloadClientRepo) GetEnabledByProtocol(ctx context.Context, protocol string) ([]models.DownloadClient, error) {
-	clientType := "sabnzbd"
+	var rows *sql.Rows
+	var err error
 	if protocol == "torrent" {
-		clientType = "qbittorrent"
+		rows, err = r.db.QueryContext(ctx, `
+			SELECT id, name, type, host, port, api_key, use_ssl, url_base, category, priority, enabled, created_at, updated_at
+			FROM download_clients WHERE enabled=1 AND type IN ('qbittorrent','transmission') ORDER BY priority`)
+	} else {
+		rows, err = r.db.QueryContext(ctx, `
+			SELECT id, name, type, host, port, api_key, use_ssl, url_base, category, priority, enabled, created_at, updated_at
+			FROM download_clients WHERE enabled=1 AND type=? ORDER BY priority`, "sabnzbd")
 	}
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, name, type, host, port, api_key, use_ssl, url_base, category, priority, enabled, created_at, updated_at
-		FROM download_clients WHERE enabled=1 AND type=? ORDER BY priority`, clientType)
 	if err != nil {
 		return nil, err
 	}

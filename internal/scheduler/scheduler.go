@@ -12,6 +12,7 @@ import (
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/downloader/qbittorrent"
 	"github.com/vavallee/bindery/internal/downloader/sabnzbd"
+	"github.com/vavallee/bindery/internal/downloader/transmission"
 	"github.com/vavallee/bindery/internal/importer"
 	"github.com/vavallee/bindery/internal/indexer"
 	"github.com/vavallee/bindery/internal/indexer/newznab"
@@ -233,14 +234,21 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 	}
 
 	if best.Protocol == "torrent" {
-		qbt := qbittorrent.New(client.Host, client.Port, client.URLBase, client.APIKey, client.UseSSL)
-		if err := qbt.AddTorrent(ctx, best.NZBURL, client.Category, ""); err != nil {
-			slog.Error("SearchAndGrabBook: failed to send to qBittorrent", "title", best.Title, "error", err)
-			s.downloads.SetError(ctx, dl.ID, err.Error())
+		var addErr error
+		if client.Type == "transmission" {
+			tr := transmission.New(client.Host, client.Port, client.Username, client.Password, client.UseSSL)
+			addErr = tr.AddTorrent(ctx, best.NZBURL, client.Category, "")
+		} else {
+			qbt := qbittorrent.New(client.Host, client.Port, client.Username, client.Password, client.UseSSL)
+			addErr = qbt.AddTorrent(ctx, best.NZBURL, client.Category, "")
+		}
+		if addErr != nil {
+			slog.Error("SearchAndGrabBook: failed to send to torrent client", "title", best.Title, "client", client.Type, "error", addErr)
+			s.downloads.SetError(ctx, dl.ID, addErr.Error())
 			return
 		}
 		s.downloads.UpdateStatus(ctx, dl.ID, models.DownloadStatusDownloading)
-		slog.Info("sent to qBittorrent", "title", best.Title)
+		slog.Info("sent to torrent client", "title", best.Title, "client", client.Type)
 	} else {
 		sab := sabnzbd.New(client.Host, client.Port, client.APIKey, client.UseSSL)
 		resp, err := sab.AddURL(ctx, best.NZBURL, best.Title, client.Category, 0)

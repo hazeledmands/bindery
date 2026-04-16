@@ -3,17 +3,17 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
 
 	"github.com/go-chi/chi/v5"
 
-	"fmt"
-
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/downloader/qbittorrent"
 	"github.com/vavallee/bindery/internal/downloader/sabnzbd"
+	"github.com/vavallee/bindery/internal/downloader/transmission"
 	"github.com/vavallee/bindery/internal/indexer"
 	"github.com/vavallee/bindery/internal/models"
 )
@@ -130,17 +130,24 @@ func (h *QueueHandler) Grab(w http.ResponseWriter, r *http.Request) {
 
 	// Dispatch to the appropriate download client
 	if req.Protocol == "torrent" {
-		qbt := qbittorrent.New(client.Host, client.Port, client.URLBase, client.APIKey, client.UseSSL)
-		if err := qbt.AddTorrent(r.Context(), req.NZBURL, client.Category, ""); err != nil {
-			slog.Error("failed to send to qBittorrent", "error", err, "title", req.Title)
-			h.downloads.SetError(r.Context(), dl.ID, err.Error())
-			h.recordHistory(r.Context(), models.HistoryEventDownloadFailed, req.Title, req.BookID, map[string]interface{}{"guid": req.GUID, "message": err.Error()})
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to send to qBittorrent: " + err.Error()})
+		var addErr error
+		if client.Type == "transmission" {
+			tr := transmission.New(client.Host, client.Port, client.Username, client.Password, client.UseSSL)
+			addErr = tr.AddTorrent(r.Context(), req.NZBURL, client.Category, "")
+		} else {
+			qbt := qbittorrent.New(client.Host, client.Port, client.Username, client.Password, client.UseSSL)
+			addErr = qbt.AddTorrent(r.Context(), req.NZBURL, client.Category, "")
+		}
+		if addErr != nil {
+			slog.Error("failed to send to torrent client", "error", addErr, "title", req.Title, "client", client.Type)
+			h.downloads.SetError(r.Context(), dl.ID, addErr.Error())
+			h.recordHistory(r.Context(), models.HistoryEventDownloadFailed, req.Title, req.BookID, map[string]interface{}{"guid": req.GUID, "message": addErr.Error()})
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to send to " + client.Type + ": " + addErr.Error()})
 			return
 		}
 		h.downloads.UpdateStatus(r.Context(), dl.ID, models.DownloadStatusDownloading)
 		dl.Status = models.DownloadStatusDownloading
-		slog.Info("download sent to qBittorrent", "title", req.Title)
+		slog.Info("download sent to torrent client", "title", req.Title, "client", client.Type)
 	} else {
 		sab := sabnzbd.New(client.Host, client.Port, client.APIKey, client.UseSSL)
 		resp, err := sab.AddURL(r.Context(), req.NZBURL, req.Title, client.Category, 0)
@@ -219,8 +226,8 @@ func (h *QueueHandler) Delete(w http.ResponseWriter, r *http.Request) {
 
 	// Remove from the appropriate download client
 	if target.Protocol == "torrent" {
-		// qBittorrent: we don't store a per-download torrent hash yet, so just
-		// remove the local record. Future work: store hash in Download and call qbt.DeleteTorrent.
+		// Torrent clients: we don't store a per-download torrent hash yet, so just
+		// remove the local record. Future work: store hash in Download and call DeleteTorrent.
 	} else if target.SABnzbdNzoID != nil {
 		client, err := h.clients.GetFirstEnabledByProtocol(r.Context(), "usenet")
 		if err == nil && client != nil {
