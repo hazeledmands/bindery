@@ -8,6 +8,29 @@ All notable changes to Bindery are documented here. Format loosely follows
 
 The `development` branch carries the in-flight feature set for the next release. Images are published as `ghcr.io/vavallee/bindery:development` and `:dev-<sha>`; point ArgoCD at the `development` branch to follow. Treat these features as beta — schema migrations are additive and safe, but UX may still shift before tagging.
 
+## [v0.18.0] — 2026-04-17
+
+Calibre plugin integration mode, decision engine, pending releases, and state machine for downloads.
+
+### Added
+
+- **Calibre plugin integration mode** ([#212](https://github.com/vavallee/bindery/pull/212)) — new `plugin` mode alongside `calibredb`. When selected, Bindery POSTs imported file paths to the Bindery Bridge Calibre plugin over HTTP instead of shelling out to `calibredb`. Allows Calibre to run in a separate pod/container from Bindery without requiring a shared binary or library volume. Configure via Settings → Calibre → Mode: Plugin, with Plugin URL and API Key fields.
+- **Release decision engine** ([#218](https://github.com/vavallee/bindery/pull/218)) — specification-pattern engine evaluates candidate releases against per-profile rules before grabbing, replacing ad-hoc inline checks.
+- **Pending releases table** ([#219](https://github.com/vavallee/bindery/pull/219)) — delay-held results are tracked in a dedicated pending table with UI, replacing the previous silent-drop behaviour.
+- **Prowlarr native indexer sync** ([#215](https://github.com/vavallee/bindery/pull/215)) — Bindery can now sync indexer configurations directly from a Prowlarr instance.
+- **Add book by title or ISBN** ([#216](https://github.com/vavallee/bindery/pull/216)) — search bar accepts ISBNs and free-text titles in addition to author queries.
+- **qBittorrent hash retry** ([#209](https://github.com/vavallee/bindery/pull/209)) — retries hash lookup for 10 s after torrent URL add, fixing race where hash was not yet visible after `.torrent` fetch.
+
+### Changed
+
+- **Download state machine** ([#217](https://github.com/vavallee/bindery/pull/217)) — formalises download lifecycle states; replaces ad-hoc string constants with typed enum.
+- **Calibre settings tab** ([#220](https://github.com/vavallee/bindery/pull/220)) — shared `library_path` field hoisted to top of Calibre tab for clarity.
+
+### Upgrade notes
+
+- **No breaking schema migrations** — additive only. Safe drop-in replacement.
+- **Calibre plugin mode** requires the [Bindery Bridge Calibre plugin](https://github.com/vavallee/bindery-plugins) installed in your Calibre instance.
+
 ## [v0.17.0] — 2026-04-17
 
 Drop-folder Calibre mode removed, OpenLibrary series schema fixed, and a batch of UX and deployment polish.
