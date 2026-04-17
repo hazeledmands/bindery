@@ -285,7 +285,7 @@ func TestCheckStalledDownloads_OldEnough_ReachesClientLookup(t *testing.T) {
 		GUID:             "old-guid",
 		DownloadClientID: &client.ID,
 		Title:            "Old Download",
-		Status:           models.DownloadStatusDownloading,
+		Status:           models.StateGrabbed,
 		Protocol:         "torrent",
 	}
 	if err := downloads.Create(ctx, dl); err != nil {
