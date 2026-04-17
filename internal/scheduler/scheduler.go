@@ -309,7 +309,7 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 		Title:            best.Title,
 		NZBURL:           best.NZBURL,
 		Size:             best.Size,
-		Status:           models.DownloadStatusQueued,
+		Status:           models.StateGrabbed,
 		Protocol:         best.Protocol,
 		Quality:          indexer.ParseRelease(best.Title).Format,
 	}

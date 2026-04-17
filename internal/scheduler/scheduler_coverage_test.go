@@ -236,7 +236,7 @@ func TestCheckStalledDownloads_NotYetOldEnough(t *testing.T) {
 	dl := &models.Download{
 		GUID:     "recent-guid",
 		Title:    "Recent",
-		Status:   models.DownloadStatusQueued,
+		Status:   models.StateGrabbed,
 		Protocol: "torrent",
 	}
 	if err := downloads.Create(ctx, dl); err != nil {
