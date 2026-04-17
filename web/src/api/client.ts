@@ -428,6 +428,8 @@ export interface SearchResult {
   pubDate: string
   protocol: string  // "usenet" or "torrent"
   language?: string // ISO 639-1 from newznab:attr language (when present)
+  approved?: boolean
+  rejection?: string
 }
 
 export interface AddAuthorRequest {

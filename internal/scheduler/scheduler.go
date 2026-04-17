@@ -14,6 +14,7 @@ import (
 	"github.com/robfig/cron/v3"
 
 	"github.com/vavallee/bindery/internal/db"
+	"github.com/vavallee/bindery/internal/decision"
 	"github.com/vavallee/bindery/internal/downloader"
 	"github.com/vavallee/bindery/internal/importer"
 	"github.com/vavallee/bindery/internal/indexer"
@@ -257,12 +258,28 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 
 	results := s.searcher.SearchBook(ctx, idxs, crit)
 	results = indexer.FilterByLanguage(results, lang)
-	results = filterBlocklisted(ctx, s.blocklist, results)
-	if len(results) == 0 {
+
+	var specs []decision.Specification
+	if s.blocklist != nil {
+		if entries, err := s.blocklist.List(ctx); err == nil {
+			specs = append(specs, decision.NewBlocklistedSpec(entries))
+		}
+	}
+	dm := decision.New(specs...)
+	releases := make([]decision.Release, len(results))
+	for i, res := range results {
+		releases[i] = decision.ReleaseFromSearchResult(res)
+	}
+	var best *newznab.SearchResult
+	for i, d := range dm.Evaluate(releases, book) {
+		if d.Approved {
+			best = &results[i]
+			break
+		}
+	}
+	if best == nil {
 		return
 	}
-
-	best := results[0]
 
 	candidates, err := s.clients.GetEnabledByProtocol(ctx, best.Protocol)
 	if err != nil {
@@ -374,27 +391,6 @@ func (s *Scheduler) searchWanted() {
 		}
 		s.SearchAndGrabBook(ctx, book)
 	}
-}
-
-// filterBlocklisted drops any result whose GUID is in the blocklist. A nil
-// or erroring repo is treated as "nothing blocked".
-func filterBlocklisted(ctx context.Context, bl *db.BlocklistRepo, results []newznab.SearchResult) []newznab.SearchResult {
-	if bl == nil {
-		return results
-	}
-	out := make([]newznab.SearchResult, 0, len(results))
-	for _, r := range results {
-		blocked, err := bl.IsBlocked(ctx, r.GUID)
-		if err != nil {
-			slog.Warn("failed to check blocklist", "guid", r.GUID, "error", err)
-			out = append(out, r)
-			continue
-		}
-		if !blocked {
-			out = append(out, r)
-		}
-	}
-	return out
 }
 
 func (s *Scheduler) refreshMetadata() {

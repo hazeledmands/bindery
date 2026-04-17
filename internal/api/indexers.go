@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/vavallee/bindery/internal/db"
+	"github.com/vavallee/bindery/internal/decision"
 	"github.com/vavallee/bindery/internal/httpsec"
 	"github.com/vavallee/bindery/internal/indexer"
 	"github.com/vavallee/bindery/internal/indexer/newznab"
@@ -190,8 +191,10 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 
 	results := h.searcher.SearchBook(r.Context(), idxs, crit)
 
-	// Apply language filter using the author's metadata-profile allowed languages.
-	// Fall back to the global search.preferredLanguage setting when no profile is found.
+	// Build decision specs.
+	var specs []decision.Specification
+
+	// Language filter: author profile takes precedence, fall back to global setting.
 	lang := langFilterFromAllowed(allowedLangs)
 	if lang == "" {
 		if s, _ := h.settings.Get(r.Context(), "search.preferredLanguage"); s != nil {
@@ -200,18 +203,38 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 	}
 	results = indexer.FilterByLanguage(results, lang)
 
-	// Filter out blocklisted GUIDs so they never surface again.
+	// Blocklist spec.
 	if h.blocklist != nil {
-		filtered := make([]newznab.SearchResult, 0, len(results))
-		for _, res := range results {
-			if blocked, _ := h.blocklist.IsBlocked(r.Context(), res.GUID); !blocked {
-				filtered = append(filtered, res)
-			}
-		}
-		results = filtered
+		entries, _ := h.blocklist.List(r.Context())
+		specs = append(specs, decision.NewBlocklistedSpec(entries))
 	}
 
-	writeJSON(w, http.StatusOK, results)
+	// Already-imported spec.
+	specs = append(specs, decision.AlreadyImportedSpec{})
+
+	dm := decision.New(specs...)
+	releases := make([]decision.Release, len(results))
+	for i, res := range results {
+		releases[i] = decision.ReleaseFromSearchResult(res)
+	}
+
+	decisions := dm.Evaluate(releases, *book)
+
+	type searchDecision struct {
+		newznab.SearchResult
+		Approved  bool   `json:"approved"`
+		Rejection string `json:"rejection,omitempty"`
+	}
+	out := make([]searchDecision, len(decisions))
+	for i, d := range decisions {
+		out[i] = searchDecision{
+			SearchResult: results[i],
+			Approved:     d.Approved,
+			Rejection:    d.Rejection,
+		}
+	}
+
+	writeJSON(w, http.StatusOK, out)
 }
 
 // resolveAllowedLanguages returns the parsed allowed-language list for an
