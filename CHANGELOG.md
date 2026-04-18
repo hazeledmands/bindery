@@ -8,6 +8,30 @@ All notable changes to Bindery are documented here. Format loosely follows
 
 The `development` branch carries the in-flight feature set for the next release. Images are published as `ghcr.io/vavallee/bindery:development` and `:dev-<sha>`; point ArgoCD at the `development` branch to follow. Treat these features as beta — schema migrations are additive and safe, but UX may still shift before tagging.
 
+## [v0.19.0] — 2026-04-17
+
+### Added
+
+- **Series gap detection and Fill gaps** ([#234](https://github.com/vavallee/bindery/pull/234)) — the Series page now shows how many books are missing from each series ("N missing" badge) and a **Fill gaps** button that marks all non-imported entries as Wanted and kicks off indexer searches immediately. No more manually hunting for which entries you're missing.
+- **Series monitoring toggle** — mark a series as monitored so it's easy to identify which series you're actively tracking. Foundation for future automation (auto-adding new entries when they appear).
+
+### Fixed
+
+- **Indexers tab crash** ([#227](https://github.com/vavallee/bindery/pull/227)) — clicking Settings → Indexers caused a white screen for users without Prowlarr configured.
+- **Language filter now rejects books with unknown language** ([#228](https://github.com/vavallee/bindery/pull/228)) — non-English editions no longer slip through English-only metadata profiles when OpenLibrary omits language data.
+
+## [v0.18.3] — 2026-04-17
+
+### Fixed
+
+- **Language filter now rejects books with unknown language** ([#228](https://github.com/vavallee/bindery/pull/228)) — when a metadata profile restricts to specific languages (e.g. English-only), books with no language data are now rejected instead of passing through. OpenLibrary doesn't include language at the work level, so translated editions (Turkish, Spanish, Dutch, etc.) were silently ingested for English-only profiles. The OL client already does a best-effort search-index lookup; this closes the gap for works the index doesn't cover. Reported in [#224](https://github.com/vavallee/bindery/issues/224).
+
+## [v0.18.2] — 2026-04-17
+
+### Fixed
+
+- **Indexers tab crash** ([#227](https://github.com/vavallee/bindery/pull/227)) — clicking Settings → Indexers caused a white screen for users without a Prowlarr instance configured. The `/api/v1/prowlarr` endpoint returned JSON `null` (Go nil slice) instead of `[]`, which crashed React on render. Reported in [#225](https://github.com/vavallee/bindery/issues/225).
+
 ## [v0.18.1] — 2026-04-17
 
 ### Changed
