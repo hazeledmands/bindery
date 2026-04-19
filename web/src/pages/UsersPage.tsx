@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react'
+import React, { useEffect, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { api, ManagedUser } from '../api/client'
 import { useAuth } from '../auth/AuthContext'
 
@@ -6,7 +7,8 @@ const inputCls = 'w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 d
 const btnCls = 'px-3 py-1.5 rounded text-sm font-medium transition-colors'
 
 export default function UsersPage() {
-  const { isAdmin } = useAuth()
+  const { t } = useTranslation()
+  const { isAdmin, status } = useAuth()
   const [users, setUsers] = useState<ManagedUser[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -25,7 +27,7 @@ export default function UsersPage() {
     if (!isAdmin) return
     api.listUsers()
       .then(setUsers)
-      .catch(e => setError(e.message))
+      .catch(e => setError(e instanceof Error ? e.message : t('users.loadFail')))
       .finally(() => setLoading(false))
   }, [isAdmin])
 
@@ -40,19 +42,19 @@ export default function UsersPage() {
       setNewPassword('')
       setNewRole('user')
     } catch (e: unknown) {
-      setCreateError(e instanceof Error ? e.message : 'Failed to create user')
+      setCreateError(e instanceof Error ? e.message : t('users.createFail'))
     } finally {
       setCreating(false)
     }
   }
 
-  async function handleDelete(id: number) {
-    if (!confirm('Delete this user and all their library data?')) return
+  async function handleDelete(u: ManagedUser) {
+    if (!confirm(t('users.deleteConfirm', { username: u.username }))) return
     try {
-      await api.deleteUser(id)
-      setUsers(prev => prev.filter(u => u.id !== id))
+      await api.deleteUser(u.id)
+      setUsers(prev => prev.filter(x => x.id !== u.id))
     } catch (e: unknown) {
-      alert(e instanceof Error ? e.message : 'Failed to delete user')
+      setError(e instanceof Error ? e.message : t('users.deleteFail'))
     }
   }
 
@@ -62,7 +64,7 @@ export default function UsersPage() {
       await api.setUserRole(u.id, next)
       setUsers(prev => prev.map(x => x.id === u.id ? { ...x, role: next } : x))
     } catch (e: unknown) {
-      alert(e instanceof Error ? e.message : 'Failed to update role')
+      setError(e instanceof Error ? e.message : t('users.roleFail'))
     }
   }
 
@@ -76,9 +78,9 @@ export default function UsersPage() {
 
   return (
     <div className="space-y-8 max-w-2xl">
-      <h1 className="text-2xl font-bold">Users</h1>
+      <h1 className="text-2xl font-bold">{t('users.title')}</h1>
 
-      {loading && <p className="text-sm text-slate-500 dark:text-zinc-500">Loading...</p>}
+      {loading && <p className="text-sm text-slate-500 dark:text-zinc-500">{t('common.loading')}</p>}
       {error && <p className="text-sm text-red-500">{error}</p>}
 
       {!loading && (
@@ -86,16 +88,21 @@ export default function UsersPage() {
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-slate-200 dark:border-zinc-800 bg-slate-50 dark:bg-zinc-950">
-                <th className="px-4 py-3 text-left font-medium text-slate-600 dark:text-zinc-400">Username</th>
-                <th className="px-4 py-3 text-left font-medium text-slate-600 dark:text-zinc-400">Role</th>
-                <th className="px-4 py-3 text-left font-medium text-slate-600 dark:text-zinc-400">Created</th>
+                <th className="px-4 py-3 text-left font-medium text-slate-600 dark:text-zinc-400">{t('users.colUsername')}</th>
+                <th className="px-4 py-3 text-left font-medium text-slate-600 dark:text-zinc-400">{t('users.colRole')}</th>
+                <th className="px-4 py-3 text-left font-medium text-slate-600 dark:text-zinc-400">{t('users.colCreated')}</th>
                 <th className="px-4 py-3" />
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-200 dark:divide-zinc-800">
               {users.map(u => (
                 <tr key={u.id}>
-                  <td className="px-4 py-3 font-medium">{u.username}</td>
+                  <td className="px-4 py-3 font-medium">
+                    {u.username}
+                    {u.username === status?.username && (
+                      <span className="ml-2 text-xs text-slate-500 dark:text-zinc-500">({t('users.you')})</span>
+                    )}
+                  </td>
                   <td className="px-4 py-3">
                     <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
                       u.role === 'admin'
@@ -113,13 +120,13 @@ export default function UsersPage() {
                       onClick={() => handleRoleToggle(u)}
                       className={`${btnCls} text-xs bg-slate-100 dark:bg-zinc-800 hover:bg-slate-200 dark:hover:bg-zinc-700 text-slate-700 dark:text-zinc-300`}
                     >
-                      Make {u.role === 'admin' ? 'user' : 'admin'}
+                      {u.role === 'admin' ? t('users.demote') : t('users.promote')}
                     </button>
                     <button
-                      onClick={() => handleDelete(u.id)}
+                      onClick={() => handleDelete(u)}
                       className={`${btnCls} text-xs bg-red-50 dark:bg-red-900/20 hover:bg-red-100 dark:hover:bg-red-900/40 text-red-600 dark:text-red-400`}
                     >
-                      Delete
+                      {t('common.delete')}
                     </button>
                   </td>
                 </tr>
@@ -130,11 +137,11 @@ export default function UsersPage() {
       )}
 
       <div className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 rounded-lg p-5">
-        <h2 className="text-base font-semibold mb-4">Add User</h2>
+        <h2 className="text-base font-semibold mb-4">{t('users.addHeading')}</h2>
         <form onSubmit={handleCreate} className="space-y-3">
           <div className="grid grid-cols-2 gap-3">
             <div>
-              <label className="block text-xs font-medium text-slate-600 dark:text-zinc-400 mb-1">Username</label>
+              <label className="block text-xs font-medium text-slate-600 dark:text-zinc-400 mb-1">{t('users.fieldUsername')}</label>
               <input
                 className={inputCls}
                 value={newUsername}
@@ -144,7 +151,7 @@ export default function UsersPage() {
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-slate-600 dark:text-zinc-400 mb-1">Password</label>
+              <label className="block text-xs font-medium text-slate-600 dark:text-zinc-400 mb-1">{t('users.fieldPassword')}</label>
               <input
                 type="password"
                 className={inputCls}
@@ -156,23 +163,23 @@ export default function UsersPage() {
             </div>
           </div>
           <div>
-            <label className="block text-xs font-medium text-slate-600 dark:text-zinc-400 mb-1">Role</label>
+            <label className="block text-xs font-medium text-slate-600 dark:text-zinc-400 mb-1">{t('users.fieldRole')}</label>
             <select
               className={inputCls}
               value={newRole}
               onChange={e => setNewRole(e.target.value as 'user' | 'admin')}
             >
-              <option value="user">User</option>
-              <option value="admin">Admin</option>
+              <option value="user">{t('users.roleUser')}</option>
+              <option value="admin">{t('users.roleAdmin')}</option>
             </select>
           </div>
           {createError && <p className="text-sm text-red-500">{createError}</p>}
           <button
             type="submit"
-            disabled={creating}
+            disabled={creating || !newUsername || !newPassword}
             className={`${btnCls} bg-slate-800 dark:bg-zinc-100 text-white dark:text-zinc-900 hover:bg-slate-700 dark:hover:bg-zinc-200 disabled:opacity-50`}
           >
-            {creating ? 'Creating...' : 'Create User'}
+            {creating ? t('common.saving') : t('users.createButton')}
           </button>
         </form>
       </div>
