@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -16,6 +17,8 @@ const (
 	oidcFlowCookie = "bindery_oidc_flow"
 	oidcFlowMaxAge = 10 * 60 // 10 minutes
 )
+
+var oidcProviderIDRe = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
 
 // OIDCHandler owns GET /auth/oidc/:provider/login and /callback.
 type OIDCHandler struct {
@@ -33,6 +36,10 @@ func NewOIDCHandler(mgr *oidc.Manager, users *db.UserRepo, settings *db.Settings
 // GET /api/v1/auth/oidc/:provider/login
 func (h *OIDCHandler) Login(w http.ResponseWriter, r *http.Request) {
 	providerID := chi.URLParam(r, "provider")
+	if !oidcProviderIDRe.MatchString(providerID) {
+		writeErr(w, http.StatusBadRequest, "invalid provider id")
+		return
+	}
 
 	state, err := oidc.NewState()
 	if err != nil {
@@ -63,7 +70,7 @@ func (h *OIDCHandler) Login(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "encode flow: "+err.Error())
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ // #nosec G402 -- Secure auto-detected via cookieSecure(r); mirrors issueSession()
 		Name:     oidcFlowCookie,
 		Value:    flowVal,
 		Path:     "/api/v1/auth/oidc",
@@ -81,6 +88,10 @@ func (h *OIDCHandler) Login(w http.ResponseWriter, r *http.Request) {
 func (h *OIDCHandler) Callback(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	providerID := chi.URLParam(r, "provider")
+	if !oidcProviderIDRe.MatchString(providerID) {
+		writeErr(w, http.StatusBadRequest, "invalid provider id")
+		return
+	}
 
 	// Retrieve and validate the flow state cookie.
 	flowCookie, err := r.Cookie(oidcFlowCookie)
@@ -95,7 +106,7 @@ func (h *OIDCHandler) Callback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Clear the flow cookie.
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ // #nosec G402 -- Secure auto-detected via cookieSecure(r); mirrors issueSession()
 		Name:     oidcFlowCookie,
 		Value:    "",
 		Path:     "/api/v1/auth/oidc",
@@ -115,7 +126,7 @@ func (h *OIDCHandler) Callback(w http.ResponseWriter, r *http.Request) {
 	if errParam := r.URL.Query().Get("error"); errParam != "" {
 		desc := r.URL.Query().Get("error_description")
 		// Strip CRLF from user-controlled query params before structured logging.
-		slog.Warn("oidc callback: provider error",
+		slog.Warn("oidc callback: provider error", // #nosec -- providerID validated by oidcProviderIDRe at handler entry
 			"error", sanitizeLog(errParam),
 			"desc", sanitizeLog(desc),
 			"provider", providerID,
@@ -132,7 +143,7 @@ func (h *OIDCHandler) Callback(w http.ResponseWriter, r *http.Request) {
 
 	claims, err := h.mgr.Exchange(ctx, providerID, code, fs.Nonce, fs.CodeVerifier)
 	if err != nil {
-		slog.Warn("oidc: token exchange failed", "provider", providerID, "error", err)
+		slog.Warn("oidc: token exchange failed", "provider", providerID, "error", err) // #nosec -- providerID validated by oidcProviderIDRe at handler entry
 		writeErr(w, http.StatusUnauthorized, "token exchange failed")
 		return
 	}
