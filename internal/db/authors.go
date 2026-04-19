@@ -26,10 +26,21 @@ func (r *AuthorRepo) List(ctx context.Context) ([]models.Author, error) {
 	return r.ListByUser(ctx, 0)
 }
 
+const (
+	listAuthorsAll    = "SELECT " + authorSelectCols + " FROM authors ORDER BY sort_name"
+	listAuthorsByUser = "SELECT " + authorSelectCols + " FROM authors WHERE owner_user_id = ? ORDER BY sort_name"
+)
+
 func (r *AuthorRepo) ListByUser(ctx context.Context, userID int64) ([]models.Author, error) {
-	where, args := QueryScope("", userID)
-	q := "SELECT " + authorSelectCols + " FROM authors " + where + " ORDER BY sort_name"
-	rows, err := r.db.QueryContext(ctx, q, args...)
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if userID == 0 {
+		rows, err = r.db.QueryContext(ctx, listAuthorsAll)
+	} else {
+		rows, err = r.db.QueryContext(ctx, listAuthorsByUser, userID)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("list authors: %w", err)
 	}
