@@ -21,13 +21,13 @@ import (
 
 // ProviderConfig is one entry in the auth.oidc.providers JSON array.
 type ProviderConfig struct {
-	ID             string   `json:"id"`
-	Name           string   `json:"name"`
-	Issuer         string   `json:"issuer"`
-	ClientID       string   `json:"client_id"`
-	ClientSecret   string   `json:"client_secret"`
-	Scopes         []string `json:"scopes"`
-	AllowedGroups  []string `json:"allowed_groups,omitempty"`
+	ID            string   `json:"id"`
+	Name          string   `json:"name"`
+	Issuer        string   `json:"issuer"`
+	ClientID      string   `json:"client_id"`
+	ClientSecret  string   `json:"client_secret"` //nolint:gosec // intentionally persisted — same posture as indexer creds, documented in risk assessment
+	Scopes        []string `json:"scopes"`
+	AllowedGroups []string `json:"allowed_groups,omitempty"`
 }
 
 // ParseProviders deserialises the stored JSON array.
@@ -55,8 +55,8 @@ type Claims struct {
 // Manager holds per-provider OIDC verifiers and oauth2 configs, keyed by
 // provider ID. It is rebuilt when the settings change.
 type Manager struct {
-	mu        sync.RWMutex
-	providers map[string]*entry
+	mu           sync.RWMutex
+	providers    map[string]*entry
 	redirectBase string
 }
 

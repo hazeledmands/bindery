@@ -12,8 +12,8 @@ import (
 )
 
 const (
-	oidcFlowCookie  = "bindery_oidc_flow"
-	oidcFlowMaxAge  = 10 * 60 // 10 minutes
+	oidcFlowCookie = "bindery_oidc_flow"
+	oidcFlowMaxAge = 10 * 60 // 10 minutes
 )
 
 // OIDCHandler owns GET /auth/oidc/:provider/login and /callback.
@@ -196,4 +196,3 @@ func (h *OIDCHandler) SetProviders(w http.ResponseWriter, r *http.Request) {
 	}()
 	writeOK(w, map[string]any{"ok": true, "count": len(ps)})
 }
-
