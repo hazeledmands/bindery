@@ -191,17 +191,17 @@ func (h *OIDCHandler) SetProviders(w http.ResponseWriter, r *http.Request) {
 	merged := make([]oidc.ProviderConfig, 0, len(incoming))
 	for _, p := range incoming {
 		if p.ClientSecret == "" {
-			if prev, ok := existingByID[p.ID]; ok {
-				p.ClientSecret = prev.ClientSecret
-			} else {
+			prev, ok := existingByID[p.ID]
+			if !ok {
 				writeErr(w, http.StatusBadRequest, "client_secret required for new provider: "+p.ID)
 				return
 			}
+			p.ClientSecret = prev.ClientSecret
 		}
 		merged = append(merged, p)
 	}
 
-	raw, err := json.Marshal(merged)
+	raw, err := json.Marshal(merged) //nolint:gosec // G117: persisted server-side only, never returned via API (see ProviderPublicConfig split)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "encode: "+err.Error())
 		return
