@@ -171,15 +171,39 @@ func (h *OIDCHandler) GetProviders(w http.ResponseWriter, r *http.Request) {
 // PUT /api/v1/auth/oidc/providers
 func (h *OIDCHandler) SetProviders(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	var raw json.RawMessage
-	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+	var incoming []oidc.ProviderConfig
+	if err := json.NewDecoder(r.Body).Decode(&incoming); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	// Validate that it's a parseable provider array.
-	ps, err := oidc.ParseProviders(string(raw))
+
+	// Load existing providers so we can preserve secrets not re-submitted.
+	var existing []oidc.ProviderConfig
+	if s, _ := h.settings.Get(ctx, SettingOIDCProviders); s != nil && s.Value != "" {
+		existing, _ = oidc.ParseProviders(s.Value)
+	}
+	existingByID := make(map[string]oidc.ProviderConfig, len(existing))
+	for _, e := range existing {
+		existingByID[e.ID] = e
+	}
+
+	// Merge: preserve existing secret when incoming secret is empty.
+	merged := make([]oidc.ProviderConfig, 0, len(incoming))
+	for _, p := range incoming {
+		if p.ClientSecret == "" {
+			if prev, ok := existingByID[p.ID]; ok {
+				p.ClientSecret = prev.ClientSecret
+			} else {
+				writeErr(w, http.StatusBadRequest, "client_secret required for new provider: "+p.ID)
+				return
+			}
+		}
+		merged = append(merged, p)
+	}
+
+	raw, err := json.Marshal(merged)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeErr(w, http.StatusInternalServerError, "encode: "+err.Error())
 		return
 	}
 	if err := h.settings.Set(ctx, SettingOIDCProviders, string(raw)); err != nil {
@@ -188,7 +212,7 @@ func (h *OIDCHandler) SetProviders(w http.ResponseWriter, r *http.Request) {
 	}
 	// Reload async so the HTTP response isn't delayed by discovery.
 	go func() {
-		h.mgr.Reload(r.Context(), ps)
+		h.mgr.Reload(r.Context(), merged)
 	}()
-	writeOK(w, map[string]any{"ok": true, "count": len(ps)})
+	writeOK(w, map[string]any{"ok": true, "count": len(merged)})
 }
