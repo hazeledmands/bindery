@@ -160,13 +160,9 @@ func (h *OIDCHandler) GetProviders(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "parse providers: "+err.Error())
 		return
 	}
-	type providerInfo struct {
-		ID   string `json:"id"`
-		Name string `json:"name"`
-	}
-	out := make([]providerInfo, 0, len(ps))
+	out := make([]oidc.ProviderPublicConfig, 0, len(ps))
 	for _, p := range ps {
-		out = append(out, providerInfo{ID: p.ID, Name: p.Name})
+		out = append(out, p.Public())
 	}
 	writeOK(w, out)
 }

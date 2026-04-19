@@ -19,15 +19,40 @@ import (
 	"golang.org/x/oauth2"
 )
 
-// ProviderConfig is one entry in the auth.oidc.providers JSON array.
+// ProviderConfig is the internal representation persisted to the settings
+// table. It includes the client secret and must never be marshalled directly
+// to an API response — use ProviderPublicConfig for that.
 type ProviderConfig struct {
 	ID            string   `json:"id"`
 	Name          string   `json:"name"`
 	Issuer        string   `json:"issuer"`
 	ClientID      string   `json:"client_id"`
-	ClientSecret  string   `json:"client_secret"` //nolint:gosec // intentionally persisted — same posture as indexer creds, documented in risk assessment
+	ClientSecret  string   `json:"client_secret"` // write-only: never returned to callers
 	Scopes        []string `json:"scopes"`
 	AllowedGroups []string `json:"allowed_groups,omitempty"`
+}
+
+// ProviderPublicConfig is the API-safe view of a provider — no secret fields.
+// Used in GET /auth/oidc/providers responses.
+type ProviderPublicConfig struct {
+	ID            string   `json:"id"`
+	Name          string   `json:"name"`
+	Issuer        string   `json:"issuer"`
+	ClientID      string   `json:"client_id"`
+	Scopes        []string `json:"scopes"`
+	AllowedGroups []string `json:"allowed_groups,omitempty"`
+}
+
+// Public returns the API-safe view of the config with the secret stripped.
+func (c ProviderConfig) Public() ProviderPublicConfig {
+	return ProviderPublicConfig{
+		ID:            c.ID,
+		Name:          c.Name,
+		Issuer:        c.Issuer,
+		ClientID:      c.ClientID,
+		Scopes:        c.Scopes,
+		AllowedGroups: c.AllowedGroups,
+	}
 }
 
 // ParseProviders deserialises the stored JSON array.
