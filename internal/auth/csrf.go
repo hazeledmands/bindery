@@ -41,6 +41,10 @@ func RequireCSRFToken(secret func() []byte) func(http.Handler) http.Handler {
 				// safe methods — no mutation risk
 			default:
 				if requestAPIKey(r) == "" {
+					// No session cookie → not a cookie-authenticated request; CSRF doesn't apply.
+					if c, err := r.Cookie(SessionCookieName); err != nil || c.Value == "" {
+						break
+					}
 					tok := r.Header.Get("X-CSRF-Token")
 					if !ValidCSRFToken(secret(), r, tok) {
 						w.Header().Set("Content-Type", "application/json")
