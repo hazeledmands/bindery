@@ -88,6 +88,12 @@ func TestSetup_CreatesFirstAdmin(t *testing.T) {
 	if err != nil || u == nil {
 		t.Fatalf("expected user created, got u=%v err=%v", u, err)
 	}
+	// First-run user must be promoted to admin — without this, every
+	// role-gated config endpoint returns "admin role required" on a fresh
+	// install (gh #321).
+	if u.Role != "admin" {
+		t.Errorf("expected first-run user role=admin, got %q", u.Role)
+	}
 	// Session cookie issued.
 	var haveCookie bool
 	for _, c := range rec.Result().Cookies() {
