@@ -8,6 +8,10 @@ All notable changes to Bindery are documented here. Format loosely follows
 
 The `development` branch carries the in-flight feature set for the next release. Images are published as `ghcr.io/vavallee/bindery:development` and `:dev-<sha>`; point ArgoCD at the `development` branch to follow. Treat these features as beta — schema migrations are additive and safe, but UX may still shift before tagging.
 
+### Fixed
+
+- **NZB releases from Prowlarr routing to qBittorrent** (#320) — the Prowlarr syncer hardcoded `Type="torznab"` for every indexer regardless of protocol, so usenet indexers ended up tagged as torrent sources. The downloader router then sent .nzb URLs to qBittorrent, which failed with `add torrent accepted but hash could not be determined`. The syncer now maps `protocol=usenet` → `newznab` and everything else → `torznab`, and includes `Type` in the change-detection check so rows mis-typed by older syncs get corrected automatically on the next run.
+
 ## [v1.0.4] — 2026-04-20
 
 ### Reverted

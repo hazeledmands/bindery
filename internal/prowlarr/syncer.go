@@ -79,11 +79,16 @@ func (s *Syncer) Sync(ctx context.Context, instanceID int64) (SyncResult, error)
 
 		pID := ri.ProwlarrID
 		instID := instanceID
+		idxType := indexerTypeForProtocol(ri.Protocol)
 
 		if ex, ok := byProwlarrID[ri.ProwlarrID]; ok {
-			// Update only if something meaningful changed.
-			if ex.Name != ri.Name || ex.URL != ri.TorznabURL {
+			// Update only if something meaningful changed. Type is included so
+			// rows mis-typed by older syncs (which hardcoded "torznab" for NZB
+			// indexers) get corrected on the next sync — otherwise NZB releases
+			// continue to route to the torrent client and fail.
+			if ex.Name != ri.Name || ex.URL != ri.TorznabURL || ex.Type != idxType {
 				ex.Name = ri.Name
+				ex.Type = idxType
 				ex.URL = ri.TorznabURL
 				ex.SupportsSearch = ri.SupportsSearch
 				if err := s.indexers.Update(ctx, ex); err != nil {
@@ -99,7 +104,7 @@ func (s *Syncer) Sync(ctx context.Context, instanceID int64) (SyncResult, error)
 		// New indexer from Prowlarr.
 		idx := &models.Indexer{
 			Name:               ri.Name,
-			Type:               "torznab",
+			Type:               idxType,
 			URL:                ri.TorznabURL,
 			APIKey:             ri.APIKey,
 			Categories:         cats,
@@ -133,4 +138,17 @@ func (s *Syncer) Sync(ctx context.Context, instanceID int64) (SyncResult, error)
 	_ = s.instances.SetLastSyncAt(ctx, instanceID, time.Now())
 	slog.Info("prowlarr sync complete", "instance_id", instanceID, "result", result.String())
 	return result, nil
+}
+
+// indexerTypeForProtocol maps a Prowlarr indexer's protocol ("usenet" or
+// "torrent") to the Bindery Indexer.Type used by the searcher and downloader
+// router. A Prowlarr-reported protocol of "usenet" means the backing indexer
+// speaks Newznab; anything else is treated as Torznab. Routing downstream
+// keys off this — an NZB release mis-tagged as torznab lands at qBittorrent
+// and fails with "hash could not be determined".
+func indexerTypeForProtocol(protocol string) string {
+	if protocol == "usenet" {
+		return "newznab"
+	}
+	return "torznab"
 }
