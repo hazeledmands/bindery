@@ -8,9 +8,24 @@ All notable changes to Bindery are documented here. Format loosely follows
 
 The `development` branch carries the in-flight feature set for the next release. Images are published as `ghcr.io/vavallee/bindery:development` and `:dev-<sha>`; point ArgoCD at the `development` branch to follow. Treat these features as beta — schema migrations are additive and safe, but UX may still shift before tagging.
 
+## [v1.0.5] — 2026-04-20
+
 ### Fixed
 
+- **Admin role required on fresh install** (#321) — new users created via first-run setup were stored without the admin role, so Settings → Config showed only the General section and any config mutation (Calibre plugin, users, indexers) 403'd with "admin role required" regardless of the security mode. First-run user is now explicitly promoted to admin before the session is issued; existing single-user installs are unaffected. Unblocks #314 reporters from retesting the Calibre metadata fix.
 - **NZB grabs misrouted to qBittorrent** (#320) — Prowlarr-synced indexers were hardcoded as `torznab` regardless of the upstream indexer's actual protocol, so NZB search results were tagged `protocol=torrent` and dispatched to qBittorrent, which then failed with `add torrent accepted but hash could not be determined`. The syncer now uses Prowlarr's `protocol` field to choose `newznab` vs `torznab`, and corrects mis-typed rows on the next sync. The scheduler no longer falls back across protocols when the protocol-matched client list is empty — an NZB release can never be pushed to a torrent client.
+
+### Added
+
+- **Bulk media-type update across monitored authors** (#247) — select multiple authors on the Authors page and switch their media type in one action (or flip all authors from a Settings one-shot). `PATCH /api/v1/authors/bulk` re-evaluates wanted/missing status for affected books so a flip from ebook → audiobook (or reverse) doesn't leave the catalogue in an inconsistent state. Companion to the existing global default media-type setting.
+
+### Docs
+
+- **Discord invite added to README and CONTRIBUTING** (#319) — new Community section links the BINDERY Discord server as a real-time channel for support and contributor onboarding, alongside GitHub Issues and Discussions. Security reports continue to go through `SECURITY.md`, not Discord.
+
+### Chores
+
+- **vitest 3.2.4 → 4.1.4** (#312) — dev-dependency bump for the web test runner.
 
 ## [v1.0.4] — 2026-04-20
 
