@@ -8,7 +8,7 @@ All notable changes to Bindery are documented here. Format loosely follows
 
 The `development` branch carries the in-flight feature set for the next release. Images are published as `ghcr.io/vavallee/bindery:development` and `:dev-<sha>`; point ArgoCD at the `development` branch to follow. Treat these features as beta — schema migrations are additive and safe, but UX may still shift before tagging.
 
-## [v1.1.6] — 2026-04-23
+## [v1.2.1] — 2026-04-23
 
 ### Fixed
 
