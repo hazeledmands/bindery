@@ -165,7 +165,7 @@ export default function BookDetailPage() {
     const hasFiles = !!(book.filePath || book.ebookFilePath || book.audiobookFilePath)
     const fileSummary = [book.ebookFilePath, book.audiobookFilePath].filter(Boolean).join('\n') || book.filePath
     const msg = hasFiles
-      ? `Delete "${book.title}" AND its files on disk?\n\n${fileSummary}\n\nThis cannot be undone.`
+      ? `Delete "${book.title}" AND all its files on disk?\n\n${fileSummary}\n\nAll format variants in the same folder will also be removed.\n\nThis cannot be undone.`
       : `Delete "${book.title}"?\n\nThis cannot be undone.`
     if (!window.confirm(msg)) return
     setDeletingBook(true)

@@ -123,6 +123,13 @@ func (r *DownloadRepo) Delete(ctx context.Context, id int64) error {
 	return err
 }
 
+// DeleteByBookID removes all download records associated with a book.
+// Called when a book is deleted so the queue stays consistent.
+func (r *DownloadRepo) DeleteByBookID(ctx context.Context, bookID int64) error {
+	_, err := r.db.ExecContext(ctx, "DELETE FROM downloads WHERE book_id=?", bookID)
+	return err
+}
+
 func (r *DownloadRepo) query(ctx context.Context, q string, args ...interface{}) ([]models.Download, error) {
 	rows, err := r.db.QueryContext(ctx, q, args...)
 	if err != nil {

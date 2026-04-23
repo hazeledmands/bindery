@@ -723,6 +723,87 @@ func titleMatch(bookTitle, parsedTitle string) bool {
 	return overlap >= required
 }
 
+// jaroWinkler computes the Jaro-Winkler similarity between two strings.
+// Returns a value in [0.0, 1.0] where 1.0 means identical.
+func jaroWinkler(s1, s2 string) float64 {
+	r1 := []rune(s1)
+	r2 := []rune(s2)
+	l1, l2 := len(r1), len(r2)
+	if l1 == 0 && l2 == 0 {
+		return 1.0
+	}
+	if l1 == 0 || l2 == 0 {
+		return 0.0
+	}
+	if s1 == s2 {
+		return 1.0
+	}
+
+	maxLen := l1
+	if l2 > maxLen {
+		maxLen = l2
+	}
+	matchDist := maxLen/2 - 1
+	if matchDist < 0 {
+		matchDist = 0
+	}
+
+	s1Matched := make([]bool, l1)
+	s2Matched := make([]bool, l2)
+	matches := 0
+	for i, c := range r1 {
+		start := i - matchDist
+		if start < 0 {
+			start = 0
+		}
+		end := i + matchDist + 1
+		if end > l2 {
+			end = l2
+		}
+		for j := start; j < end; j++ {
+			if !s2Matched[j] && r2[j] == c {
+				s1Matched[i] = true
+				s2Matched[j] = true
+				matches++
+				break
+			}
+		}
+	}
+
+	if matches == 0 {
+		return 0.0
+	}
+
+	trans := 0
+	k := 0
+	for i := 0; i < l1; i++ {
+		if !s1Matched[i] {
+			continue
+		}
+		for k < l2 && !s2Matched[k] {
+			k++
+		}
+		if k < l2 && r1[i] != r2[k] {
+			trans++
+		}
+		k++
+	}
+
+	m := float64(matches)
+	jaro := (m/float64(l1) + m/float64(l2) + (m-float64(trans)/2)/m) / 3.0
+
+	// Jaro-Winkler prefix bonus (p=0.1, up to 4 chars).
+	prefix := 0
+	for i := 0; i < l1 && i < l2 && i < 4; i++ {
+		if r1[i] == r2[i] {
+			prefix++
+		} else {
+			break
+		}
+	}
+	return jaro + float64(prefix)*0.1*(1-jaro)
+}
+
 // authorMatch returns true when parsedAuthor is consistent with bookAuthor.
 // If parsedAuthor is empty the function returns true (can't disprove).
 // Otherwise it checks that the last name of parsedAuthor appears in bookAuthor.
@@ -844,29 +925,37 @@ func (s *Scanner) ScanLibrary(ctx context.Context) {
 			}
 		}
 
-		// Search existing books for a title + author match
+		// Search existing books for a title + author match.
+		// Require Jaro-Winkler >= 0.85 on normalised titles to avoid false
+		// positives when undeleted sibling files rescan after a book is removed.
 		matched := false
 		if parsed.Title != "" {
 			detectedFmt := detectDownloadFormat([]string{path})
+			normTitle := strings.ToLower(strings.TrimSpace(parsed.Title))
 			for _, b := range allBooks {
 				if reconciledBooks[b.ID] {
 					continue
 				}
-				if b.Status == models.BookStatusWanted &&
-					titleMatch(b.Title, parsed.Title) &&
-					authorMatch(authorNames[b.AuthorID], parsed.Author) {
-					// Match found — update the per-format file path and aggregate status.
-					if err := s.books.SetFormatFilePath(ctx, b.ID, detectedFmt, path); err != nil {
-						slog.Error("library scan: failed to update book", "id", b.ID, "error", err)
-						continue
-					}
-					slog.Info("library scan: reconciled book", "title", b.Title, "path", path)
-					trackedPaths[cleanPath] = true
-					reconciledBooks[b.ID] = true
-					reconciled++
-					matched = true
-					break
+				if b.Status != models.BookStatusWanted {
+					continue
 				}
+				if jaroWinkler(strings.ToLower(b.Title), normTitle) < 0.85 {
+					continue
+				}
+				if !authorMatch(authorNames[b.AuthorID], parsed.Author) {
+					continue
+				}
+				// Match found — update the per-format file path and aggregate status.
+				if err := s.books.SetFormatFilePath(ctx, b.ID, detectedFmt, path); err != nil {
+					slog.Error("library scan: failed to update book", "id", b.ID, "error", err)
+					continue
+				}
+				slog.Info("library scan: reconciled book", "title", b.Title, "path", path)
+				trackedPaths[cleanPath] = true
+				reconciledBooks[b.ID] = true
+				reconciled++
+				matched = true
+				break
 			}
 		}
 

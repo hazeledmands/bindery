@@ -6,7 +6,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 
@@ -16,11 +18,12 @@ import (
 )
 
 type BookHandler struct {
-	books    *db.BookRepo
-	meta     *metadata.Aggregator
-	history  *db.HistoryRepo
-	searcher BookSearcher
-	settings *db.SettingsRepo
+	books     *db.BookRepo
+	meta      *metadata.Aggregator
+	history   *db.HistoryRepo
+	searcher  BookSearcher
+	settings  *db.SettingsRepo
+	downloads *db.DownloadRepo
 }
 
 func NewBookHandler(books *db.BookRepo, meta *metadata.Aggregator, history *db.HistoryRepo, searcher BookSearcher) *BookHandler {
@@ -31,6 +34,13 @@ func NewBookHandler(books *db.BookRepo, meta *metadata.Aggregator, history *db.H
 // global autoGrab.enabled kill-switch.
 func (h *BookHandler) WithSettings(settings *db.SettingsRepo) *BookHandler {
 	h.settings = settings
+	return h
+}
+
+// WithDownloads wires in the download repo so the book handler can clean up
+// download records when a book is deleted.
+func (h *BookHandler) WithDownloads(downloads *db.DownloadRepo) *BookHandler {
+	h.downloads = downloads
 	return h
 }
 
@@ -216,9 +226,9 @@ func (h *BookHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid id"})
 		return
 	}
-	// Opt-in `?deleteFiles=true` also removes the on-disk file or folder
-	// before dropping the record, so the user doesn't have to delete the
-	// file separately after removing the book.
+	// Opt-in `?deleteFiles=true` removes the on-disk file or folder for every
+	// tracked format, then sweeps for same-basename sibling files left behind by
+	// multi-format downloads (e.g. a download containing both .epub and .mobi).
 	if r.URL.Query().Get("deleteFiles") == "true" {
 		if book, _ := h.books.GetByID(r.Context(), id); book != nil {
 			for _, p := range []string{book.EbookFilePath, book.AudiobookFilePath} {
@@ -226,6 +236,7 @@ func (h *BookHandler) Delete(w http.ResponseWriter, r *http.Request) {
 					if err := removeBookPath(p); err != nil {
 						slog.Warn("book delete: failed to remove files", "id", id, "path", p, "error", err)
 					}
+					deleteSiblings(p)
 				}
 			}
 			// Fallback for books with only the legacy file_path set.
@@ -233,12 +244,20 @@ func (h *BookHandler) Delete(w http.ResponseWriter, r *http.Request) {
 				if err := removeBookPath(book.FilePath); err != nil {
 					slog.Warn("book delete: failed to remove files", "id", id, "path", book.FilePath, "error", err)
 				}
+				deleteSiblings(book.FilePath)
 			}
 		}
 	}
 	if err := h.books.Delete(r.Context(), id); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
+	}
+	// Remove any queued/completed download records for this book so the queue
+	// page doesn't show phantom entries after a book is deleted.
+	if h.downloads != nil {
+		if err := h.downloads.DeleteByBookID(r.Context(), id); err != nil {
+			slog.Warn("book delete: failed to clean download records", "id", id, "error", err)
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -347,7 +366,50 @@ func removeBookPath(p string) error {
 	if info.IsDir() {
 		return os.RemoveAll(p)
 	}
-	return os.Remove(p)
+	if err := os.Remove(p); err != nil { //nosec G304 -- p is a DB-stored path, not user input
+		return err
+	}
+	// Clean up the parent directory when it is now empty.
+	parent := filepath.Dir(p)
+	if entries, err := os.ReadDir(parent); err == nil && len(entries) == 0 {
+		_ = os.Remove(parent) //nosec G304 -- derived from DB-stored path
+	}
+	return nil
+}
+
+// deleteSiblings removes all plain files in the same directory as p that
+// share the same stem (base name without extension). Used to sweep up
+// multi-format ebook files (epub/mobi/azw3) left behind when only one format
+// was tracked. Errors are logged and swallowed — best-effort cleanup.
+func deleteSiblings(p string) {
+	info, err := os.Stat(p)
+	if err != nil || info.IsDir() {
+		return // audiobook folders handled by removeBookPath; nothing to sweep
+	}
+	dir := filepath.Dir(p)
+	stem := strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
+	if stem == "" {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.TrimSuffix(name, filepath.Ext(name)) == stem {
+			if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) { //nosec G304
+				slog.Warn("book delete: failed to remove sibling file", "path", filepath.Join(dir, name), "error", err)
+			}
+		}
+	}
+	// Clean up the parent directory when it is now empty.
+	if entries2, err := os.ReadDir(dir); err == nil && len(entries2) == 0 {
+		_ = os.Remove(dir) //nosec G304
+	}
 }
 
 func (h *BookHandler) ListWanted(w http.ResponseWriter, r *http.Request) {
