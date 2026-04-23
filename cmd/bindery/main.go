@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -92,6 +93,11 @@ func main() {
 	defer database.Close()
 
 	// Repos
+	// Persistent log store — extend the slog pipeline to also write to SQLite.
+	logRepo := db.NewLogRepo(database)
+	logDBHandler := db.NewLogSlogHandler(logRepo, level)
+	slog.SetDefault(slog.New(logbuf.NewTee(logbuf.NewTee(stdoutHandler, ring), logDBHandler)))
+
 	authorRepo := db.NewAuthorRepo(database)
 	authorAliasRepo := db.NewAuthorAliasRepo(database)
 	bookRepo := db.NewBookRepo(database)
@@ -261,6 +267,7 @@ func main() {
 	// Register the Hardcover list syncer (24-hour job).
 	hcSyncer := hardcoverlistsyncer.New(importListRepo, authorRepo, bookRepo)
 	sched.WithHardcoverSyncer(hcSyncer)
+	sched.WithLogRepo(logRepo, cfg.LogRetentionDays)
 
 	sched.Start()
 	defer sched.Stop()
@@ -284,13 +291,29 @@ func main() {
 	searchHandler := api.NewSearchHandler(metaAgg)
 	authorHandler := api.NewAuthorHandler(authorRepo, authorAliasRepo, bookRepo, seriesRepo, metaAgg, settingsRepo, metadataProfileRepo, sched).WithFinder(importScanner)
 	authorAliasHandler := api.NewAuthorAliasHandler(authorRepo, authorAliasRepo)
-	bookHandler := api.NewBookHandler(bookRepo, metaAgg, historyRepo, sched).WithSettings(settingsRepo)
+	bookHandler := api.NewBookHandler(bookRepo, metaAgg, historyRepo, sched).WithSettings(settingsRepo).WithDownloads(downloadRepo)
 	indexerHandler := api.NewIndexerHandler(indexerRepo, bookRepo, authorRepo, metadataProfileRepo, idxSearcher, settingsRepo, blocklistRepo)
 	dlClientHandler := api.NewDownloadClientHandler(dlClientRepo)
 	queueHandler := api.NewQueueHandler(downloadRepo, dlClientRepo, bookRepo, historyRepo).WithNotifier(notif)
 	pendingHandler := api.NewPendingHandler(pendingReleaseRepo, queueHandler, downloadRepo, bookRepo)
 	importScanner.WithSettings(settingsRepo)
 	importScanner.WithRootFolders(rootFolderRepo)
+
+	// Startup check: warn if the configured default root folder no longer exists on disk.
+	if s, _ := settingsRepo.Get(ctxBoot, api.SettingDefaultLibraryRootFolderID); s != nil && s.Value != "" {
+		if id, err := strconv.ParseInt(s.Value, 10, 64); err == nil && id > 0 {
+			if rf, err := rootFolderRepo.GetByID(ctxBoot, id); err == nil && rf != nil {
+				if _, statErr := os.Stat(rf.Path); statErr != nil {
+					slog.Warn("default library root folder does not exist on disk — falling back to BINDERY_LIBRARY_DIR",
+						"path", rf.Path, "rootFolderId", id, "error", statErr)
+				}
+			} else {
+				slog.Warn("default library root folder ID not found in database — falling back to BINDERY_LIBRARY_DIR",
+					"rootFolderId", id)
+			}
+		}
+	}
+
 	libraryHandler := api.NewLibraryHandler(importScanner).WithSettings(settingsRepo)
 	fileHandler := api.NewFileHandler(bookRepo, cfg.LibraryDir, cfg.AudiobookDir)
 	historyHandler := api.NewHistoryHandler(historyRepo, blocklistRepo)
@@ -307,7 +330,7 @@ func main() {
 	bulkHandler := api.NewBulkHandler(authorRepo, bookRepo, blocklistRepo, sched)
 	backupHandler := api.NewBackupHandler(cfg.DBPath, cfg.DataDir)
 	rootFolderHandler := api.NewRootFolderHandler(rootFolderRepo)
-	logHandler := api.NewLogHandler(ring)
+	logHandler := api.NewLogHandler(ring).WithLogRepo(logRepo)
 	prowlarrHandler := api.NewProwlarrHandler(prowlarrRepo, indexerRepo)
 	calibreHandler := api.NewCalibreHandler(settingsRepo)
 	calibreImportHandler := api.NewCalibreImportHandler(calibreImporter, func() calibre.Config {

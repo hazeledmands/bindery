@@ -105,11 +105,18 @@ export const api = {
   // System
   health: () => request<{ status: string; version: string }>('/health'),
   status: () => request<{ version: string; commit: string; buildDate: string }>('/system/status'),
-  getLogs: (level?: string, limit?: number) =>
-    request<LogEntry[]>(`/system/logs${level || limit ? '?' + new URLSearchParams({
-      ...(level ? { level } : {}),
-      ...(limit ? { limit: String(limit) } : {}),
-    }) : ''}`),
+  getLogs: (params?: { level?: string; component?: string; from?: string; to?: string; q?: string; limit?: number; offset?: number }) => {
+    const p: Record<string, string> = {}
+    if (params?.level) p.level = params.level
+    if (params?.component) p.component = params.component
+    if (params?.from) p.from = params.from
+    if (params?.to) p.to = params.to
+    if (params?.q) p.q = params.q
+    if (params?.limit) p.limit = String(params.limit)
+    if (params?.offset) p.offset = String(params.offset)
+    const qs = new URLSearchParams(p).toString()
+    return request<LogEntry[]>(`/system/logs${qs ? '?' + qs : ''}`)
+  },
   getLogLevel: () => request<{ level: string }>('/system/loglevel'),
   setLogLevel: (level: string) =>
     request<{ level: string }>('/system/loglevel', { method: 'PUT', body: JSON.stringify({ level }) }),
@@ -395,6 +402,15 @@ export interface MergeAuthorsResult {
 
 export type MediaType = 'ebook' | 'audiobook' | 'both'
 
+export interface BookFile {
+  id: number
+  bookId: number
+  format: 'ebook' | 'audiobook'
+  path: string
+  sizeBytes: number
+  createdAt: string
+}
+
 export interface Book {
   id: number
   foreignBookId: string
@@ -411,6 +427,8 @@ export interface Book {
   // Per-format file paths for dual-format books (mediaType='both').
   ebookFilePath: string
   audiobookFilePath: string
+  // All on-disk files tracked in book_files (populated on single-book GET).
+  bookFiles?: BookFile[]
   excluded: boolean
   narrator?: string
   durationSeconds?: number
@@ -580,8 +598,9 @@ export interface SearchResult {
   nzbUrl: string
   grabs: number
   pubDate: string
-  protocol: string  // "usenet" or "torrent"
-  language?: string // ISO 639-1 from newznab:attr language (when present)
+  protocol: string   // "usenet" or "torrent"
+  language?: string  // ISO 639-1 from newznab:attr language (when present)
+  mediaType?: string // "ebook" or "audiobook"; set for dual-format book searches
   approved?: boolean
   rejection?: string
 }
@@ -784,10 +803,17 @@ export interface HardcoverList {
 }
 
 export interface LogEntry {
-  time: string
-  level: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR'
-  msg: string
+  // Ring buffer shape
+  time?: string
+  msg?: string
   attrs?: Record<string, string>
+  // DB shape
+  id?: number
+  ts?: string
+  level: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR'
+  component?: string
+  message?: string
+  fields?: Record<string, string>
 }
 
 export interface Recommendation {

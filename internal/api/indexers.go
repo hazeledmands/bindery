@@ -36,18 +36,25 @@ func (s *lastDebugStore) get() *indexer.SearchDebug {
 	return s.dbg
 }
 
+// indexerSearcher is the subset of indexer.Searcher used by IndexerHandler.
+// It is an interface so tests can inject a mock.
+type indexerSearcher interface {
+	SearchBookWithDebug(ctx context.Context, indexers []models.Indexer, c indexer.MatchCriteria) ([]newznab.SearchResult, *indexer.SearchDebug)
+	SearchQuery(ctx context.Context, indexers []models.Indexer, query string) []newznab.SearchResult
+}
+
 type IndexerHandler struct {
 	indexers  *db.IndexerRepo
 	books     *db.BookRepo
 	authors   *db.AuthorRepo
 	profiles  *db.MetadataProfileRepo
-	searcher  *indexer.Searcher
+	searcher  indexerSearcher
 	settings  *db.SettingsRepo
 	blocklist *db.BlocklistRepo
 	lastDebug *lastDebugStore
 }
 
-func NewIndexerHandler(indexers *db.IndexerRepo, books *db.BookRepo, authors *db.AuthorRepo, profiles *db.MetadataProfileRepo, searcher *indexer.Searcher, settings *db.SettingsRepo, blocklist *db.BlocklistRepo) *IndexerHandler {
+func NewIndexerHandler(indexers *db.IndexerRepo, books *db.BookRepo, authors *db.AuthorRepo, profiles *db.MetadataProfileRepo, searcher indexerSearcher, settings *db.SettingsRepo, blocklist *db.BlocklistRepo) *IndexerHandler {
 	return &IndexerHandler{
 		indexers: indexers, books: books, authors: authors, profiles: profiles,
 		searcher: searcher, settings: settings, blocklist: blocklist,
@@ -256,8 +263,32 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 		ebookCrit.MediaType = models.MediaTypeEbook
 		audioCrit := crit
 		audioCrit.MediaType = models.MediaTypeAudiobook
-		ebookResults, ebookDbg := h.searcher.SearchBookWithDebug(r.Context(), idxs, ebookCrit)
-		audioResults, audioDbg := h.searcher.SearchBookWithDebug(r.Context(), idxs, audioCrit)
+
+		type searchOut struct {
+			results []newznab.SearchResult
+			dbg     *indexer.SearchDebug
+		}
+		ctx := r.Context()
+		ebookCh := make(chan searchOut, 1)
+		audioCh := make(chan searchOut, 1)
+		go func() {
+			res, d := h.searcher.SearchBookWithDebug(ctx, idxs, ebookCrit)
+			for i := range res {
+				res[i].MediaType = "ebook"
+			}
+			ebookCh <- searchOut{res, d}
+		}()
+		go func() {
+			res, d := h.searcher.SearchBookWithDebug(ctx, idxs, audioCrit)
+			for i := range res {
+				res[i].MediaType = "audiobook"
+			}
+			audioCh <- searchOut{res, d}
+		}()
+		ebookOut := <-ebookCh
+		audioOut := <-audioCh
+		ebookResults, ebookDbg := ebookOut.results, ebookOut.dbg
+		audioResults, audioDbg := audioOut.results, audioOut.dbg
 		results = append(ebookResults, audioResults...)
 		results = indexer.DedupeResults(results)
 		// Merge debug info from both searches.

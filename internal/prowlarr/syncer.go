@@ -72,9 +72,9 @@ func (s *Syncer) Sync(ctx context.Context, instanceID int64) (SyncResult, error)
 
 	for _, ri := range remotes {
 		seen[ri.ProwlarrID] = struct{}{}
-		cats := ri.Categories
+		cats := filterCategoriesForMedia(ri.Categories)
 		if len(cats) == 0 {
-			cats = []int{7000, 7020}
+			cats = []int{7020}
 		}
 
 		pID := ri.ProwlarrID
@@ -85,11 +85,13 @@ func (s *Syncer) Sync(ctx context.Context, instanceID int64) (SyncResult, error)
 			// Update only if something meaningful changed. Type is included so
 			// rows created by older versions (which hardcoded "torznab" for
 			// every indexer, misrouting usenet grabs to torrent clients) are
-			// corrected on the next sync.
-			if ex.Name != ri.Name || ex.URL != ri.TorznabURL || ex.Type != idxType {
+			// corrected on the next sync. Categories are included so that
+			// re-syncing propagates removed parent categories (7000, 3000).
+			if ex.Name != ri.Name || ex.URL != ri.TorznabURL || ex.Type != idxType || !intSliceEqual(ex.Categories, cats) {
 				ex.Name = ri.Name
 				ex.URL = ri.TorznabURL
 				ex.Type = idxType
+				ex.Categories = cats
 				ex.SupportsSearch = ri.SupportsSearch
 				if err := s.indexers.Update(ctx, ex); err != nil {
 					slog.Warn("prowlarr sync: update indexer failed",
@@ -149,4 +151,51 @@ func indexerTypeForProtocol(protocol string) string {
 		return "newznab"
 	}
 	return "torznab"
+}
+
+// filterCategoriesForMedia normalises the Newznab category list at sync time.
+// Broad parent categories (7000 Other, 3000 Audio) are dropped when specific
+// children are already present. When only the parent is present (no children),
+// it is widened to its most useful specific child: 7000→7020 (Ebooks),
+// 3000→3030 (Audiobooks). All other categories pass through unchanged.
+func filterCategoriesForMedia(cats []int) []int {
+	var has7000, has3000, hasChild7, hasChild3 bool
+	for _, c := range cats {
+		switch {
+		case c == 7000:
+			has7000 = true
+		case c == 3000:
+			has3000 = true
+		case c > 7000 && c < 8000:
+			hasChild7 = true
+		case c > 3000 && c < 4000:
+			hasChild3 = true
+		}
+	}
+
+	out := make([]int, 0, len(cats))
+	for _, c := range cats {
+		if c != 7000 && c != 3000 {
+			out = append(out, c)
+		}
+	}
+	if has7000 && !hasChild7 {
+		out = append(out, 7020)
+	}
+	if has3000 && !hasChild3 {
+		out = append(out, 3030)
+	}
+	return out
+}
+
+func intSliceEqual(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

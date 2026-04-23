@@ -4,9 +4,27 @@ All notable changes to Bindery are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com) and versions follow
 [Semantic Versioning](https://semver.org).
 
-## [Unreleased] — development branch
+## [Unreleased]
 
-The `development` branch carries the in-flight feature set for the next release. Images are published as `ghcr.io/vavallee/bindery:development` and `:dev-<sha>`; point ArgoCD at the `development` branch to follow. Treat these features as beta — schema migrations are additive and safe, but UX may still shift before tagging.
+## [v1.2.0] — 2026-04-22
+
+### Added
+
+- **Default library location can now be set from Settings → General** (#332). A new "Default root folder" dropdown lets you pick any configured root folder as the library path used when an author has no per-author root folder. Existing `BINDERY_LIBRARY_DIR` continues to work as a fallback when the setting is unset. An inline "Add root folder" affordance lets you create a new root folder without leaving the page. Startup logs a warning (but does not fail) if the configured default root folder no longer exists on disk.
+- **Search results grouped by media type** — For dual-format books (ebook + audiobook), the Book Detail page now displays results in two titled sections (Ebooks / Audiobooks) each with its own 20-result cap, so audiobook results can no longer fall past the UI cap. Single-format books retain the existing flat list. Each result row in the split view shows a colour-coded media-type badge (#333).
+- **Persistent log store** — Settings → Logs now persists entries across restarts and supports filtering by date range, level, and component. Retention defaults to 14 days and is configurable via `BINDERY_LOG_RETENTION_DAYS` or Settings → General → Log retention. ([#241](https://github.com/vavallee/bindery/issues/241))
+
+### Fixed
+
+- **Multi-file ebook downloads are now fully tracked** — Delete + files removes every file (mobi, epub, pdf, etc.) and rescan cannot re-claim orphan files. Library rescan now requires a matched file to live under the candidate book's configured root folder, preventing cross-author mismapping (#343).
+- **Ebook searches no longer include the parent Books category (7000)**, which could return comics and magazines. Affects Prowlarr-synced indexers: `filterCategoriesForMedia` now matches only the 702x ebook subcategory range (7020–7029) and 303x audiobook range (3030–3039), and the syncer drops parent categories (7000, 3000) at sync time and propagates category changes on re-sync. (#344)
+- **Author sync no longer creates duplicate book rows that differ only in edition suffix, whitespace, or Unicode normalization.** Existing duplicates are merged on upgrade. Search result filtering no longer drops valid releases when the book title contains a parenthesised edition qualifier (#283).
+
+## [v1.1.7] — 2026-04-22
+
+### Fixed
+
+- **Discover page blank after first refresh** — `models.Recommendation.Genres` was typed as `string`, so the API serialised genres as a JSON-encoded string (`"[\"Fantasy\",...]"`) instead of a JSON array. The frontend called `.map()` on the string, threw a `TypeError`, and React unmounted the whole page. `Genres` is now `[]string`; the DB scan layer deserialises the stored JSON before the struct is marshalled to the API response.
 
 ## [v1.1.6] — 2026-04-22
 

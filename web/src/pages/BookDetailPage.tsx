@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, Book, HistoryEvent, SearchResult, SearchDebug } from '../api/client'
 import SearchDebugPanel from '../components/SearchDebugPanel'
+import MediaBadge from '../components/MediaBadge'
 
 function formatSize(n: number): string {
   if (!n || n <= 0) return ''
@@ -24,6 +25,75 @@ const statusColors: Record<string, string> = {
   downloaded: 'bg-purple-500/20 text-purple-700 dark:text-purple-400',
   imported: 'bg-emerald-500/20 text-emerald-700 dark:text-emerald-400',
   skipped: 'bg-slate-300 dark:bg-zinc-700 text-slate-600 dark:text-zinc-400',
+}
+
+const resultRowCls = (approved?: boolean) =>
+  `flex items-center justify-between p-2 border rounded text-xs ${
+    approved === false
+      ? 'bg-slate-50 dark:bg-zinc-950 border-slate-200 dark:border-zinc-800 opacity-60'
+      : 'bg-slate-100 dark:bg-zinc-900 border-slate-200 dark:border-zinc-800'
+  }`
+
+export function SearchResultsSection({
+  results,
+  bookMediaType,
+  grabbing,
+  onGrab,
+}: {
+  results: SearchResult[]
+  bookMediaType?: string
+  grabbing: string | null
+  onGrab: (r: SearchResult) => void
+}) {
+  const renderRow = (r: SearchResult, fmt?: 'ebook' | 'audiobook') => (
+    <div key={r.guid} className={resultRowCls(r.approved)}>
+      <div className="min-w-0 mr-3">
+        <div className="flex items-center gap-1.5 flex-wrap mb-0.5">
+          {fmt && <MediaBadge type={fmt} />}
+          <span className="truncate text-slate-800 dark:text-zinc-200">{r.title}</span>
+        </div>
+        <span className="text-slate-500 dark:text-zinc-500 truncate block">
+          {r.indexerName} · {formatSize(r.size)} · {r.grabs} grabs
+          {r.rejection && <span className="ml-2 text-amber-600 dark:text-amber-400">· {r.rejection}</span>}
+        </span>
+      </div>
+      <button
+        onClick={() => onGrab(r)}
+        disabled={grabbing !== null}
+        className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded text-[11px] font-medium flex-shrink-0"
+      >
+        {grabbing === r.guid ? 'Grabbing…' : 'Grab'}
+      </button>
+    </div>
+  )
+
+  if (bookMediaType === 'both') {
+    const ebooks = results.filter(r => r.mediaType === 'ebook')
+    const audiobooks = results.filter(r => r.mediaType === 'audiobook')
+    return (
+      <>
+        {ebooks.length > 0 && (
+          <section className="mb-4">
+            <h3 className="text-sm font-semibold mb-2 text-slate-800 dark:text-zinc-200">Ebooks ({ebooks.length})</h3>
+            <div className="space-y-1">{ebooks.slice(0, 20).map(r => renderRow(r, 'ebook'))}</div>
+          </section>
+        )}
+        {audiobooks.length > 0 && (
+          <section className="mb-4">
+            <h3 className="text-sm font-semibold mb-2 text-slate-800 dark:text-zinc-200">Audiobooks ({audiobooks.length})</h3>
+            <div className="space-y-1">{audiobooks.slice(0, 20).map(r => renderRow(r, 'audiobook'))}</div>
+          </section>
+        )}
+      </>
+    )
+  }
+
+  return (
+    <section className="mb-6">
+      <h3 className="text-sm font-semibold mb-2 text-slate-800 dark:text-zinc-200">Results ({results.length})</h3>
+      <div className="space-y-1">{results.slice(0, 20).map(r => renderRow(r))}</div>
+    </section>
+  )
 }
 
 export default function BookDetailPage() {
@@ -138,17 +208,23 @@ export default function BookDetailPage() {
     const hasLegacy = !!book.filePath && !hasEbook && !hasAudiobook
     if (!hasEbook && !hasAudiobook && !hasLegacy) return
 
+    // Count files being deleted from book_files for accurate dialog copy.
+    const relevantFiles = book.bookFiles?.filter(f => !format || f.format === format) ?? []
+    const fileCount = relevantFiles.length
+
     let label: string
-    let path: string
+    let pathSummary: string
     if (format === 'ebook' && hasEbook) {
-      label = 'the ebook file'; path = book.ebookFilePath
+      label = fileCount > 1 ? `${fileCount} ebook files` : 'the ebook file'
+      pathSummary = relevantFiles.map(f => f.path).join('\n') || book.ebookFilePath
     } else if (format === 'audiobook' && hasAudiobook) {
-      label = 'the audiobook folder'; path = book.audiobookFilePath
+      label = 'the audiobook folder'
+      pathSummary = book.audiobookFilePath
     } else {
       label = book.mediaType === 'audiobook' ? 'the audiobook folder' : 'this file'
-      path = book.filePath
+      pathSummary = book.filePath
     }
-    if (!window.confirm(`Permanently delete ${label} from disk?\n\n${path}\n\nThe book record stays; it will flip back to "wanted".`)) return
+    if (!window.confirm(`Permanently delete ${label} from disk?\n\n${pathSummary}\n\nAny sibling files with the same name (different format) will also be removed.\n\nThe book record stays; it will flip back to "wanted".`)) return
     setDeletingFile(true)
     setError(null)
     try {
@@ -166,10 +242,12 @@ export default function BookDetailPage() {
 
   const deleteBook = async () => {
     if (!book) return
-    const hasFiles = !!(book.filePath || book.ebookFilePath || book.audiobookFilePath)
-    const fileSummary = [book.ebookFilePath, book.audiobookFilePath].filter(Boolean).join('\n') || book.filePath
+    const hasFiles = !!(book.filePath || book.ebookFilePath || book.audiobookFilePath || (book.bookFiles && book.bookFiles.length > 0))
+    const fileSummary = book.bookFiles && book.bookFiles.length > 0
+      ? book.bookFiles.map(f => f.path).join('\n')
+      : [book.ebookFilePath, book.audiobookFilePath].filter(Boolean).join('\n') || book.filePath
     const msg = hasFiles
-      ? `Delete "${book.title}" AND its files on disk?\n\n${fileSummary}\n\nThis cannot be undone.`
+      ? `Delete "${book.title}" AND its files on disk?\n\n${fileSummary}\n\nSibling files with the same name (different format) will also be removed. Download history will be cleared.\n\nThis cannot be undone.`
       : `Delete "${book.title}"?\n\nThis cannot be undone.`
     if (!window.confirm(msg)) return
     setDeletingBook(true)
@@ -426,29 +504,12 @@ export default function BookDetailPage() {
       )}
 
       {results !== null && results.length > 0 && (
-        <section className="mb-6">
-          <h3 className="text-sm font-semibold mb-2 text-slate-800 dark:text-zinc-200">Results ({results.length})</h3>
-          <div className="space-y-1">
-            {results.slice(0, 20).map(r => (
-              <div key={r.guid} className={`flex items-center justify-between p-2 border rounded text-xs ${r.approved === false ? 'bg-slate-50 dark:bg-zinc-950 border-slate-200 dark:border-zinc-800 opacity-60' : 'bg-slate-100 dark:bg-zinc-900 border-slate-200 dark:border-zinc-800'}`}>
-                <div className="min-w-0 mr-3">
-                  <span className="truncate block text-slate-800 dark:text-zinc-200">{r.title}</span>
-                  <span className="text-slate-500 dark:text-zinc-500 truncate block">
-                    {r.indexerName} · {formatSize(r.size)} · {r.grabs} grabs
-                    {r.rejection && <span className="ml-2 text-amber-600 dark:text-amber-400">· {r.rejection}</span>}
-                  </span>
-                </div>
-                <button
-                  onClick={() => grab(r)}
-                  disabled={grabbing !== null}
-                  className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded text-[11px] font-medium flex-shrink-0"
-                >
-                  {grabbing === r.guid ? 'Grabbing…' : 'Grab'}
-                </button>
-              </div>
-            ))}
-          </div>
-        </section>
+        <SearchResultsSection
+          results={results}
+          bookMediaType={book.mediaType}
+          grabbing={grabbing}
+          onGrab={grab}
+        />
       )}
 
       {events.length > 0 && (

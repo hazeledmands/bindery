@@ -64,9 +64,9 @@ The short version lives in the [README](../README.md#roadmap). ✅ items have la
   - ✅ **Configurable per-library mode** ([#64](https://github.com/vavallee/bindery/issues/64), landed in v0.9.0) — Settings → General → Calibre exposes a mode selector: **Off** or **calibredb CLI**. Toggling takes effect without a restart.
   - ✅ **OPDS feed** ([#65](https://github.com/vavallee/bindery/issues/65), landed in v0.9.0) — OPDS 1.2 Atom catalogue at `/opds/v1.2/` so KOReader / Moon+ Reader / etc. can browse and download without running Calibre itself. Authenticated with HTTP Basic Auth (API key as password).
 
-- ⬜ **Storage location configurable from UI** ([#332](https://github.com/vavallee/bindery/issues/332)) — today the library root is set via the `BINDERY_LIBRARY_DIR` environment variable, which requires a container restart to change. A Settings → General field would let users update the path in-place, the same way download-client directories can already be edited.
+- ✅ **Default library location configurable from Settings UI** ([#332](https://github.com/vavallee/bindery/issues/332)) — a new "Default root folder" dropdown in Settings → General lets users pick any configured root folder as the library fallback for authors with no per-author root folder. `BINDERY_LIBRARY_DIR` continues to work as an env-var fallback when the setting is unset.
 
-- ⬜ **Split ebook / audiobook results in search** ([#333](https://github.com/vavallee/bindery/issues/333)) — when both ebook and audiobook indexers are enabled, the search results page shows only one media type at a time based on the active filter. A two-section layout (ebooks / audiobooks) would surface both in the same view so users can compare and grab from either without toggling.
+- ✅ **Split ebook / audiobook results in search** ([#333](https://github.com/vavallee/bindery/issues/333)) — when both ebook and audiobook indexers are enabled, the search results page shows only one media type at a time based on the active filter. A two-section layout (ebooks / audiobooks) would surface both in the same view so users can compare and grab from either without toggling.
 
 ## v2 horizon
 
@@ -80,7 +80,7 @@ These items are too large or architectural for a minor release. They define the 
 
   > **Ships with multi-user.** External DB support only makes sense alongside multi-user (#73 above) — a single-user instance has no concurrency pressure that justifies leaving SQLite. Plan to deliver both in the same release so the migration path is tested once, not twice.
 
-- **Persistent structured log store** — The current ring buffer (1 000 entries, in-process memory) is a good v1 for the log viewer (Settings → Logs, [#93](https://github.com/vavallee/bindery/issues/93)). A v2 log store would persist entries to the database (or a rolling log file), survive restarts, be queryable across date ranges, and support structured search. Useful for incident retrospectives on long-running instances.
+- ✅ **Persistent structured log store** ([#241](https://github.com/vavallee/bindery/issues/241), landed in development) — Persists log entries to SQLite (migration 026), survives restarts, queryable by date range / level / component / full-text. Retention defaults to 14 days and is configurable. The ring buffer remains as a fast in-process fallback when no DB is available.
 
 ## Explicitly out of scope
 

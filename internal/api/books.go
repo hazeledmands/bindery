@@ -8,20 +8,23 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/vavallee/bindery/internal/db"
+	"github.com/vavallee/bindery/internal/importer"
 	"github.com/vavallee/bindery/internal/metadata"
 	"github.com/vavallee/bindery/internal/models"
 )
 
 type BookHandler struct {
-	books    *db.BookRepo
-	meta     *metadata.Aggregator
-	history  *db.HistoryRepo
-	searcher BookSearcher
-	settings *db.SettingsRepo
+	books     *db.BookRepo
+	meta      *metadata.Aggregator
+	history   *db.HistoryRepo
+	searcher  BookSearcher
+	settings  *db.SettingsRepo
+	downloads *db.DownloadRepo
 }
 
 func NewBookHandler(books *db.BookRepo, meta *metadata.Aggregator, history *db.HistoryRepo, searcher BookSearcher) *BookHandler {
@@ -32,6 +35,13 @@ func NewBookHandler(books *db.BookRepo, meta *metadata.Aggregator, history *db.H
 // global autoGrab.enabled kill-switch.
 func (h *BookHandler) WithSettings(settings *db.SettingsRepo) *BookHandler {
 	h.settings = settings
+	return h
+}
+
+// WithDownloads wires in the download repo so the book handler can clean up
+// download records when a book is deleted with ?deleteFiles=true.
+func (h *BookHandler) WithDownloads(d *db.DownloadRepo) *BookHandler {
+	h.downloads = d
 	return h
 }
 
@@ -128,7 +138,16 @@ func (h *BookHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	proxyBookImages(book)
+	h.attachBookFiles(r.Context(), book)
 	writeJSON(w, http.StatusOK, book)
+}
+
+// attachBookFiles populates book.BookFiles from the book_files table.
+// Called on single-book responses so the frontend can display all tracked files.
+func (h *BookHandler) attachBookFiles(ctx context.Context, book *models.Book) {
+	if files, err := h.books.ListFiles(ctx, book.ID); err == nil {
+		book.BookFiles = files
+	}
 }
 
 func (h *BookHandler) Update(w http.ResponseWriter, r *http.Request) {
@@ -217,23 +236,32 @@ func (h *BookHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid id"})
 		return
 	}
-	// Opt-in `?deleteFiles=true` also removes the on-disk file or folder
-	// before dropping the record, so the user doesn't have to delete the
-	// file separately after removing the book.
+	// Opt-in `?deleteFiles=true` also removes every on-disk file tracked in
+	// book_files before dropping the record.
 	if r.URL.Query().Get("deleteFiles") == "true" {
-		if book, _ := h.books.GetByID(r.Context(), id); book != nil {
-			for _, p := range []string{book.EbookFilePath, book.AudiobookFilePath} {
-				if p != "" {
-					if err := removeBookPath(p); err != nil {
-						slog.Warn("book delete: failed to remove files", "id", id, "path", p, "error", err)
+		files, _ := h.books.ListFiles(r.Context(), id)
+		for _, f := range files {
+			if err := removeBookPath(f.Path); err != nil {
+				slog.Warn("book delete: failed to remove file", "id", id, "path", f.Path, "error", err)
+			}
+		}
+		// Fallback for books imported before the book_files migration.
+		if len(files) == 0 {
+			if book, _ := h.books.GetByID(r.Context(), id); book != nil {
+				for _, p := range []string{book.EbookFilePath, book.AudiobookFilePath, book.FilePath} {
+					if p != "" {
+						if err := removeBookPath(p); err != nil {
+							slog.Warn("book delete: failed to remove legacy file", "id", id, "path", p, "error", err)
+						}
 					}
 				}
 			}
-			// Fallback for books with only the legacy file_path set.
-			if book.EbookFilePath == "" && book.AudiobookFilePath == "" && book.FilePath != "" {
-				if err := removeBookPath(book.FilePath); err != nil {
-					slog.Warn("book delete: failed to remove files", "id", id, "path", book.FilePath, "error", err)
-				}
+		}
+		// Clean up any pending/completed download records for this book so the
+		// queue does not show stale entries after a full book deletion.
+		if h.downloads != nil {
+			if err := h.downloads.DeleteByBook(r.Context(), id); err != nil {
+				slog.Warn("book delete: failed to clean download records", "id", id, "error", err)
 			}
 		}
 	}
@@ -244,99 +272,98 @@ func (h *BookHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// DeleteFile removes the on-disk file or folder backing an imported book and
+// DeleteFile removes the on-disk file(s) backing an imported book and
 // flips the book's status back to `wanted` so it re-appears on the Wanted page.
 //
-// For single-format books the file is always the one stored in file_path.
-// For dual-format books (media_type='both') an optional `?format=ebook` or
-// `?format=audiobook` query param scopes the deletion to one format; omitting
-// it (or passing any other value) deletes both.
+// An optional `?format=ebook` or `?format=audiobook` query param scopes the
+// deletion to one format; omitting it deletes all files for the book.
+// Files are enumerated from book_files; the legacy single-path columns are
+// checked as a fallback for books imported before the migration.
 func (h *BookHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseID(w, r)
 	if !ok {
 		return
 	}
+
+	format := r.URL.Query().Get("format") // optional: "ebook" | "audiobook"
+
+	// Enumerate files from book_files for this book.
+	allFiles, err := h.books.ListFiles(r.Context(), id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	// Filter to the requested format(s).
+	var toDelete []string
+	for _, f := range allFiles {
+		if format == "" || f.Format == format {
+			toDelete = append(toDelete, f.Path)
+		}
+	}
+
+	// Fallback for books imported before the book_files migration.
+	if len(toDelete) == 0 {
+		book, err := h.books.GetByID(r.Context(), id)
+		if err != nil || book == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "book not found"})
+			return
+		}
+		if format == "" || format == models.MediaTypeEbook {
+			if book.EbookFilePath != "" { //nolint:staticcheck
+				toDelete = append(toDelete, book.EbookFilePath) //nolint:staticcheck
+			} else if book.FilePath != "" && format == models.MediaTypeEbook {
+				toDelete = append(toDelete, book.FilePath)
+			}
+		}
+		if format == "" || format == models.MediaTypeAudiobook {
+			if book.AudiobookFilePath != "" { //nolint:staticcheck
+				toDelete = append(toDelete, book.AudiobookFilePath) //nolint:staticcheck
+			}
+		}
+		// Legacy single file_path (no format qualifier).
+		if format == "" && len(toDelete) == 0 && book.FilePath != "" {
+			toDelete = append(toDelete, book.FilePath)
+		}
+		if len(toDelete) == 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "book has no file to delete"})
+			return
+		}
+	}
+
+	// Remove files from disk and from book_files.
+	var deletedPaths []string
+	for _, p := range toDelete {
+		if err := removeBookPath(p); err != nil {
+			slog.Error("failed to remove book file", "id", id, "path", p, "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		deletedPaths = append(deletedPaths, p)
+		if _, err := h.books.RemoveBookFile(r.Context(), p); err != nil {
+			slog.Warn("failed to deregister book file", "id", id, "path", p, "error", err)
+		}
+	}
+
+	// Re-load the book to get the refreshed status and file paths.
 	book, err := h.books.GetByID(r.Context(), id)
 	if err != nil || book == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "book not found"})
 		return
 	}
-
-	format := r.URL.Query().Get("format") // optional: "ebook" | "audiobook"
-	deleteEbook := (format == "" || format == models.MediaTypeEbook) && book.EbookFilePath != ""
-	deleteAudiobook := (format == "" || format == models.MediaTypeAudiobook) && book.AudiobookFilePath != ""
-
-	if !deleteEbook && !deleteAudiobook {
-		// Legacy fallback: check the old file_path for books migrated before
-		// the dual-format columns were added.
-		if book.FilePath == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "book has no file to delete"})
-			return
-		}
-		deleteEbook = true // treat legacy file_path as ebook
-	}
-
-	var deletedPaths []string
-
-	if deleteEbook && book.EbookFilePath != "" {
-		if err := removeBookPath(book.EbookFilePath); err != nil {
-			slog.Error("failed to remove ebook path", "id", id, "path", book.EbookFilePath, "error", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-			return
-		}
-		deletedPaths = append(deletedPaths, book.EbookFilePath)
-		book.EbookFilePath = ""
-	} else if deleteEbook && book.FilePath != "" {
-		// Legacy path: EbookFilePath is empty but FilePath is set.
-		// deleteEbook was set via the legacy-fallback branch above.
-		if err := removeBookPath(book.FilePath); err != nil {
-			slog.Error("failed to remove legacy file path", "id", id, "path", book.FilePath, "error", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-			return
-		}
-		deletedPaths = append(deletedPaths, book.FilePath)
-	}
-
-	if deleteAudiobook && book.AudiobookFilePath != "" {
-		if err := removeBookPath(book.AudiobookFilePath); err != nil {
-			slog.Error("failed to remove audiobook path", "id", id, "path", book.AudiobookFilePath, "error", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-			return
-		}
-		deletedPaths = append(deletedPaths, book.AudiobookFilePath)
-		book.AudiobookFilePath = ""
-	}
-
-	// Legacy file_path: clear when the corresponding per-format column is gone.
-	if book.EbookFilePath == "" && book.AudiobookFilePath == "" {
-		book.FilePath = ""
-	} else if book.EbookFilePath != "" {
-		book.FilePath = book.EbookFilePath
-	} else {
-		book.FilePath = book.AudiobookFilePath
-	}
-
-	// Status: back to wanted if any wanted format is now missing.
-	if book.NeedsEbook() || book.NeedsAudiobook() {
-		book.Status = models.BookStatusWanted
-	}
-
-	if err := h.books.Update(r.Context(), book); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
+	h.attachBookFiles(r.Context(), book)
 
 	if h.history != nil {
 		data, err := json.Marshal(map[string]any{"paths": deletedPaths})
 		if err != nil {
-			slog.Warn("failed to marshal deleted paths history event", "book_id", book.ID, "error", err)
+			slog.Warn("failed to marshal deleted paths history event", "book_id", id, "error", err)
 		} else if err := h.history.Create(r.Context(), &models.HistoryEvent{
 			BookID:      &book.ID,
 			EventType:   models.HistoryEventBookFileDeleted,
 			SourceTitle: book.Title,
 			Data:        string(data),
 		}); err != nil {
-			slog.Warn("failed to create deleted paths history event", "book_id", book.ID, "error", err)
+			slog.Warn("failed to create deleted paths history event", "book_id", id, "error", err)
 		}
 	}
 
@@ -345,6 +372,9 @@ func (h *BookHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 
 // removeBookPath deletes a file or directory at p. Audiobooks are stored as
 // folders (multi-part mp3/m4b + cover + cue); ebooks are single files.
+// For single files it also sweeps any sibling files in the same directory
+// that share the same basename (stem) and have a recognised book extension —
+// this handles dual-format downloads where epub + mobi land in one folder.
 // Returns nil if the path no longer exists — the net state is the same.
 func removeBookPath(p string) error {
 	info, err := os.Stat(p)
@@ -357,14 +387,38 @@ func removeBookPath(p string) error {
 	if info.IsDir() {
 		return os.RemoveAll(p)
 	}
-	if err := os.Remove(p); err != nil { //nosec G304 -- p is a DB-stored path written by the import pipeline, not user input
-		return err
-	}
-	// After removing a file, clean up the parent directory if it is now empty.
-	// This handles multi-format NZBs where several formats share one folder.
+
+	// Sweep sibling book files with the same stem in the parent directory.
 	parent := filepath.Dir(p)
-	entries, err := os.ReadDir(parent)
-	if err == nil && len(entries) == 0 {
+	stem := strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
+	entries, readErr := os.ReadDir(parent)
+	if readErr == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			n := e.Name()
+			if !importer.IsBookFile(n) {
+				continue
+			}
+			s := strings.TrimSuffix(n, filepath.Ext(n))
+			if !strings.EqualFold(s, stem) {
+				continue
+			}
+			if rmErr := os.Remove(filepath.Join(parent, n)); rmErr != nil && !os.IsNotExist(rmErr) { //nosec G304 -- derived from DB-stored path
+				slog.Warn("book delete: failed to remove sibling file", "path", filepath.Join(parent, n), "error", rmErr)
+			}
+		}
+	} else {
+		// ReadDir failed — fall back to deleting only the target file.
+		if err := os.Remove(p); err != nil { //nosec G304 -- p is a DB-stored path written by the import pipeline, not user input
+			return err
+		}
+	}
+
+	// Clean up parent directory if it is now empty.
+	remaining, err := os.ReadDir(parent)
+	if err == nil && len(remaining) == 0 {
 		_ = os.Remove(parent) //nosec G304 -- derived from DB-stored path, not user input
 	}
 	return nil
