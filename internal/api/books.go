@@ -380,20 +380,23 @@ func removeBookPath(p string) error {
 // deleteSiblings removes all plain files in the same directory as p that
 // share the same stem (base name without extension). Used to sweep up
 // multi-format ebook files (epub/mobi/azw3) left behind when only one format
-// was tracked. Errors are logged and swallowed — best-effort cleanup.
+// was tracked. p may have already been removed by removeBookPath — the
+// function derives dir and stem from the path string directly. Paths without
+// an extension (audiobook folder paths) are skipped. Errors are logged and
+// swallowed — best-effort cleanup.
 func deleteSiblings(p string) {
-	info, err := os.Stat(p)
-	if err != nil || info.IsDir() {
+	ext := filepath.Ext(p)
+	if ext == "" {
 		return // audiobook folders handled by removeBookPath; nothing to sweep
 	}
 	dir := filepath.Dir(p)
-	stem := strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
+	stem := strings.TrimSuffix(filepath.Base(p), ext)
 	if stem == "" {
 		return
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return
+		return // dir already gone or inaccessible
 	}
 	for _, e := range entries {
 		if e.IsDir() {
@@ -401,8 +404,9 @@ func deleteSiblings(p string) {
 		}
 		name := e.Name()
 		if strings.TrimSuffix(name, filepath.Ext(name)) == stem {
-			if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) { //nosec G304
-				slog.Warn("book delete: failed to remove sibling file", "path", filepath.Join(dir, name), "error", err)
+			target := filepath.Join(dir, name)
+			if err := os.Remove(target); err != nil && !os.IsNotExist(err) { //nosec G304
+				slog.Warn("book delete: failed to remove sibling file", "path", target, "error", err)
 			}
 		}
 	}

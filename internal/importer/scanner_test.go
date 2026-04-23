@@ -203,3 +203,28 @@ func TestPushToCalibre_NilResolver(t *testing.T) {
 	// No WithCalibre call.
 	s.pushToCalibre(ctx, book, author, "/library/book.epub") // must not panic
 }
+
+func TestJaroWinkler(t *testing.T) {
+	cases := []struct {
+		s1, s2 string
+		wantGE  float64
+		wantLT  float64
+	}{
+		{"Das Echo der Schuld", "Das Echo der Schuld", 1.0, 0},
+		{"Das Echo der Schuld", "das echo der schuld", 0, 1.0},      // case-sensitive; callers normalise
+		{"Das Echo der Schuld", "Completely Different Book Title", 0, 0.85},
+		{"The Great Gatsby", "The Great Gatsby", 1.0, 0},
+		{"1984", "1984", 1.0, 0},
+		{"", "", 1.0, 0},
+		{"abc", "", 0, 0.5},
+	}
+	for _, tc := range cases {
+		got := jaroWinkler(tc.s1, tc.s2)
+		if tc.wantGE > 0 && got < tc.wantGE {
+			t.Errorf("jaroWinkler(%q, %q) = %.4f, want >= %.4f", tc.s1, tc.s2, got, tc.wantGE)
+		}
+		if tc.wantLT > 0 && got >= tc.wantLT {
+			t.Errorf("jaroWinkler(%q, %q) = %.4f, want < %.4f", tc.s1, tc.s2, got, tc.wantLT)
+		}
+	}
+}
