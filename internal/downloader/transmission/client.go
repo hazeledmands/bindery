@@ -33,7 +33,7 @@ type Client struct {
 
 // New creates a Transmission client.
 // username and password are optional for Transmission RPC authentication.
-func New(host string, port int, username, password string, useSSL bool) *Client {
+func New(host string, port int, username, password string, useSSL bool, urlBase string) *Client {
 	scheme := "http"
 	if useSSL {
 		scheme = "https"
@@ -45,7 +45,7 @@ func New(host string, port int, username, password string, useSSL bool) *Client 
 		http:     &http.Client{Timeout: 15 * time.Second},
 	}
 
-	rpcURL, err := buildRPCURL(scheme, host, port)
+	rpcURL, err := buildRPCURL(scheme, host, port, urlBase)
 	if err != nil {
 		client.initErr = err
 	} else {
@@ -206,7 +206,7 @@ func (c *Client) buildRequest(ctx context.Context, method string, args map[strin
 	return req, nil
 }
 
-func buildRPCURL(scheme, host string, port int) (*url.URL, error) {
+func buildRPCURL(scheme, host string, port int, urlBase string) (*url.URL, error) {
 	if err := validateHost(host); err != nil {
 		return nil, err
 	}
@@ -214,10 +214,15 @@ func buildRPCURL(scheme, host string, port int) (*url.URL, error) {
 		return nil, fmt.Errorf("invalid Transmission port %d", port)
 	}
 
+	base := strings.TrimRight(strings.TrimSpace(urlBase), "/")
+	if base != "" && !strings.HasPrefix(base, "/") {
+		base = "/" + base
+	}
+
 	return &url.URL{
 		Scheme: scheme,
 		Host:   net.JoinHostPort(host, strconv.Itoa(port)),
-		Path:   "/transmission/rpc",
+		Path:   base + "/transmission/rpc",
 	}, nil
 }
 

@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -24,13 +25,17 @@ type Client struct {
 
 // New creates a NZBGet client.
 // NZBGet's JSON-RPC endpoint is http://user:pass@host:port/jsonrpc.
-func New(host string, port int, username, password string, useSSL bool) *Client {
+func New(host string, port int, username, password string, useSSL bool, urlBase string) *Client {
 	scheme := "http"
 	if useSSL {
 		scheme = "https"
 	}
+	base := strings.TrimRight(strings.TrimSpace(urlBase), "/")
+	if base != "" && !strings.HasPrefix(base, "/") {
+		base = "/" + base
+	}
 	return &Client{
-		baseURL:  fmt.Sprintf("%s://%s:%d/jsonrpc", scheme, host, port),
+		baseURL:  fmt.Sprintf("%s://%s:%d%s/jsonrpc", scheme, host, port, base),
 		username: username,
 		password: password,
 		http:     &http.Client{Timeout: 15 * time.Second},

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -20,13 +21,17 @@ type Client struct {
 }
 
 // New creates a SABnzbd client.
-func New(host string, port int, apiKey string, useSSL bool) *Client {
+func New(host string, port int, apiKey string, useSSL bool, urlBase string) *Client {
 	scheme := "http"
 	if useSSL {
 		scheme = "https"
 	}
+	base := strings.TrimRight(strings.TrimSpace(urlBase), "/")
+	if base != "" && !strings.HasPrefix(base, "/") {
+		base = "/" + base
+	}
 	return &Client{
-		baseURL: fmt.Sprintf("%s://%s:%d", scheme, host, port),
+		baseURL: fmt.Sprintf("%s://%s:%d%s", scheme, host, port, base),
 		apiKey:  apiKey,
 		http:    &http.Client{Timeout: 15 * time.Second},
 	}

@@ -24,10 +24,6 @@ var hashPollTimeout = 30 * time.Second
 // Authentication is cookie-based: Login() obtains a SID cookie which is
 // stored in the embedded http.Client's cookie jar and sent automatically on
 // subsequent requests.
-//
-// Field mapping for DownloadClient storage:
-//   - APIKey  → password  (qBittorrent uses username/password, not an API key)
-//   - URLBase → username  (reused since qBittorrent ignores URL base)
 type Client struct {
 	baseURL  string
 	username string
@@ -38,17 +34,18 @@ type Client struct {
 }
 
 // New creates a qBittorrent client.
-// username and password map to the DownloadClient's URLBase and APIKey fields
-// respectively (see comment on the Client struct).
-func New(host string, port int, username, password string, useSSL bool) *Client {
+func New(host string, port int, username, password string, useSSL bool, urlBase string) *Client {
 	scheme := "http"
 	if useSSL {
 		scheme = "https"
 	}
-
+	base := strings.TrimRight(strings.TrimSpace(urlBase), "/")
+	if base != "" && !strings.HasPrefix(base, "/") {
+		base = "/" + base
+	}
 	jar, _ := cookiejar.New(nil)
 	return &Client{
-		baseURL:  fmt.Sprintf("%s://%s:%d", scheme, host, port),
+		baseURL:  fmt.Sprintf("%s://%s:%d%s", scheme, host, port, base),
 		username: username,
 		password: password,
 		http:     &http.Client{Timeout: 15 * time.Second, Jar: jar},
