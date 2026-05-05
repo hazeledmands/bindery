@@ -179,6 +179,18 @@ func TestFilterRelevantApostrophe(t *testing.T) {
 			},
 			wantAny: "Douglas.Adams.Hitchhikers.Guide.to.the.Galaxy.epub",
 		},
+		{
+			// Possessive brand-prefix titles: releases drop the "'s" entirely
+			// ("Tom Clancy Rainbow Six") rather than contracting it ("Tom Clancys").
+			bookTitle: "Tom Clancy's Rainbow Six",
+			author:    "Tom Clancy",
+			releases: []string{
+				"Tom.Clancy.Rainbow.Six.epub",
+				"Tom.Clancy.-.Rainbow.Six.RETAIL.epub",
+				"Unrelated.Book.epub",
+			},
+			wantAny: "Tom.Clancy.Rainbow.Six.epub",
+		},
 	}
 
 	for _, tc := range cases {

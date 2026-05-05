@@ -186,6 +186,23 @@ func sigWords(s string) []string {
 	return out
 }
 
+// sigWordsDepossessive is like sigWords but strips possessive "'s" as a suffix
+// before removing remaining apostrophes. This produces "clancy" from "clancy's"
+// rather than "clancys", matching releases that drop the possessive 's entirely
+// (e.g. "Tom Clancy Rainbow Six" for title "Tom Clancy's Rainbow Six").
+func sigWordsDepossessive(s string) []string {
+	var out []string
+	for _, w := range strings.Fields(strings.ToLower(s)) {
+		w = strings.ReplaceAll(w, "'s", "") // "clancy's" → "clancy"
+		w = strings.ReplaceAll(w, "'", "")  // remaining apostrophes
+		w = transliterateUmlauts(w)
+		if len(w) >= 3 && !stopWords[w] {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
 // primaryTitle returns the portion of title before the first colon (used for
 // subtitle handling — "Dune: Messiah" → "Dune"). If there's no colon the full
 // title is returned.
@@ -241,6 +258,9 @@ func titleMatchesResult(normResult string, titleKws []string, surname string, al
 //   - Titles with no significant words: fall back to the author surname alone.
 //   - Subtitle handling: if the title has "primary: subtitle", results matching
 //     either the primary-only or the full title form are accepted.
+//   - Possessive handling: if the standard form fails, also try keywords with
+//     possessive "'s" stripped entirely (e.g. "clancy" for "clancy's") to match
+//     releases that drop the possessive suffix rather than contracting it.
 //
 // Each result is evaluated independently. The previous batch-level
 // anyPhraseMatch gate (which disabled keyword fallback for the whole batch if
@@ -250,6 +270,7 @@ func titleMatchesResult(normResult string, titleKws []string, surname string, al
 func filterRelevant(results []newznab.SearchResult, title, author string) []newznab.SearchResult {
 	fullKws := sigWords(title)
 	primaryKws := sigWords(primaryTitle(title))
+	depossessiveKws := sigWordsDepossessive(title)
 	authorKws := sigWords(author)
 	surname := AuthorSurname(author)
 
@@ -274,7 +295,11 @@ func filterRelevant(results []newznab.SearchResult, title, author string) []newz
 		if !fullOK && len(primaryKws) > 0 && !sameKws(primaryKws, fullKws) {
 			primaryOK = titleMatchesResult(n, primaryKws, surname, true)
 		}
-		if fullOK || primaryOK {
+		depossessiveOK := false
+		if !fullOK && !primaryOK && !sameKws(fullKws, depossessiveKws) {
+			depossessiveOK = titleMatchesResult(n, depossessiveKws, surname, true)
+		}
+		if fullOK || primaryOK || depossessiveOK {
 			filtered = append(filtered, r)
 		}
 	}
