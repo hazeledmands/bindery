@@ -712,6 +712,22 @@ func TestFilterRelevantPossessivePrefix(t *testing.T) {
 				"James.Patterson.Kiss.the.Girls.epub",
 			},
 		},
+		{
+			// Unicode right-single-quotation-mark (U+2019, 3 bytes) instead of
+			// ASCII apostrophe — regression for the byte-offset slice bug.
+			bookTitle: "Tom Clancy’s Rainbow Six",
+			author:    "Tom Clancy",
+			releases: []string{
+				"Tom.Clancy.-.Rainbow.Six.epub",
+				"Tom.Clancy.-.The.Hunt.for.Red.October.epub",
+			},
+			wantPass: []string{
+				"Tom.Clancy.-.Rainbow.Six.epub",
+			},
+			wantDrop: []string{
+				"Tom.Clancy.-.The.Hunt.for.Red.October.epub",
+			},
+		},
 	}
 
 	for _, tc := range cases {

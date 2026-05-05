@@ -225,7 +225,11 @@ func stripPossessivePrefix(title, author string) string {
 	for n := len(authorFields); n >= 1; n-- {
 		prefix := strings.ToLower(strings.Join(authorFields[:n], " ")) + "'s "
 		if strings.HasPrefix(lowerTitle, prefix) {
-			stripped := strings.TrimSpace(title[len(prefix):])
+			// Slice normTitle (not title): both use ASCII apostrophe, so
+			// len(prefix) is a valid byte offset into normTitle. Slicing the
+			// original title mis-aligns when it contains a Unicode
+			// right-single-quotation-mark (3 bytes vs ASCII 1 byte).
+			stripped := strings.TrimSpace(normTitle[len(prefix):])
 			if stripped != "" {
 				return stripped
 			}
