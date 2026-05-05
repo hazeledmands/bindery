@@ -100,8 +100,10 @@ func (h *MigrateHandler) ImportCSV(w http.ResponseWriter, r *http.Request) {
 // readarr.db (SQLite). It's saved to a temp file (sqlite driver wants a
 // path), imported, then deleted.
 func (h *MigrateHandler) ImportReadarr(w http.ResponseWriter, r *http.Request) {
+	slog.Info("readarr import started", "content_length", r.ContentLength)
 	file, err := acceptUpload(w, r, 1<<30) // 1 GB cap — readarr.db is usually < 100 MB
 	if err != nil {
+		slog.Warn("readarr upload rejected", "error", err)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
