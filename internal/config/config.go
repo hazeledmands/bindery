@@ -12,14 +12,14 @@ import (
 
 // Config holds the application configuration loaded from environment variables.
 type Config struct {
-	Port              string
-	DBPath            string
-	DataDir           string
-	LogLevel          string
-	APIKey            string
-	DownloadDir       string
-	LibraryDir        string
-	AudiobookDir      string
+	Port         string
+	DBPath       string
+	DataDir      string
+	LogLevel     string
+	APIKey       string
+	DownloadDir  string
+	LibraryDir   string
+	AudiobookDir string
 	// Enhanced Hardcover series API (BINDERY_ENHANCED_HARDCOVER_API, default false).
 	EnhancedHardcoverAPI bool
 	DownloadPathRemap    string
