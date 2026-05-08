@@ -17,6 +17,13 @@ type BookSearcher interface {
 	SearchAndGrabBook(ctx context.Context, book models.Book)
 }
 
+// BookMetaLookup fetches a single book record from a named provider,
+// bypassing the TTL cache. Implemented by *metadata.Aggregator; kept as an
+// interface so the Rebind handler can be tested without a real HTTP client.
+type BookMetaLookup interface {
+	GetBookFromProvider(ctx context.Context, provider, foreignID string) (*models.Book, error)
+}
+
 // LibraryFinder checks whether a book already exists in the local library.
 // Implemented by *importer.Scanner; a nil implementation is a no-op. The
 // mediaType argument selects which library roots are searched (ebook vs

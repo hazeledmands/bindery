@@ -23,6 +23,7 @@ import (
 type BookHandler struct {
 	books     *db.BookRepo
 	meta      *metadata.Aggregator
+	lookup    BookMetaLookup // used by Rebind; defaults to meta when non-nil
 	history   *db.HistoryRepo
 	searcher  BookSearcher
 	settings  *db.SettingsRepo
@@ -32,7 +33,18 @@ type BookHandler struct {
 }
 
 func NewBookHandler(books *db.BookRepo, meta *metadata.Aggregator, history *db.HistoryRepo, searcher BookSearcher) *BookHandler {
-	return &BookHandler{books: books, meta: meta, history: history, searcher: searcher}
+	h := &BookHandler{books: books, meta: meta, history: history, searcher: searcher}
+	if meta != nil {
+		h.lookup = meta
+	}
+	return h
+}
+
+// WithMetaLookup overrides the BookMetaLookup used by Rebind. Useful in tests
+// to inject a stub without a real HTTP client.
+func (h *BookHandler) WithMetaLookup(l BookMetaLookup) *BookHandler {
+	h.lookup = l
+	return h
 }
 
 // WithSettings wires in the settings repo so the book handler can consult the
@@ -520,12 +532,12 @@ func (h *BookHandler) Rebind(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.meta == nil {
+	if h.lookup == nil {
 		writeJSON(w, http.StatusFailedDependency, map[string]string{"error": "metadata aggregator not configured"})
 		return
 	}
 
-	upstream, err := h.meta.GetBookFromProvider(r.Context(), req.Provider, req.ForeignID)
+	upstream, err := h.lookup.GetBookFromProvider(r.Context(), req.Provider, req.ForeignID)
 	if err != nil {
 		slog.Warn("rebind: upstream fetch failed", "bookId", book.ID, "provider", req.Provider, "foreignId", req.ForeignID, "error", err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
