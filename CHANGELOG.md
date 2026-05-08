@@ -6,6 +6,8 @@ All notable changes to Bindery are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [v1.7.0] — 2026-05-08
+
 ### Added
 
 - **Subpath / reverse-proxy hosting** (`BINDERY_URL_BASE`) (#516) — New env var strips incoming URLs to their path, validates the prefix, injects `<base href>` and `window.__BINDERY_BASE__` into the served `index.html` at runtime, and mounts all chi routes under the prefix. Vite is built with `base: './'` for relative asset URLs; the React router and API client read `window.__BINDERY_BASE__` for the basename and prefix.
