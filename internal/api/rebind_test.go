@@ -150,7 +150,7 @@ func TestRebind_ProviderError_Returns502(t *testing.T) {
 func TestRebind_AuthorMismatch_Rejected(t *testing.T) {
 	h, _, _, _, _, book, _ := rebindFixture(t)
 	h.WithMetaLookup(&stubLookup{book: &models.Book{
-		Title: "Different Author's Book",
+		Title:  "Different Author's Book",
 		Author: &models.Author{ForeignID: "OL_OTHER_A", Name: "Someone Else"},
 	}})
 
@@ -171,7 +171,7 @@ func TestRebind_AuthorMismatch_Rejected(t *testing.T) {
 func TestRebind_AuthorMismatch_ForceOverrides(t *testing.T) {
 	h, _, _, _, _, book, _ := rebindFixture(t)
 	h.WithMetaLookup(&stubLookup{book: &models.Book{
-		Title: "Different Author's Book",
+		Title:  "Different Author's Book",
 		Author: &models.Author{ForeignID: "OL_OTHER_A", Name: "Someone Else"},
 	}})
 
@@ -197,7 +197,7 @@ func TestRebind_SeriesRelinked(t *testing.T) {
 	}
 
 	h.WithMetaLookup(&stubLookup{book: &models.Book{
-		Title: "New Title",
+		Title:  "New Title",
 		Author: &models.Author{ForeignID: author.ForeignID},
 		SeriesRefs: []models.SeriesRef{
 			{ForeignID: "SER_NEW", Title: "New Series", Position: "2", Primary: true},
