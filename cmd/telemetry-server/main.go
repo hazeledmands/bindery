@@ -1280,6 +1280,7 @@ func (s *server) computePreviewData(ctx context.Context, f previewFilters) (*pre
 			q += ` AND last_seen >= ?`
 			args = append(args, cutoff)
 		}
+		// #nosec G202 G701 -- extraWhere is built by previewFilters.whereClause() from a static set of "<col> = ?" fragments; user values are bound via extraArgs.
 		q += extraWhere
 		args = append(args, extraArgs...)
 		if err := s.db.QueryRowContext(ctx, q, args...).Scan(&d.ActiveRange); err != nil {
@@ -1291,6 +1292,7 @@ func (s *server) computePreviewData(ctx context.Context, f previewFilters) (*pre
 	// "how many installs have we ever seen?" number. OS/deploy filters still
 	// apply so the card matches the rest of the page.
 	{
+		// #nosec G202 G701 -- see whereClause; static fragments + ? placeholders.
 		q := `SELECT COUNT(*) FROM installs WHERE 1=1` + extraWhere
 		if err := s.db.QueryRowContext(ctx, q, extraArgs...).Scan(&d.Total); err != nil {
 			return nil, err
@@ -1305,6 +1307,7 @@ func (s *server) computePreviewData(ctx context.Context, f previewFilters) (*pre
 			q += ` AND first_seen >= ?`
 			args = append(args, cutoff)
 		}
+		// #nosec G202 G701 -- see whereClause; static fragments + ? placeholders.
 		q += extraWhere
 		args = append(args, extraArgs...)
 		if err := s.db.QueryRowContext(ctx, q, args...).Scan(&d.NewRange); err != nil {
@@ -1320,6 +1323,7 @@ func (s *server) computePreviewData(ctx context.Context, f previewFilters) (*pre
 		prevStart := cutoff.Add(-span)
 		prevEnd := cutoff
 		args := []any{prevStart, prevEnd}
+		// #nosec G202 G701 -- see whereClause; static fragments + ? placeholders.
 		q := `SELECT COUNT(*) FROM installs WHERE last_seen >= ? AND last_seen < ?` + extraWhere
 		args = append(args, extraArgs...)
 		if err := s.db.QueryRowContext(ctx, q, args...).Scan(&d.ActivePrev); err != nil {
@@ -1340,6 +1344,7 @@ func (s *server) computePreviewData(ctx context.Context, f previewFilters) (*pre
 			q += ` AND last_seen >= ?`
 			args = append(args, cutoff)
 		}
+		// #nosec G202 G701 -- see whereClause; static fragments + ? placeholders.
 		q += extraWhere
 		args = append(args, extraArgs...)
 		q += ` GROUP BY ` + col + ` ORDER BY COUNT(*) DESC`
@@ -1396,6 +1401,7 @@ func (s *server) computePreviewData(ctx context.Context, f previewFilters) (*pre
 			q += ` AND last_seen >= ?`
 			args = append(args, cutoff)
 		}
+		// #nosec G202 G701 -- see whereClause; static fragments + ? placeholders.
 		q += extraWhere
 		args = append(args, extraArgs...)
 		q += ` GROUP BY bucket`
@@ -1408,12 +1414,12 @@ func (s *server) computePreviewData(ctx context.Context, f previewFilters) (*pre
 			var bucket string
 			var count int
 			if err := rows.Scan(&bucket, &count); err != nil {
-				rows.Close()
+				_ = rows.Close()
 				return nil, err
 			}
 			lonMap[bucket] = count
 		}
-		rows.Close()
+		_ = rows.Close()
 		for _, label := range []string{"< 1 week", "1–4 weeks", "1–3 months", "3+ months"} {
 			d.Longevity = append(d.Longevity, statsBucket{Label: label, Count: lonMap[label]})
 		}
@@ -1427,6 +1433,7 @@ func (s *server) computePreviewData(ctx context.Context, f previewFilters) (*pre
 	chartCutoff := today.AddDate(0, 0, -(days - 1))
 	{
 		args := []any{chartCutoff}
+		// #nosec G202 G701 -- see whereClause; static fragments + ? placeholders.
 		q := `SELECT substr(last_seen, 1, 10) AS day, COUNT(*) FROM installs WHERE last_seen >= ?` + extraWhere
 		args = append(args, extraArgs...)
 		q += ` GROUP BY day ORDER BY day`
@@ -1439,12 +1446,12 @@ func (s *server) computePreviewData(ctx context.Context, f previewFilters) (*pre
 			var day string
 			var count int
 			if err := rows.Scan(&day, &count); err != nil {
-				rows.Close()
+				_ = rows.Close()
 				return nil, err
 			}
 			dayCount[day] = count
 		}
-		rows.Close()
+		_ = rows.Close()
 		for i := days - 1; i >= 0; i-- {
 			day := today.AddDate(0, 0, -i)
 			key := day.Format("2006-01-02")
@@ -1455,6 +1462,7 @@ func (s *server) computePreviewData(ctx context.Context, f previewFilters) (*pre
 	// New installs per day over the same window.
 	{
 		args := []any{chartCutoff}
+		// #nosec G202 G701 -- see whereClause; static fragments + ? placeholders.
 		q := `SELECT substr(first_seen, 1, 10) AS day, COUNT(*) FROM installs WHERE first_seen >= ?` + extraWhere
 		args = append(args, extraArgs...)
 		q += ` GROUP BY day ORDER BY day`
@@ -1467,12 +1475,12 @@ func (s *server) computePreviewData(ctx context.Context, f previewFilters) (*pre
 			var day string
 			var count int
 			if err := rows.Scan(&day, &count); err != nil {
-				rows.Close()
+				_ = rows.Close()
 				return nil, err
 			}
 			dayCount[day] = count
 		}
-		rows.Close()
+		_ = rows.Close()
 		for i := days - 1; i >= 0; i-- {
 			day := today.AddDate(0, 0, -i)
 			key := day.Format("2006-01-02")
@@ -1493,6 +1501,7 @@ func (s *server) computePreviewData(ctx context.Context, f previewFilters) (*pre
 	// existing query shape but with the range-aware cutoff + OS/deploy filter.
 	{
 		args := []any{chartCutoff}
+		// #nosec G202 G701 -- see whereClause; static fragments + ? placeholders.
 		q := `SELECT substr(last_seen, 1, 10) AS day, version, COUNT(*) FROM installs WHERE last_seen >= ?` + extraWhere
 		args = append(args, extraArgs...)
 		q += ` GROUP BY day, version ORDER BY day`
@@ -1505,7 +1514,7 @@ func (s *server) computePreviewData(ctx context.Context, f previewFilters) (*pre
 			var day, ver string
 			var count int
 			if err := rows.Scan(&day, &ver, &count); err != nil {
-				rows.Close()
+				_ = rows.Close()
 				return nil, err
 			}
 			if vtMap[day] == nil {
@@ -1513,7 +1522,7 @@ func (s *server) computePreviewData(ctx context.Context, f previewFilters) (*pre
 			}
 			vtMap[day][ver] = count
 		}
-		rows.Close()
+		_ = rows.Close()
 		for i := days - 1; i >= 0; i-- {
 			day := today.AddDate(0, 0, -i)
 			key := day.Format("2006-01-02")
@@ -1560,6 +1569,7 @@ func (s *server) computeRetentionCohorts(ctx context.Context, f previewFilters, 
 	args = append(args, extraArgs...)
 	// Pull every install whose first_seen is within the cohort window.
 	// SQLite's substr() is fine for stable last_seen/first_seen formatting.
+	// #nosec G202 G701 -- see whereClause; static fragments + ? placeholders.
 	q := `SELECT substr(first_seen, 1, 10), substr(last_seen, 1, 10) FROM installs WHERE first_seen >= ?` + extraWhere
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -1688,16 +1698,16 @@ func buildPreviewPayload(d *previewData) previewPayload {
 		p.New = append(p.New, day.Count)
 	}
 	for _, b := range d.OS {
-		p.OS = append(p.OS, labelCount{b.Label, b.Count})
+		p.OS = append(p.OS, labelCount(b))
 	}
 	for _, b := range d.Arch {
-		p.Arch = append(p.Arch, labelCount{b.Label, b.Count})
+		p.Arch = append(p.Arch, labelCount(b))
 	}
 	for _, b := range d.Deploy {
-		p.Deploy = append(p.Deploy, labelCount{b.Label, b.Count})
+		p.Deploy = append(p.Deploy, labelCount(b))
 	}
 	for _, b := range d.Longevity {
-		p.Longevity = append(p.Longevity, labelCount{b.Label, b.Count})
+		p.Longevity = append(p.Longevity, labelCount(b))
 	}
 
 	// Version-mix stacked area: one series per top version + "(other)".
@@ -2145,7 +2155,7 @@ func hexRGB(s string) (int, int, int) {
 		return 0, 0, 0
 	}
 	var r, g, b int
-	fmt.Sscanf(s[1:], "%02x%02x%02x", &r, &g, &b)
+	_, _ = fmt.Sscanf(s[1:], "%02x%02x%02x", &r, &g, &b)
 	return r, g, b
 }
 
