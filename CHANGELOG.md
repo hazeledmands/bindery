@@ -6,6 +6,10 @@ All notable changes to Bindery are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **Telemetry preview dashboard** — New `/stats/preview` page with interactive filters (time range, OS, deployment), version-adoption stacked area chart, retention cohorts, and per-distribution doughnut charts. Existing `/stats` is unchanged.
+
 ## [v1.9.3] — 2026-05-12
 
 ### Fixed
