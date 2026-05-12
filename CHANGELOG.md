@@ -10,21 +10,10 @@ All notable changes to Bindery are documented here. Format loosely follows
 
 - **Discord stats voice channels** — A k8s CronJob in `deploy/discord-stats.yaml` updates three Discord voice channels every 10 minutes with live active-install count, latest released version, and GitHub star count. Powered by a new `/stats.json` JSON endpoint on the telemetry server. Setup steps in `deploy/README.md`.
 
-## [v1.9.5] — 2026-05-12
-
 ### Fixed
 
-- **qBittorrent v5.x login now works** (#616, #623) — qBit 5.0 introduced two breaking changes to `/api/v2/auth/login` that v1.9.4 and earlier didn't handle: (1) CSRF protection requires matching `Origin` and `Referer` headers (without them, login is silently rejected — the empty-body 403 that v1.9.4 surfaced as an IP-ban hint); (2) successful login returns `204 No Content` instead of `200 OK` + body `Ok.`. Bindery now sends both headers on every login request (v4.x ignores them, so the change is version-safe) and accepts `204` as success alongside the v4.x `200`. Original fix and tests authored by @statte.
-
-## [v1.9.4] — 2026-05-12
-
-### Added
-
-- **Telemetry preview dashboard** — New `/stats/preview` page with interactive filters (time range, OS, deployment), version-adoption stacked area chart, retention cohorts, and per-distribution doughnut charts. Existing `/stats` is unchanged.
-
-### Fixed
-
-- **qBittorrent connection-test error messages are no longer misleading** — When qBit returned `HTTP 403` with an empty body (the shape of an IP ban after repeated failed logins), bindery previously surfaced `qBittorrent login failed: ` (empty) wrapped with `could not reach qBittorrent at … (in Docker use the service/container name, not localhost)`. The "could not reach" hint and Docker-name hint only apply to actual transport failures, not to a server that responded with a rejection. The qBittorrent client now returns a typed `*AuthError` carrying the HTTP status and body; `Test()` rewords accordingly (`connected to qBittorrent at … but qBittorrent auth failed (HTTP 403, empty body): your IP is most likely banned…`) so the user knows where to look. Bad credentials and host-header rejection get their own targeted hints.
+- **Stale ABS-sourced author aliases are now cleaned up post-import** — When an audiobook import recorded a co-author (or a different-named primary author) as an alias, the alias would stick around tagged `SourceOLID="abs"` even when it no longer matched the canonical author. The importer now sweeps these at the end of each run and drops aliases that don't fuzzy-match the canonical name. Also prevents pen-name corruption by requiring secondary-author aliases recorded during import to fuzzy-match the canonical author. Extracted from #515.
+- **Manual alias deletion** — New `DELETE /api/v1/author/{id}/aliases/{aliasID}` endpoint lets the UI / API clients remove specific aliases without merging the whole author. Scoped to (authorID, aliasID) pair; returns 404 if the alias isn't on that author so cross-author tampering can't happen. Extracted from #515.
 
 ## [v1.9.3] — 2026-05-12
 
