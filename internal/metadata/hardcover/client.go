@@ -484,7 +484,7 @@ func (c *Client) GetListBooks(ctx context.Context, listID int) ([]models.Book, e
 		return c.getShelfBooks(ctx, statusID)
 	}
 	gql := `query GetListBooks($id: Int!) {
-		list(id: $id) {
+		lists(where: {id: {_eq: $id}}, limit: 1) {
 			id
 			name
 			slug
@@ -507,18 +507,21 @@ func (c *Client) GetListBooks(ctx context.Context, listID int) ([]models.Book, e
 	}`
 	var resp struct {
 		Data struct {
-			List struct {
+			Lists []struct {
 				ListBooks []struct {
 					Book hcBook `json:"book"`
 				} `json:"list_books"`
-			} `json:"list"`
+			} `json:"lists"`
 		} `json:"data"`
 	}
 	if err := c.query(ctx, gql, map[string]any{"id": listID}, &resp); err != nil {
 		return nil, fmt.Errorf("hardcover get list books: %w", err)
 	}
-	books := make([]models.Book, 0, len(resp.Data.List.ListBooks))
-	for _, lb := range resp.Data.List.ListBooks {
+	if len(resp.Data.Lists) == 0 {
+		return nil, nil
+	}
+	books := make([]models.Book, 0, len(resp.Data.Lists[0].ListBooks))
+	for _, lb := range resp.Data.Lists[0].ListBooks {
 		books = append(books, c.toBook(lb.Book))
 	}
 	return books, nil

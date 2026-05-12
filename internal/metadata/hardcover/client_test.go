@@ -1082,6 +1082,39 @@ func TestGetListBooks_BuiltinShelfRoutesToUserBooks(t *testing.T) {
 	}
 }
 
+func TestGetListBooks_PositiveID(t *testing.T) {
+	var gotVars map[string]any
+	var gotQuery string
+	c := newMockClient(func(r *http.Request) (*http.Response, error) {
+		var req gqlRequest
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &req)
+		gotVars = req.Variables
+		gotQuery = req.Query
+		resp := `{"data":{"lists":[{"id":42,"name":"Favorites","slug":"favorites","list_books":[{"book":{"id":99,"title":"Dune","slug":"dune","contributions":[{"author":{"id":1,"name":"Frank Herbert","slug":"frank-herbert"}}]}}]}]}}`
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(resp)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	c = c.WithToken("hc-token")
+
+	books, err := c.GetListBooks(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("GetListBooks: %v", err)
+	}
+	if len(books) != 1 || books[0].Title != "Dune" {
+		t.Errorf("books = %+v, want [{Title:Dune}]", books)
+	}
+	if gotVars["id"] != float64(42) {
+		t.Errorf("id var = %v, want 42", gotVars["id"])
+	}
+	if !strings.Contains(gotQuery, "lists(where:") {
+		t.Errorf("query should use plural lists(where:) field, got: %q", gotQuery)
+	}
+}
+
 func TestHcShelfStatusID(t *testing.T) {
 	cases := []struct{ id, want int }{{-1, 1}, {-2, 2}, {-3, 3}, {-4, 4}}
 	for _, tc := range cases {

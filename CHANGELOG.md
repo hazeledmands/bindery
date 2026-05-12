@@ -12,6 +12,8 @@ All notable changes to Bindery are documented here. Format loosely follows
 
 - **Enhanced Hardcover series controls are no longer hidden by default** (#596) — The deployment-wide `BINDERY_ENHANCED_HARDCOVER_API` flag now defaults to enabled, leaving the saved Hardcover token and **Settings -> General** admin toggle as the normal feature gates. Operators can still set the flag to `false` to disable the feature for an entire deployment.
 
+- Hardcover list sync now uses the plural `lists(where:)` root field; the singular `list(id:)` query was rejected by Hardcover's GraphQL schema (#562).
+
 ## [v1.9.1] — 2026-05-11
 
 ### Fixed
