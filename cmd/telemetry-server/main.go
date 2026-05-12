@@ -1581,6 +1581,7 @@ func (s *server) computeRetentionCohorts(ctx context.Context, f previewFilters, 
 	args = append(args, extraArgs...)
 	// Pull every install whose first_seen is within the cohort window.
 	// SQLite's substr() is fine for stable last_seen/first_seen formatting.
+	// #nosec G202 -- extraWhere is static fragments; values bound via extraArgs.
 	q := `SELECT substr(first_seen, 1, 10), substr(last_seen, 1, 10) FROM installs WHERE first_seen >= ?` + extraWhere
 	// #nosec G202 G701 -- see whereClause; static fragments + ? placeholders.
 	rows, err := s.db.QueryContext(ctx, q, args...)
