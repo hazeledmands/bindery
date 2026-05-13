@@ -682,7 +682,7 @@ func TestImporter_FindAuthorByName_MatchingTiers(t *testing.T) {
 	}
 }
 
-func TestImporter_RunScopedAuthorMatcherSeesAliasCreatedEarlierInRun(t *testing.T) {
+func TestImporter_DoesNotUseSecondaryAuthorsAsPrimaryIdentity(t *testing.T) {
 	t.Parallel()
 
 	importer, authorRepo, _, _, _, _, _, _, _, _ := newABSImporterFixture(t)
@@ -732,35 +732,221 @@ func TestImporter_RunScopedAuthorMatcherSeesAliasCreatedEarlierInRun(t *testing.
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if stats.AuthorsCreated != 1 || stats.AuthorsLinked != 1 {
-		t.Fatalf("stats = %+v, want one created author and one linked author", stats)
+	if stats.AuthorsCreated != 2 || stats.AuthorsLinked != 0 {
+		t.Fatalf("stats = %+v, want two created authors and no linked authors", stats)
 	}
 
 	authors, err := authorRepo.List(ctx)
 	if err != nil {
 		t.Fatalf("List authors: %v", err)
 	}
-	if len(authors) != 1 || authors[0].Name != "Cache Primary" {
-		t.Fatalf("authors = %+v, want only Cache Primary", authors)
+	if len(authors) != 2 {
+		t.Fatalf("authors = %+v, want Cache Primary and Cache Pen Name", authors)
 	}
-	aliases, err := importer.aliases.ListByAuthor(ctx, authors[0].ID)
+	var primaryID int64
+	authorNames := make(map[string]bool)
+	for _, author := range authors {
+		authorNames[author.Name] = true
+		if author.Name == "Cache Primary" {
+			primaryID = author.ID
+		}
+	}
+	if !authorNames["Cache Primary"] || !authorNames["Cache Pen Name"] {
+		t.Fatalf("authors = %+v, want Cache Primary and Cache Pen Name", authors)
+	}
+	aliases, err := importer.aliases.ListByAuthor(ctx, primaryID)
 	if err != nil {
 		t.Fatalf("ListByAuthor: %v", err)
 	}
-	foundAlias := false
-	for _, alias := range aliases {
-		if alias.Name == "Cache Pen Name" {
-			foundAlias = true
-			break
-		}
-	}
-	if !foundAlias {
-		t.Fatalf("aliases = %+v, want Cache Pen Name", aliases)
+	if len(aliases) != 0 {
+		t.Fatalf("aliases = %+v, want arbitrary secondary author not recorded as alias", aliases)
 	}
 
 	progress := importer.Progress()
-	if len(progress.Results) != 2 || progress.Results[1].MatchedBy != "alias" {
-		t.Fatalf("progress results = %+v, want second item matched by alias", progress.Results)
+	if len(progress.Results) != 2 || progress.Results[1].MatchedBy != "created" {
+		t.Fatalf("progress results = %+v, want second item created separately", progress.Results)
+	}
+}
+
+func TestImporter_ABSAuthorIdentityCorruptionRegression(t *testing.T) {
+	t.Parallel()
+
+	importer, authorRepo, bookRepo, _, _, _, _, _, _, _ := newABSImporterFixture(t)
+	ctx := context.Background()
+	makeItem := func(itemID, title, asin, authorID, authorName string, extras ...NormalizedAuthor) NormalizedLibraryItem {
+		item := sampleABSItem()
+		item.ItemID = itemID
+		item.Title = title
+		item.ASIN = asin
+		item.Authors = append([]NormalizedAuthor{{ID: authorID, Name: authorName}}, extras...)
+		item.Series = nil
+		item.AudioFiles = []NormalizedAudioFile{{INO: "audio-" + itemID, Path: "/abs/" + itemID + ".m4b"}}
+		item.EbookPath = ""
+		item.EbookINO = ""
+		return item
+	}
+	items := []NormalizedLibraryItem{
+		makeItem("li-wheel", "The Gathering Storm", "ASIN-WHEEL", "author-robert-jordan", "Robert Jordan", NormalizedAuthor{ID: "author-brandon-sanderson", Name: "Brandon Sanderson"}),
+		makeItem("li-mistborn", "Mistborn", "ASIN-MISTBORN", "author-brandon-sanderson", "Brandon Sanderson"),
+		makeItem("li-graphic", "GraphicAudio Production", "ASIN-GRAPHIC", "author-graphic-audio", "GraphicAudio"),
+	}
+	importer.enumerateFn = func(ctx context.Context, libraryID string, fn func(context.Context, NormalizedLibraryItem) error) (EnumerationStats, error) {
+		for _, item := range items {
+			if err := fn(ctx, item); err != nil {
+				return EnumerationStats{}, err
+			}
+		}
+		return EnumerationStats{PagesScanned: 1, ItemsSeen: len(items), ItemsNormalized: len(items)}, nil
+	}
+
+	stats, err := importer.Run(ctx, ImportConfig{
+		SourceID:  DefaultSourceID,
+		BaseURL:   "https://abs.example.com",
+		APIKey:    "secret",
+		LibraryID: "lib-books",
+		Label:     "Shelf",
+		Enabled:   true,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stats.AuthorsCreated != 3 || stats.AuthorsLinked != 0 {
+		t.Fatalf("stats = %+v, want three independent authors", stats)
+	}
+
+	authors, err := authorRepo.List(ctx)
+	if err != nil {
+		t.Fatalf("List authors: %v", err)
+	}
+	authorsByName := make(map[string]models.Author)
+	for _, author := range authors {
+		authorsByName[author.Name] = author
+	}
+	for _, name := range []string{"Robert Jordan", "Brandon Sanderson", "GraphicAudio"} {
+		if authorsByName[name].ID == 0 {
+			t.Fatalf("authors = %+v, missing %s", authors, name)
+		}
+	}
+
+	books, err := bookRepo.ListIncludingExcluded(ctx)
+	if err != nil {
+		t.Fatalf("List books: %v", err)
+	}
+	booksByTitle := make(map[string]models.Book)
+	for _, book := range books {
+		booksByTitle[book.Title] = book
+	}
+	if booksByTitle["Mistborn"].AuthorID != authorsByName["Brandon Sanderson"].ID {
+		t.Fatalf("Mistborn author_id = %d, want Brandon Sanderson %d", booksByTitle["Mistborn"].AuthorID, authorsByName["Brandon Sanderson"].ID)
+	}
+	if booksByTitle["Mistborn"].AuthorID == authorsByName["GraphicAudio"].ID {
+		t.Fatal("Mistborn was attached to GraphicAudio")
+	}
+}
+
+func TestImporter_CleanupABSSourcedAliases(t *testing.T) {
+	t.Parallel()
+
+	importer, authorRepo, _, _, _, _, _, _, _, _ := newABSImporterFixture(t)
+	ctx := context.Background()
+	author := &models.Author{
+		ForeignID:        "OL-BRANDON",
+		Name:             "Brandon Sanderson",
+		SortName:         "Sanderson, Brandon",
+		MetadataProvider: "openlibrary",
+		Monitored:        true,
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatalf("Create author: %v", err)
+	}
+	aliases := []*models.AuthorAlias{
+		{AuthorID: author.ID, Name: "GraphicAudio", SourceOLID: "abs"},
+		{AuthorID: author.ID, Name: "Brandon Sanderson", SourceOLID: "abs"},
+		{AuthorID: author.ID, Name: "B Sanderson", SourceOLID: "abs"},
+		{AuthorID: author.ID, Name: "Robert Jordan"},
+		{AuthorID: author.ID, Name: "Upstream Pen Name", SourceOLID: "OL-PEN"},
+	}
+	for _, alias := range aliases {
+		if err := importer.aliases.Create(ctx, alias); err != nil {
+			t.Fatalf("Create alias %q: %v", alias.Name, err)
+		}
+	}
+
+	removed, err := importer.cleanupABSSourcedAliases(ctx)
+	if err != nil {
+		t.Fatalf("cleanupABSSourcedAliases: %v", err)
+	}
+	if removed != 2 {
+		t.Fatalf("removed = %d, want 2", removed)
+	}
+	got, err := importer.aliases.ListByAuthor(ctx, author.ID)
+	if err != nil {
+		t.Fatalf("ListByAuthor: %v", err)
+	}
+	remaining := make(map[string]string)
+	for _, alias := range got {
+		remaining[alias.Name] = alias.SourceOLID
+	}
+	for _, removedName := range []string{"GraphicAudio", "Brandon Sanderson"} {
+		if _, ok := remaining[removedName]; ok {
+			t.Fatalf("remaining aliases = %+v, want %q removed", got, removedName)
+		}
+	}
+	for _, keptName := range []string{"B Sanderson", "Robert Jordan", "Upstream Pen Name"} {
+		if _, ok := remaining[keptName]; !ok {
+			t.Fatalf("remaining aliases = %+v, want %q preserved", got, keptName)
+		}
+	}
+}
+
+func TestImporter_TrustedSourceAliasStillMatchesAuthor(t *testing.T) {
+	t.Parallel()
+
+	importer, authorRepo, bookRepo, _, _, _, _, _, _, _ := newABSImporterFixture(t)
+	ctx := context.Background()
+	existing := &models.Author{
+		ForeignID:        "OL-TWAIN",
+		Name:             "Mark Twain",
+		SortName:         "Twain, Mark",
+		MetadataProvider: "openlibrary",
+		Monitored:        true,
+	}
+	if err := authorRepo.Create(ctx, existing); err != nil {
+		t.Fatalf("Create author: %v", err)
+	}
+	if err := importer.aliases.Create(ctx, &models.AuthorAlias{AuthorID: existing.ID, Name: "Samuel Clemens", SourceOLID: "OL-CLEMENS"}); err != nil {
+		t.Fatalf("Create trusted alias: %v", err)
+	}
+
+	item := sampleABSItem()
+	item.ItemID = "li-huck"
+	item.Title = "Adventures of Huckleberry Finn"
+	item.ASIN = "ASIN-HUCK"
+	item.Authors = []NormalizedAuthor{{ID: "author-samuel-clemens", Name: "Samuel Clemens"}}
+	item.Series = nil
+	item.AudioFiles = []NormalizedAudioFile{{INO: "audio-huck", Path: "/abs/huck.m4b"}}
+	item.EbookPath = ""
+	item.EbookINO = ""
+
+	runSingleABSImport(t, importer, item)
+
+	authors, err := authorRepo.List(ctx)
+	if err != nil {
+		t.Fatalf("List authors: %v", err)
+	}
+	if len(authors) != 1 || authors[0].ID != existing.ID {
+		t.Fatalf("authors = %+v, want existing Mark Twain only", authors)
+	}
+	books, err := bookRepo.ListIncludingExcluded(ctx)
+	if err != nil {
+		t.Fatalf("List books: %v", err)
+	}
+	if len(books) != 1 || books[0].AuthorID != existing.ID {
+		t.Fatalf("books = %+v, want book linked to trusted alias author", books)
+	}
+	progress := importer.Progress()
+	if len(progress.Results) != 1 || progress.Results[0].MatchedBy != "alias" {
+		t.Fatalf("progress results = %+v, want alias match", progress.Results)
 	}
 }
 

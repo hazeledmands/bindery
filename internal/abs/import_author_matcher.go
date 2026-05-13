@@ -278,7 +278,11 @@ func trustedAuthorAlias(alias models.AuthorAlias, author *models.Author) bool {
 	if author == nil {
 		return false
 	}
-	if strings.TrimSpace(alias.SourceOLID) != "" {
+	source := strings.TrimSpace(alias.SourceOLID)
+	if strings.EqualFold(source, "abs") {
+		return authorNamesAutoMatch(alias.Name, author.Name)
+	}
+	if source != "" {
 		return true
 	}
 	return authorNamesAutoMatch(alias.Name, author.Name)
@@ -369,6 +373,43 @@ func shouldRecordAuthorVariantAlias(matchedBy string) bool {
 	return false
 }
 
+func (i *Importer) cleanupABSSourcedAliases(ctx context.Context) (int, error) {
+	if i.aliases == nil || i.authors == nil {
+		return 0, nil
+	}
+	aliases, err := i.aliases.List(ctx)
+	if err != nil {
+		return 0, err
+	}
+	authors := make(map[int64]*models.Author)
+	removed := 0
+	for _, alias := range aliases {
+		if !strings.EqualFold(strings.TrimSpace(alias.SourceOLID), "abs") {
+			continue
+		}
+		author, ok := authors[alias.AuthorID]
+		if !ok {
+			author, err = i.authors.GetByID(ctx, alias.AuthorID)
+			if err != nil {
+				return removed, err
+			}
+			authors[alias.AuthorID] = author
+		}
+		if author == nil {
+			continue
+		}
+		aliasName := strings.TrimSpace(alias.Name)
+		authorName := strings.TrimSpace(author.Name)
+		if !authorNamesAutoMatch(aliasName, authorName) || strings.EqualFold(aliasName, authorName) {
+			if err := i.aliases.Delete(ctx, alias.ID); err != nil {
+				return removed, err
+			}
+			removed++
+		}
+	}
+	return removed, nil
+}
+
 func (i *Importer) recordSecondaryAuthors(ctx context.Context, canonicalID int64, extras []NormalizedAuthor, matcher *authorMatcher) {
 	if canonicalID == 0 || i.aliases == nil {
 		return
@@ -389,7 +430,7 @@ func (i *Importer) recordSecondaryAuthors(ctx context.Context, canonicalID int64
 	}
 	for _, author := range extras {
 		name := strings.TrimSpace(author.Name)
-		if name == "" {
+		if name == "" || !authorNamesAutoMatch(name, canonical.Name) {
 			continue
 		}
 		// Mark ABS-sourced secondary-author aliases with a sentinel SourceOLID so
