@@ -185,7 +185,7 @@ func renameChannel(ctx context.Context, c *http.Client, token, id, want string) 
 		}
 		// Drain & close so the connection can be reused on retry.
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		switch {
 		case resp.StatusCode >= 200 && resp.StatusCode < 300:
