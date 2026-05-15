@@ -21,6 +21,8 @@ import (
 	"time"
 	"unicode"
 
+	"golang.org/x/text/unicode/norm"
+
 	"github.com/vavallee/bindery/internal/models"
 )
 
@@ -80,9 +82,66 @@ func (c *Client) SearchBooks(ctx context.Context, query string) ([]models.Book, 
 	return books, nil
 }
 
-// GetAuthor is not supported by the DNB SRU endpoint.
-func (c *Client) GetAuthor(_ context.Context, _ string) (*models.Author, error) {
+// GetAuthor is largely unsupported by the DNB SRU endpoint. DNB's public SRU
+// interface does not expose an authority record lookup by ID — author records
+// in DNB live in a separate GND (Gemeinsame Normdatei) catalog that is not
+// queryable by the same SRU endpoint. Callers that need the full author record
+// must use SearchAuthors and pick the best match.
+//
+// However, when recordToBook synthesises an author ForeignID ("dnb:gnd:<id>"
+// or "dnb:author:<slug>") the aggregator's prefix-based dispatch will route
+// any subsequent GetAuthor here. We return (nil, nil) for those synthetic
+// IDs so the AddBook fallback can construct an Author from name without
+// the call erroring out. Real DNB control numbers ("dnb:<digits>") keep the
+// original "not supported" behaviour for callers that still pass them.
+func (c *Client) GetAuthor(_ context.Context, foreignID string) (*models.Author, error) {
+	if strings.HasPrefix(foreignID, "dnb:gnd:") || strings.HasPrefix(foreignID, "dnb:author:") {
+		return nil, nil
+	}
 	return nil, fmt.Errorf("dnb does not support author lookup by ID")
+}
+
+// GetAuthorWorks returns all books by the author identified by foreignID.
+// When foreignID carries a "dnb:" prefix (e.g. "dnb:1234567890") the SRU
+// num= index is used to look up the authority record's control number and
+// then searches by author name.  When the foreignID looks like a plain name
+// (i.e. no recognised prefix) it is used directly as a person-name query.
+//
+// Limitation: DNB's public SRU endpoint does not expose an author-ID →
+// works relationship directly; this implementation performs a per=<name>
+// query which may include works by different authors who share the same
+// name.  For most use cases this is acceptable — DNB catalogue entries are
+// generally unambiguous within the DACH publication space.
+func (c *Client) GetAuthorWorks(ctx context.Context, authorForeignID string) ([]models.Book, error) {
+	// Derive a query term: if it looks like a plain name (no known prefix)
+	// use it directly; otherwise try to find the name from a record lookup.
+	query := authorForeignID
+	if id := strings.TrimPrefix(authorForeignID, idPrefix); id != authorForeignID {
+		// Had the "dnb:" prefix — look up the record to get the author name.
+		records, err := c.sruQuery(ctx, "num="+id, 1)
+		if err != nil || len(records) == 0 {
+			// Fall back to a direct person query with the raw ID.
+			query = id
+		} else {
+			if name := marcClean(records[0].subfield("100", "a")); name != "" {
+				query = name
+			} else {
+				query = id
+			}
+		}
+	}
+
+	records, err := c.sruQuery(ctx, "per="+query, 50)
+	if err != nil {
+		return nil, fmt.Errorf("dnb get author works %s: %w", authorForeignID, err)
+	}
+	books := make([]models.Book, 0, len(records))
+	for _, rec := range records {
+		if b := recordToBook(rec); b != nil {
+			books = append(books, *b)
+		}
+	}
+	return books, nil
 }
 
 // GetBook fetches a single record by its DNB control number (the foreignID
@@ -196,17 +255,75 @@ func recordToBook(rec marcRecord) *models.Book {
 		b.ReleaseDate = t
 	}
 
-	// Main entry personal name (100 $a). MARC format is "Last, First".
+	// Main entry personal name (100 $a). MARC format is "Last, First". Pair
+	// it with the linked-authority identifier from $0 (GND) when present, or
+	// synthesise a stable name-slug ID otherwise so the aggregator's "drop
+	// results without an author ForeignID" guard does not silently swallow
+	// the DNB result.
 	if marcName := marcClean(rec.subfield("100", "a")); marcName != "" {
 		displayName := invertMARCName(marcName)
+		foreignID := ""
+		for _, raw := range rec.subfieldAll("100", "0") {
+			if gnd := extractGND(raw); gnd != "" {
+				foreignID = "dnb:gnd:" + gnd
+				break
+			}
+		}
+		if foreignID == "" {
+			foreignID = "dnb:author:" + slug(displayName)
+		}
 		b.Author = &models.Author{
+			ForeignID:        foreignID,
 			Name:             displayName,
 			SortName:         marcName, // already in "Last, First" sort form
 			MetadataProvider: "dnb",
 		}
 	}
 
+	// ISBN(s) from MARC 020 $a. The field can repeat once per edition format
+	// (paperback / hardcover / ebook), and the value typically contains a
+	// qualifier in parentheses ("9783499015717 (pbk)"). Extract every digit
+	// run, classify into ISBN-13 / ISBN-10, and surface as Editions so the
+	// add-book endpoint can use them for cross-provider author resolution
+	// when the DNB record has only an author name and no foreign author ID.
+	for _, raw := range rec.subfieldAll("020", "a") {
+		digits := stripISBNQualifier(raw)
+		if digits == "" {
+			continue
+		}
+		ed := models.Edition{}
+		switch len(digits) {
+		case 13:
+			ed.ISBN13 = &digits
+		case 10:
+			ed.ISBN10 = &digits
+		default:
+			continue
+		}
+		b.Editions = append(b.Editions, ed)
+	}
+
 	return b
+}
+
+// stripISBNQualifier extracts the digit-run from a MARC 020 $a value. Real
+// values look like "9783499015717", "3-499-01571-X", or
+// "9783499015717 (pbk.)" — keep the digits (and a trailing X for ISBN-10
+// check digits), drop everything else.
+func stripISBNQualifier(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		} else if r == 'X' || r == 'x' {
+			// ISBN-10 check digit can be 'X' (value 10).
+			b.WriteRune('X')
+		} else if b.Len() > 0 && (r == ' ' || r == '(' || r == ',') {
+			// Stop at the first delimiter after digits — qualifier text follows.
+			break
+		}
+	}
+	return b.String()
 }
 
 func recordToAuthor(rec marcRecord) *models.Author {
@@ -257,6 +374,87 @@ func invertMARCName(marc string) string {
 		return last
 	}
 	return first + " " + last
+}
+
+// extractGND returns the bare GND (Gemeinsame Normdatei) identifier from a
+// MARC 100 $0 authority-link value. DNB records use two conventional forms:
+//
+//   - "(DE-588)1234567X"     — parenthesised authority-source prefix
+//   - "http://d-nb.info/gnd/1234567X" — URL form
+//
+// Both encode the same authority record. Returns "" when neither form is
+// present (e.g. an empty $0, or a non-GND authority like ISNI/VIAF).
+func extractGND(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	// URL form takes precedence: "…/gnd/<id>". We accept any case for the
+	// path segment to tolerate "GND" or trailing path noise.
+	if idx := strings.Index(strings.ToLower(raw), "/gnd/"); idx != -1 {
+		rest := raw[idx+len("/gnd/"):]
+		return trimGNDID(rest)
+	}
+	// Parenthesised form: "(DE-588)<id>" or "(DE-101) <id>" with whitespace.
+	if strings.HasPrefix(raw, "(") {
+		if end := strings.IndexByte(raw, ')'); end != -1 {
+			authority := strings.TrimSpace(raw[1:end])
+			if strings.EqualFold(authority, "DE-588") {
+				return trimGNDID(strings.TrimSpace(raw[end+1:]))
+			}
+		}
+	}
+	return ""
+}
+
+// trimGNDID strips trailing slashes / whitespace / non-ID punctuation from a
+// candidate GND identifier. GND IDs are 9–10 chars: digits with an optional
+// trailing check character (digit or 'X').
+func trimGNDID(s string) string {
+	s = strings.TrimSpace(s)
+	// Stop at first path/query/fragment delimiter — guards against trailing
+	// path noise on URL-form values.
+	for _, sep := range []string{"/", "?", "#", " "} {
+		if idx := strings.Index(s, sep); idx != -1 {
+			s = s[:idx]
+		}
+	}
+	return s
+}
+
+// slug returns a lowercase ASCII-folded version of name with any run of
+// non-alphanumeric characters collapsed to "-". Leading/trailing hyphens are
+// trimmed. Used to synthesise a stable author ForeignID when the DNB record
+// has no GND authority link (so the aggregator can persist + dedupe DNB-only
+// authors).
+//
+// Example: "Müller, Thomas" → "muller-thomas".
+func slug(name string) string {
+	folded := norm.NFD.String(strings.TrimSpace(name))
+	var b strings.Builder
+	b.Grow(len(folded))
+	prevDash := false
+	for _, r := range folded {
+		switch {
+		case unicode.Is(unicode.Mn, r):
+			// Combining mark from NFD decomposition — drop, keeping the base letter.
+			continue
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r + ('a' - 'A'))
+			prevDash = false
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+			prevDash = false
+		default:
+			if !prevDash && b.Len() > 0 {
+				b.WriteByte('-')
+				prevDash = true
+			}
+		}
+	}
+	out := b.String()
+	out = strings.TrimRight(out, "-")
+	return out
 }
 
 // parseYear extracts the first 4-digit year from a MARC date string such as

@@ -83,6 +83,25 @@ const marcNoID = `<record xmlns="http://www.loc.gov/MARC21/slim">
   </datafield>
 </record>`
 
+// marcWithISBNs carries two MARC 020 entries — a paperback ISBN-13 with a
+// trailing qualifier ("(pbk.)") and an ISBN-10 with hyphens — to exercise
+// stripISBNQualifier across both forms.
+const marcWithISBNs = `<record xmlns="http://www.loc.gov/MARC21/slim">
+  <controlfield tag="001">2222</controlfield>
+  <datafield tag="020" ind1=" " ind2=" ">
+    <subfield code="a">9783499015717 (pbk.)</subfield>
+  </datafield>
+  <datafield tag="020" ind1=" " ind2=" ">
+    <subfield code="a">3-499-01571-X</subfield>
+  </datafield>
+  <datafield tag="100" ind1="1" ind2=" ">
+    <subfield code="a">Funke, Cornelia,</subfield>
+  </datafield>
+  <datafield tag="245" ind1="1" ind2="0">
+    <subfield code="a">Tintenherz</subfield>
+  </datafield>
+</record>`
+
 // --- Tests ---
 
 func TestName(t *testing.T) {
@@ -445,5 +464,315 @@ func TestSRUQueryBuildsCorrectURL(t *testing.T) {
 	}
 	if !strings.Contains(gotURL, "tit") {
 		t.Errorf("URL missing CQL title field: %q", gotURL)
+	}
+}
+
+// TestGetAuthorWorks_ByForeignID verifies that GetAuthorWorks with a "dnb:"
+// prefixed ID performs a num= lookup first to resolve the author name, then
+// performs a per= query. The test stubs two sequential HTTP calls.
+func TestGetAuthorWorks_ByForeignID(t *testing.T) {
+	calls := 0
+	c := &Client{
+		http: &http.Client{
+			Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+				calls++
+				// First call: num= lookup returns a record with 100 $a.
+				// Second call: per= query returns the same record as a "work".
+				body := sruXMLN("1", marcDuneGerman)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(body)),
+					Header:     make(http.Header),
+				}, nil
+			}),
+		},
+	}
+	books, err := c.GetAuthorWorks(context.Background(), "dnb:1234567890")
+	if err != nil {
+		t.Fatalf("GetAuthorWorks: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("expected 2 HTTP calls (num= + per=), got %d", calls)
+	}
+	if len(books) == 0 {
+		t.Errorf("expected at least 1 book, got 0")
+	}
+}
+
+// TestGetAuthorWorks_ByPlainName verifies that GetAuthorWorks with a plain
+// name (no "dnb:" prefix) goes straight to a per= query (single HTTP call).
+func TestGetAuthorWorks_ByPlainName(t *testing.T) {
+	calls := 0
+	var gotURL string
+	c := &Client{
+		http: &http.Client{
+			Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				gotURL = r.URL.String()
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(sruXMLN("1", marcDuneGerman))),
+					Header:     make(http.Header),
+				}, nil
+			}),
+		},
+	}
+	books, err := c.GetAuthorWorks(context.Background(), "Herbert, Frank")
+	if err != nil {
+		t.Fatalf("GetAuthorWorks: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("expected 1 HTTP call (per= only), got %d", calls)
+	}
+	if !strings.Contains(gotURL, "per") {
+		t.Errorf("expected per= CQL query in URL, got %q", gotURL)
+	}
+	if len(books) == 0 {
+		t.Errorf("expected at least 1 book, got 0")
+	}
+}
+
+// TestGetAuthorWorks_Empty verifies that GetAuthorWorks returns an empty slice
+// (not nil) when no records match.
+func TestGetAuthorWorks_Empty(t *testing.T) {
+	calls := 0
+	c := &Client{
+		http: &http.Client{
+			Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+				calls++
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(sruXMLN("0"))),
+					Header:     make(http.Header),
+				}, nil
+			}),
+		},
+	}
+	books, err := c.GetAuthorWorks(context.Background(), "Unknown Author")
+	if err != nil {
+		t.Fatalf("GetAuthorWorks: %v", err)
+	}
+	if len(books) != 0 {
+		t.Errorf("expected 0 books, got %d", len(books))
+	}
+}
+
+// TestGetAuthorWorks_ForeignID_NumLookupFails verifies that when the initial
+// num= lookup fails (network error), GetAuthorWorks falls back to using the
+// raw ID as the per= query term rather than returning an error.
+func TestGetAuthorWorks_ForeignID_NumLookupFails(t *testing.T) {
+	calls := 0
+	c := &Client{
+		http: &http.Client{
+			Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+				calls++
+				if calls == 1 {
+					// Simulate a network error on the num= lookup.
+					return nil, fmt.Errorf("connection refused")
+				}
+				// Second call (per= fallback) succeeds.
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(sruXMLN("1", marcDuneGerman))),
+					Header:     make(http.Header),
+				}, nil
+			}),
+		},
+	}
+	books, err := c.GetAuthorWorks(context.Background(), "dnb:1234567890")
+	if err != nil {
+		t.Fatalf("expected fallback to succeed, got error: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("expected 2 calls (num= fail + per= fallback), got %d", calls)
+	}
+	if len(books) == 0 {
+		t.Errorf("expected at least 1 book from fallback, got 0")
+	}
+}
+
+func TestSearchBooks_ExtractsISBNsFromMARC020(t *testing.T) {
+	c := mockXMLClient(sruXMLN("1", marcWithISBNs), http.StatusOK)
+	books, err := c.SearchBooks(context.Background(), "Tintenherz")
+	if err != nil {
+		t.Fatalf("SearchBooks: %v", err)
+	}
+	if len(books) != 1 {
+		t.Fatalf("expected 1 book, got %d", len(books))
+	}
+	b := books[0]
+	if len(b.Editions) != 2 {
+		t.Fatalf("expected 2 editions (one per ISBN), got %d", len(b.Editions))
+	}
+	if b.Editions[0].ISBN13 == nil || *b.Editions[0].ISBN13 != "9783499015717" {
+		t.Errorf("Editions[0].ISBN13 = %v, want 9783499015717", b.Editions[0].ISBN13)
+	}
+	if b.Editions[0].ISBN10 != nil {
+		t.Errorf("Editions[0].ISBN10 should be nil for an ISBN-13 row, got %v", *b.Editions[0].ISBN10)
+	}
+	if b.Editions[1].ISBN10 == nil || *b.Editions[1].ISBN10 != "349901571X" {
+		t.Errorf("Editions[1].ISBN10 = %v, want 349901571X", b.Editions[1].ISBN10)
+	}
+}
+
+// marcWithGND has a 100 $0 carrying the parenthesised DE-588 form. Used to
+// verify recordToBook lifts the GND authority ID into Author.ForeignID.
+const marcWithGND = `<record xmlns="http://www.loc.gov/MARC21/slim">
+  <controlfield tag="001">7777</controlfield>
+  <datafield tag="100" ind1="1" ind2=" ">
+    <subfield code="a">Funke, Cornelia,</subfield>
+    <subfield code="0">(DE-588)123456789</subfield>
+    <subfield code="0">(DE-101)abc</subfield>
+  </datafield>
+  <datafield tag="245" ind1="1" ind2="0">
+    <subfield code="a">Tintenherz</subfield>
+  </datafield>
+</record>`
+
+// marcWithGNDURL uses the URL form of the GND authority link.
+const marcWithGNDURL = `<record xmlns="http://www.loc.gov/MARC21/slim">
+  <controlfield tag="001">8888</controlfield>
+  <datafield tag="100" ind1="1" ind2=" ">
+    <subfield code="a">Müller, Heiner,</subfield>
+    <subfield code="0">http://d-nb.info/gnd/118585665</subfield>
+  </datafield>
+  <datafield tag="245" ind1="1" ind2="0">
+    <subfield code="a">Werke</subfield>
+  </datafield>
+</record>`
+
+// marcSyntheticAuthor has 100 $a but no $0; recordToBook should fall back
+// to a "dnb:author:<slug>" ForeignID derived from the display name.
+const marcSyntheticAuthor = `<record xmlns="http://www.loc.gov/MARC21/slim">
+  <controlfield tag="001">9001</controlfield>
+  <datafield tag="100" ind1="1" ind2=" ">
+    <subfield code="a">Müller, Thomas,</subfield>
+  </datafield>
+  <datafield tag="245" ind1="1" ind2="0">
+    <subfield code="a">Ein Buch</subfield>
+  </datafield>
+</record>`
+
+func TestExtractGND(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"(DE-588)1234567X", "1234567X"},
+		{"(DE-588)118585665", "118585665"},
+		{" (DE-588) 99999X ", "99999X"},
+		{"http://d-nb.info/gnd/1234567X", "1234567X"},
+		{"https://d-nb.info/gnd/118585665", "118585665"},
+		{"http://d-nb.info/gnd/118585665/about", "118585665"},
+		{"", ""},
+		{"(DE-101)abc", ""}, // wrong authority code → not a GND value
+		{"(ISNI)0000000123456789", ""},
+		{"random nonsense", ""},
+		{"http://example.com/foo/bar", ""},
+	}
+	for _, tc := range cases {
+		got := extractGND(tc.in)
+		if got != tc.want {
+			t.Errorf("extractGND(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestSlug(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"Frank Herbert", "frank-herbert"},
+		{"Müller, Thomas", "muller-thomas"},
+		{"Heiner Müller", "heiner-muller"},
+		{"  J.R.R.   Tolkien  ", "j-r-r-tolkien"},
+		{"Anonyme – Auteur", "anonyme-auteur"},
+		{"García Márquez", "garcia-marquez"},
+		{"", ""},
+		{"---", ""},
+	}
+	for _, tc := range cases {
+		got := slug(tc.in)
+		if got != tc.want {
+			t.Errorf("slug(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestRecordToBook_AuthorForeignID_FromGND(t *testing.T) {
+	c := mockXMLClient(sruXMLN("1", marcWithGND), http.StatusOK)
+	books, err := c.SearchBooks(context.Background(), "Tintenherz")
+	if err != nil {
+		t.Fatalf("SearchBooks: %v", err)
+	}
+	if len(books) != 1 {
+		t.Fatalf("expected 1 book, got %d", len(books))
+	}
+	b := books[0]
+	if b.Author == nil {
+		t.Fatal("expected Author to be populated")
+	}
+	if b.Author.ForeignID != "dnb:gnd:123456789" {
+		t.Errorf("Author.ForeignID = %q, want dnb:gnd:123456789", b.Author.ForeignID)
+	}
+}
+
+func TestRecordToBook_AuthorForeignID_FromGNDURL(t *testing.T) {
+	c := mockXMLClient(sruXMLN("1", marcWithGNDURL), http.StatusOK)
+	books, err := c.SearchBooks(context.Background(), "Werke")
+	if err != nil {
+		t.Fatalf("SearchBooks: %v", err)
+	}
+	if len(books) != 1 || books[0].Author == nil {
+		t.Fatalf("expected 1 book with author, got %+v", books)
+	}
+	if books[0].Author.ForeignID != "dnb:gnd:118585665" {
+		t.Errorf("Author.ForeignID = %q, want dnb:gnd:118585665", books[0].Author.ForeignID)
+	}
+}
+
+func TestRecordToBook_AuthorForeignID_SyntheticWhenNoAuthorityLink(t *testing.T) {
+	c := mockXMLClient(sruXMLN("1", marcSyntheticAuthor), http.StatusOK)
+	books, err := c.SearchBooks(context.Background(), "Müller")
+	if err != nil {
+		t.Fatalf("SearchBooks: %v", err)
+	}
+	if len(books) != 1 || books[0].Author == nil {
+		t.Fatalf("expected 1 book with author, got %+v", books)
+	}
+	if books[0].Author.ForeignID != "dnb:author:thomas-muller" {
+		t.Errorf("Author.ForeignID = %q, want dnb:author:thomas-muller", books[0].Author.ForeignID)
+	}
+}
+
+// TestGetAuthor_SyntheticIDsReturnNil verifies that the prefix-based
+// aggregator dispatch can safely route GetAuthor calls for synthetic DNB
+// author IDs without producing an error — the caller will construct an
+// Author from name in that path.
+func TestGetAuthor_SyntheticIDsReturnNil(t *testing.T) {
+	cases := []string{"dnb:gnd:118585665", "dnb:author:frank-herbert"}
+	for _, id := range cases {
+		got, err := New().GetAuthor(context.Background(), id)
+		if err != nil {
+			t.Errorf("GetAuthor(%q): unexpected error: %v", id, err)
+		}
+		if got != nil {
+			t.Errorf("GetAuthor(%q): expected nil, got %+v", id, got)
+		}
+	}
+}
+
+func TestStripISBNQualifier(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"9783499015717", "9783499015717"},
+		{"9783499015717 (pbk.)", "9783499015717"},
+		{"3-499-01571-X", "349901571X"},
+		{"  9783446123456  ", "9783446123456"},
+		{"978 3 446 12345 6", "978"}, // first delimiter ends the run — accepted limitation
+		{"", ""},
+		{"no digits here", ""},
+		{"349901571x", "349901571X"}, // lowercase x normalized
+	}
+	for _, tc := range cases {
+		if got := stripISBNQualifier(tc.in); got != tc.want {
+			t.Errorf("stripISBNQualifier(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }

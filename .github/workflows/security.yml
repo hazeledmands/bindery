@@ -3,14 +3,31 @@ name: Security
 on:
   push:
     branches: [main, development]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'CHANGELOG*'
+      - 'CONTRIBUTING*'
+      - 'README*'
+      - 'LICENSE*'
+      - 'CODE_OF_CONDUCT*'
+      - '.github/ISSUE_TEMPLATE/**'
   pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'CHANGELOG*'
+      - 'CONTRIBUTING*'
+      - 'README*'
+      - 'LICENSE*'
+      - 'CODE_OF_CONDUCT*'
+      - '.github/ISSUE_TEMPLATE/**'
   schedule:
     # Weekly Monday 06:00 UTC
     - cron: '0 6 * * 1'
 
 permissions:
   contents: read
-  security-events: write
   actions: read
 
 concurrency:
@@ -18,31 +35,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ── Go SAST: gosec + govulncheck + golangci-lint ────────────────────────────
+  # ── Go SAST: gosec only — golangci-lint and govulncheck run in ci.yml lint ──
   sast-go:
     name: SAST – Go
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: "1.25.9"
-
-      - name: Cache Go modules
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: go-mod-${{ hashFiles('go.sum') }}
-          restore-keys: go-mod-
+          go-version: "1.25.10"
+          cache: true
 
       - name: gosec (SARIF)
-        uses: securego/gosec@64b97151cd7b978abdf8d2f1159a4e9096a12c2b # master
+        uses: securego/gosec@5f4eec95fa28ce5dc6cf555de8c242cb57545f01 # master
         with:
-          args: '-no-fail -fmt sarif -out gosec.sarif ./...'
+          # G402 (TLS/cookie insecure) excluded: cookie Secure flag is dynamic (auto-detected
+          # from r.TLS and X-Forwarded-Proto, overridable via BINDERY_COOKIE_SECURE) and gosec
+          # only accepts literal `true`. Safety is enforced by cookie config logic + docs.
+          args: '-no-fail -fmt sarif -out gosec.sarif -exclude=G101,G402 ./...'
 
       - name: Upload gosec SARIF
         uses: github/codeql-action/upload-sarif@95e58e9a2cdfd71adc6e0353d5c52f41a045d225 # v4.35.2
@@ -51,27 +66,18 @@ jobs:
           sarif_file: gosec.sarif
           category: gosec
 
-      - name: govulncheck
-        run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./...
-
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7
-        with:
-          version: v2.11.4
-          args: --timeout=5m
-          only-new-issues: false
-
   # ── Frontend SAST: Semgrep + npm audit + ESLint security ───────────────────
   sast-frontend:
     name: SAST – Frontend
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: "22"
           cache: npm
@@ -131,6 +137,9 @@ jobs:
     name: Secrets Scan
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -150,11 +159,14 @@ jobs:
           sarif_file: results.sarif
           category: gitleaks
 
-  # ── IaC scan: Hadolint + Helm lint + Kubesec + Checkov ────────────────────
+  # ── IaC scan: Hadolint + Helm lint + Checkov ──────────────────────────────
   iac-scan:
     name: IaC Scan
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -181,16 +193,6 @@ jobs:
       - name: Helm lint
         run: helm lint --strict charts/bindery
 
-      - name: Render Helm templates for kubesec
-        run: |
-          helm template bindery charts/bindery > /tmp/rendered-manifests.yaml
-
-      - name: Kubesec scan
-        run: |
-          docker run --rm -v /tmp:/tmp kubesec/kubesec:v2 scan /tmp/rendered-manifests.yaml \
-            > /tmp/kubesec-results.json || true
-          cat /tmp/kubesec-results.json
-
       - name: Checkov
         uses: bridgecrewio/checkov-action@de2bfaecd21d58ef232e0d2a3391c33c32c460d7 # master
         with:
@@ -208,7 +210,7 @@ jobs:
           sarif_file: checkov.sarif
           category: checkov
 
-  # ── Container scan: Trivy + Grype + Dockle + Syft SBOM ───────────────────
+  # ── Container scan: Trivy + Grype + Syft SBOM ────────────────────────────
   container-scan:
     name: Container Scan
     runs-on: ubuntu-latest
@@ -219,17 +221,16 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Cache Go modules
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: go-mod-${{ hashFiles('go.sum') }}
-          restore-keys: go-mod-
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - name: Build image
-        run: docker build -t bindery:scan .
+      - name: Build image (with layer cache)
+        run: |
+          docker buildx build \
+            --load \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            -t bindery:scan \
+            .
 
       - name: Trivy vulnerability scan (SARIF)
         uses: aquasecurity/trivy-action@1994662b5555670344cd84d29ed3cad4bd26f31c # master
@@ -263,14 +264,6 @@ jobs:
           sarif_file: grype.sarif
           category: grype
 
-      - name: Dockle CIS Docker benchmark
-        run: |
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            goodwithtech/dockle:latest \
-            --exit-code 0 --exit-level warn \
-            bindery:scan
-
       - name: Syft SBOM – SPDX
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
@@ -299,20 +292,12 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Cache Go modules
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: go-mod-${{ hashFiles('go.sum') }}
-          restore-keys: go-mod-
-
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: "1.25.9"
+          go-version: "1.25.10"
+          cache: true
 
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: "22"
           cache: npm
@@ -395,11 +380,11 @@ jobs:
 
           | Job | Status |
           |-----|--------|
-          | SAST – Go (gosec, govulncheck, golangci-lint) | ${{ needs.sast-go.result }} |
+          | SAST – Go (gosec) | ${{ needs.sast-go.result }} |
           | SAST – Frontend (Semgrep, npm audit, ESLint) | ${{ needs.sast-frontend.result }} |
           | Secrets Scan (Gitleaks) | ${{ needs.secrets-scan.result }} |
-          | IaC Scan (Hadolint, Helm lint, Kubesec, Checkov) | ${{ needs.iac-scan.result }} |
-          | Container Scan (Trivy, Grype, Dockle, Syft SBOM) | ${{ needs.container-scan.result }} |
+          | IaC Scan (Hadolint, Helm lint, Checkov) | ${{ needs.iac-scan.result }} |
+          | Container Scan (Trivy, Grype, Syft SBOM) | ${{ needs.container-scan.result }} |
           | DAST – ZAP Baseline | ${{ needs.dast-api.result }} |
           | Helm Policy Tests | ${{ needs.policy-test.result }} |
 

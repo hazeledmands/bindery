@@ -56,7 +56,7 @@ func TestOpenMemory(t *testing.T) {
 	// Verify tables exist
 	tables := []string{"authors", "books", "series", "editions", "indexers",
 		"download_clients", "downloads", "root_folders", "quality_profiles",
-		"settings", "history", "schema_migrations"}
+		"settings", "history", "abs_import_runs", "abs_provenance", "abs_metadata_conflicts", "series_hardcover_links", "schema_migrations"}
 	for _, table := range tables {
 		var name string
 		err := db.QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&name)
@@ -78,6 +78,78 @@ func TestMigrateIdempotent(t *testing.T) {
 		t.Fatalf("second migrate should be idempotent: %v", err)
 	}
 	db.Close()
+}
+
+func TestMigrate033ABSReviewResolutionIdempotent(t *testing.T) {
+	database, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("open memory db: %v", err)
+	}
+	defer database.Close()
+
+	for _, column := range []string{
+		"resolved_author_foreign_id",
+		"resolved_author_name",
+		"resolved_book_foreign_id",
+		"resolved_book_title",
+		"edited_title",
+	} {
+		var name string
+		if err := database.QueryRow(`SELECT name FROM pragma_table_info('abs_review_queue') WHERE name = ?`, column).Scan(&name); err != nil {
+			t.Fatalf("abs_review_queue column %q missing: %v", column, err)
+		}
+	}
+
+	_, err = database.Exec(`
+		INSERT INTO abs_review_queue (
+			source_id, library_id, item_id, title, primary_author, asin, media_type,
+			review_reason, payload_json, resolved_author_foreign_id, resolved_author_name,
+			resolved_book_foreign_id, resolved_book_title, edited_title, status, created_at, updated_at
+		)
+		VALUES (
+			'src', 'lib', 'item', 'Title', 'Author', 'ASIN', 'audiobook',
+			'review', '{}', 'author-1', 'Resolved Author', 'book-1',
+			'Resolved Book', 'Edited Title', 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+		)`)
+	if err != nil {
+		t.Fatalf("seed abs review queue row: %v", err)
+	}
+
+	version := migrationVersionForTest(t, "033_abs_review_resolution.sql")
+	if _, err := database.Exec(`DELETE FROM schema_migrations WHERE version = ?`, version); err != nil {
+		t.Fatalf("clear migration 033 marker: %v", err)
+	}
+	if err := migrate(database); err != nil {
+		t.Fatalf("rerun migration 033: %v", err)
+	}
+
+	var authorID, bookID, editedTitle string
+	err = database.QueryRow(`
+		SELECT resolved_author_foreign_id, resolved_book_foreign_id, edited_title
+		FROM abs_review_queue
+		WHERE source_id = 'src' AND library_id = 'lib' AND item_id = 'item'`,
+	).Scan(&authorID, &bookID, &editedTitle)
+	if err != nil {
+		t.Fatalf("reload abs review queue row: %v", err)
+	}
+	if authorID != "author-1" || bookID != "book-1" || editedTitle != "Edited Title" {
+		t.Fatalf("resolution fields changed after rerun: author=%q book=%q edited=%q", authorID, bookID, editedTitle)
+	}
+}
+
+func migrationVersionForTest(t *testing.T, filename string) int {
+	t.Helper()
+	entries, err := migrationsFS.ReadDir("migrations")
+	if err != nil {
+		t.Fatalf("read migrations: %v", err)
+	}
+	for i, entry := range entries {
+		if entry.Name() == filename {
+			return i + 1
+		}
+	}
+	t.Fatalf("migration %s not found", filename)
+	return 0
 }
 
 // TestMigrate008_CalibreOnFreshDB verifies the v0.8.0 Calibre migration
@@ -624,6 +696,90 @@ func TestDownloadClientRepoCredentialFields(t *testing.T) {
 	}
 }
 
+// TestNormalizeClientCredentialStorageWritePath covers the write-path guard in
+// normalizeClientCredentialStorage: a qBittorrent client saved with a bare
+// url_base and an empty api_key must read back with url_base preserved and
+// username NOT populated from it. (closes #422)
+func TestNormalizeClientCredentialStorageWritePath(t *testing.T) {
+	database, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	ctx := context.Background()
+	repo := NewDownloadClientRepo(database)
+
+	// A client with a bare url_base path and no api_key — the write-path guard
+	// (normalizeClientCredentialStorage) must not migrate url_base into username
+	// because api_key is empty, which means this is not a legacy credential row.
+	qbt := &models.DownloadClient{
+		Name:    "qBittorrent bare url_base",
+		Type:    "qbittorrent",
+		Host:    "localhost",
+		Port:    8080,
+		URLBase: "qbit",
+		APIKey:  "", // empty — no migration should happen
+		Enabled: true,
+	}
+	if err := repo.Create(ctx, qbt); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	got, err := repo.GetByID(ctx, qbt.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	// url_base must be preserved exactly as written.
+	if got.URLBase != "qbit" {
+		t.Errorf("URLBase: want %q, got %q", "qbit", got.URLBase)
+	}
+	// username must NOT be populated from url_base when api_key is empty.
+	if got.Username != "" {
+		t.Errorf("Username: want empty (should not be populated from url_base when api_key is empty), got %q", got.Username)
+	}
+}
+
+// TestLegacyCredentialURLBase exercises legacyCredentialURLBase directly to
+// guard against regressions in the legacy-row detection logic. (closes #423)
+func TestLegacyCredentialURLBase(t *testing.T) {
+	tests := []struct {
+		name     string
+		username string
+		urlBase  string
+		apiKey   string
+		want     bool
+	}{
+		// Legacy row: username column is still empty, url_base held the username,
+		// api_key held the password.
+		{"empty username non-empty urlBase with apiKey", "", "admin", "secret", true},
+		// Legacy row: both fields kept in sync by old code.
+		{"username equals urlBase with apiKey", "admin", "admin", "secret", true},
+		// Modern row: distinct username and a real url_base path — must NOT fire.
+		{"distinct username and urlBase", "admin", "/qbit", "secret", false},
+		// Modern row: username set, url_base empty — already migrated.
+		{"username set urlBase empty", "admin", "", "secret", false},
+		// Both empty — nothing to migrate.
+		{"both empty", "", "", "", false},
+		// Whitespace-only urlBase does not count as a legacy row.
+		{"whitespace urlBase", "", "   ", "secret", false},
+		// Modern row: bare url_base but no api_key — client has a real url_base
+		// path but no password stored in the legacy location. Must NOT fire.
+		// This is the core regression from #423.
+		{"bare urlBase empty apiKey", "", "qbit", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := legacyCredentialURLBase(tt.username, tt.urlBase, tt.apiKey)
+			if got != tt.want {
+				t.Errorf("legacyCredentialURLBase(%q, %q, %q) = %v, want %v",
+					tt.username, tt.urlBase, tt.apiKey, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDownloadClientRepoGetEnabledByProtocol(t *testing.T) {
 	database, err := OpenMemory()
 	if err != nil {
@@ -820,6 +976,19 @@ func TestDownloadRepoCRUD(t *testing.T) {
 	// SetError
 	if err := repo.SetError(ctx, dl.ID, "something went wrong"); err != nil {
 		t.Errorf("SetError: %v", err)
+	}
+
+	// SetErrorWithStatus — transitions from StateFailed must reject (no valid
+	// transitions from StateFailed) but setting to the same state should succeed.
+	if err := repo.SetErrorWithStatus(ctx, dl.ID, models.StateFailed, "still broken"); err != nil {
+		t.Errorf("SetErrorWithStatus same-state: %v", err)
+	}
+	got, getErr := repo.GetByGUID(ctx, dl.GUID)
+	if getErr != nil || got == nil {
+		t.Fatalf("reload after SetErrorWithStatus: %v", getErr)
+	}
+	if got.ErrorMessage != "still broken" {
+		t.Errorf("expected error message persisted, got %q", got.ErrorMessage)
 	}
 
 	// Delete
@@ -1061,5 +1230,109 @@ func TestUserRepoCRUD(t *testing.T) {
 	got, _ = repo.GetByID(ctx, u.ID)
 	if got.Username != "superadmin" {
 		t.Errorf("expected superadmin, got %q", got.Username)
+	}
+}
+
+// TestMigrate026_DedupBooks verifies that migration 026 merges duplicate book
+// rows that differ only in whitespace/case, re-parents dependent rows, and
+// keeps the row with the best file state.
+func TestMigrate026_DedupBooks(t *testing.T) {
+	database, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	ctx := context.Background()
+
+	// Seed one author.
+	_, err = database.ExecContext(ctx,
+		`INSERT INTO authors (foreign_id, name, sort_name, monitored)
+		 VALUES ('OL-D1A', 'Test Author', 'Author, Test', 1)`)
+	if err != nil {
+		t.Fatal("seed author:", err)
+	}
+	var authorID int64
+	if err := database.QueryRowContext(ctx, `SELECT id FROM authors WHERE foreign_id='OL-D1A'`).Scan(&authorID); err != nil {
+		t.Fatal("get author id:", err)
+	}
+
+	// Insert 3 duplicate book rows: same normalised title, different whitespace/case.
+	// Row A has a file path (should be the winner).
+	// Row B and C are pure duplicates with no file.
+	insertBook := func(foreignID, title, filePath string) int64 {
+		_, err := database.ExecContext(ctx,
+			`INSERT INTO books (foreign_id, author_id, title, sort_title, monitored, any_edition_ok)
+			 VALUES (?, ?, ?, lower(?), 1, 1)`,
+			foreignID, authorID, title, title)
+		if err != nil {
+			t.Fatalf("insert book %s: %v", foreignID, err)
+		}
+		var id int64
+		database.QueryRowContext(ctx, `SELECT id FROM books WHERE foreign_id=?`, foreignID).Scan(&id)
+		if filePath != "" {
+			database.ExecContext(ctx, `UPDATE books SET ebook_file_path=? WHERE id=?`, filePath, id)
+		}
+		return id
+	}
+
+	idA := insertBook("OL-D1W", "Dune", "/books/dune.epub")
+	idB := insertBook("OL-D2W", "dune", "")     // case duplicate — no file
+	idC := insertBook("OL-D3W", "  Dune  ", "") // whitespace duplicate — no file
+
+	// Seed a series_books row pointing at loser B.
+	_, err = database.ExecContext(ctx,
+		`INSERT INTO series (foreign_id, title) VALUES ('OL-S1', 'Dune Series')`)
+	if err != nil {
+		t.Fatal("insert series:", err)
+	}
+	var seriesID int64
+	database.QueryRowContext(ctx, `SELECT id FROM series WHERE foreign_id='OL-S1'`).Scan(&seriesID)
+	_, err = database.ExecContext(ctx,
+		`INSERT OR IGNORE INTO series_books (series_id, book_id, position_in_series, primary_series)
+		 VALUES (?, ?, '1', 1)`, seriesID, idB)
+	if err != nil {
+		t.Fatal("insert series_books:", err)
+	}
+
+	// Seed a history row pointing at loser C.
+	_, err = database.ExecContext(ctx,
+		`INSERT INTO history (book_id, event_type) VALUES (?, 'grabbed')`, idC)
+	if err != nil {
+		t.Fatal("insert history:", err)
+	}
+
+	// Re-run migrate (026 is position 25 in the sorted migration list and was
+	// already applied to the empty DB; roll back its marker so migrate() re-runs
+	// it against the seeded duplicate rows).
+	database.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version=25`)
+	if err := migrate(database); err != nil {
+		t.Fatal("re-run migrate:", err)
+	}
+
+	// Only the winner (idA) should survive.
+	var bookCount int
+	database.QueryRowContext(ctx, `SELECT COUNT(*) FROM books WHERE author_id=?`, authorID).Scan(&bookCount)
+	if bookCount != 1 {
+		t.Fatalf("expected 1 book after dedup, got %d", bookCount)
+	}
+	var survivorID int64
+	database.QueryRowContext(ctx, `SELECT id FROM books WHERE author_id=?`, authorID).Scan(&survivorID)
+	if survivorID != idA {
+		t.Errorf("expected winner to be idA (%d), got %d", idA, survivorID)
+	}
+
+	// series_books must point to the winner.
+	var sbBookID int64
+	database.QueryRowContext(ctx, `SELECT book_id FROM series_books WHERE series_id=?`, seriesID).Scan(&sbBookID)
+	if sbBookID != idA {
+		t.Errorf("series_books.book_id: expected %d (winner), got %d", idA, sbBookID)
+	}
+
+	// history must point to the winner.
+	var hBookID int64
+	database.QueryRowContext(ctx, `SELECT book_id FROM history WHERE event_type='grabbed'`).Scan(&hBookID)
+	if hBookID != idA {
+		t.Errorf("history.book_id: expected %d (winner), got %d", idA, hBookID)
 	}
 }

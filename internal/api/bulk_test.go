@@ -130,18 +130,164 @@ func TestAuthorsBulk_Delete(t *testing.T) {
 	}
 }
 
+func TestAuthorsBulk_SetMediaType(t *testing.T) {
+	h, _, books, author, ctx := bulkFixture(t)
+
+	// Two books under this author, both currently ebook.
+	mustCreateBook(t, books, ctx, &models.Book{
+		ForeignID: "OL_A", AuthorID: author.ID, Title: "A",
+		SortTitle: "a", MediaType: models.MediaTypeEbook,
+		Genres: []string{}, MetadataProvider: "openlibrary",
+	})
+	mustCreateBook(t, books, ctx, &models.Book{
+		ForeignID: "OL_B", AuthorID: author.ID, Title: "B",
+		SortTitle: "b", MediaType: models.MediaTypeEbook,
+		Genres: []string{}, MetadataProvider: "openlibrary",
+	})
+
+	body := fmt.Sprintf(`{"ids":[%d],"action":"set_media_type","mediaType":"audiobook"}`, author.ID)
+	rec := postBulk(t, h.AuthorsBulk, body)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	got, _ := books.ListByAuthor(ctx, author.ID)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 books, got %d", len(got))
+	}
+	for _, b := range got {
+		if b.MediaType != models.MediaTypeAudiobook {
+			t.Errorf("book %q: expected audiobook, got %q", b.Title, b.MediaType)
+		}
+	}
+}
+
+// Switching an author's imported ebook catalogue to audiobook must re-flag
+// the books as wanted so they reappear on the Wanted page — otherwise the
+// user sees "imported" rows with no audiobook on disk. Mirrors the
+// DeleteFile handler's "back to wanted if any wanted format is missing".
+func TestAuthorsBulk_SetMediaType_ReevaluatesToWanted(t *testing.T) {
+	h, _, books, author, ctx := bulkFixture(t)
+
+	// Imported ebook: has an ebook on disk, no audiobook.
+	imported := mustCreateBook(t, books, ctx, &models.Book{
+		ForeignID: "OL_IMP", AuthorID: author.ID, Title: "On Disk",
+		SortTitle: "on disk", Status: models.BookStatusImported,
+		MediaType: models.MediaTypeEbook,
+		Genres:    []string{}, MetadataProvider: "openlibrary", Monitored: true,
+	})
+	// Per-format paths are set via Update, not Create.
+	imported.EbookFilePath = "/library/on-disk.epub"
+	imported.FilePath = "/library/on-disk.epub"
+	if err := books.Update(ctx, imported); err != nil {
+		t.Fatal(err)
+	}
+
+	body := fmt.Sprintf(`{"ids":[%d],"action":"set_media_type","mediaType":"audiobook"}`, author.ID)
+	rec := postBulk(t, h.AuthorsBulk, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	got, _ := books.GetByID(ctx, imported.ID)
+	if got.MediaType != models.MediaTypeAudiobook {
+		t.Errorf("mediaType: want audiobook, got %q", got.MediaType)
+	}
+	if got.Status != models.BookStatusWanted {
+		t.Errorf("status: want wanted after ebook→audiobook flip (no audiobook on disk), got %q", got.Status)
+	}
+}
+
+// Opposite direction: a wanted book whose existing on-disk file satisfies
+// the new media type should flip back to imported.
+func TestAuthorsBulk_SetMediaType_ReevaluatesToImported(t *testing.T) {
+	h, _, books, author, ctx := bulkFixture(t)
+
+	wanted := mustCreateBook(t, books, ctx, &models.Book{
+		ForeignID: "OL_WANT", AuthorID: author.ID, Title: "Have Audio",
+		SortTitle: "have audio", Status: models.BookStatusWanted,
+		MediaType: models.MediaTypeEbook,
+		Genres:    []string{}, MetadataProvider: "openlibrary", Monitored: true,
+	})
+	wanted.AudiobookFilePath = "/library/have-audio.m4b"
+	if err := books.Update(ctx, wanted); err != nil {
+		t.Fatal(err)
+	}
+
+	body := fmt.Sprintf(`{"ids":[%d],"action":"set_media_type","mediaType":"audiobook"}`, author.ID)
+	rec := postBulk(t, h.AuthorsBulk, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	got, _ := books.GetByID(ctx, wanted.ID)
+	if got.Status != models.BookStatusImported {
+		t.Errorf("status: want imported after ebook→audiobook flip (audiobook already on disk), got %q", got.Status)
+	}
+}
+
+// Skipped and mid-pipeline books must survive a media-type flip unchanged —
+// skipped encodes an explicit user decision, and disturbing a downloading
+// book would duplicate work the download client is already doing.
+func TestAuthorsBulk_SetMediaType_PreservesSkippedAndInFlight(t *testing.T) {
+	h, _, books, author, ctx := bulkFixture(t)
+
+	skipped := mustCreateBook(t, books, ctx, &models.Book{
+		ForeignID: "OL_SKIP", AuthorID: author.ID, Title: "Skipped",
+		SortTitle: "skipped", Status: models.BookStatusSkipped,
+		MediaType: models.MediaTypeEbook,
+		Genres:    []string{}, MetadataProvider: "openlibrary",
+	})
+	downloading := mustCreateBook(t, books, ctx, &models.Book{
+		ForeignID: "OL_DL", AuthorID: author.ID, Title: "Downloading",
+		SortTitle: "downloading", Status: models.BookStatusDownloading,
+		MediaType: models.MediaTypeEbook,
+		Genres:    []string{}, MetadataProvider: "openlibrary", Monitored: true,
+	})
+
+	body := fmt.Sprintf(`{"ids":[%d],"action":"set_media_type","mediaType":"audiobook"}`, author.ID)
+	rec := postBulk(t, h.AuthorsBulk, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	gotSkipped, _ := books.GetByID(ctx, skipped.ID)
+	if gotSkipped.Status != models.BookStatusSkipped {
+		t.Errorf("skipped: want status preserved, got %q", gotSkipped.Status)
+	}
+	gotDL, _ := books.GetByID(ctx, downloading.ID)
+	if gotDL.Status != models.BookStatusDownloading {
+		t.Errorf("downloading: want status preserved, got %q", gotDL.Status)
+	}
+}
+
+func TestAuthorsBulk_SetMediaType_Invalid(t *testing.T) {
+	h, _, _, author, _ := bulkFixture(t)
+	body := fmt.Sprintf(`{"ids":[%d],"action":"set_media_type","mediaType":"videogame"}`, author.ID)
+	rec := postBulk(t, h.AuthorsBulk, body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+}
+
 func TestAuthorsBulk_Search_FiresSearcherForWantedBooks(t *testing.T) {
 	searcher := newMockBookSearcher()
 	h, _, books, author, ctx := bulkFixtureWithSearcher(t, searcher)
 
-	// One wanted book + one imported book; only wanted should be searched.
+	// One monitored wanted book, one unmonitored wanted book, and one imported
+	// book; only the monitored wanted book should be searched.
 	mustCreateBook(t, books, ctx, &models.Book{
 		ForeignID: "OL_BK1", AuthorID: author.ID, Title: "Wanted Book",
 		SortTitle: "wanted book", Status: models.BookStatusWanted,
 		Genres: []string{}, MetadataProvider: "openlibrary", Monitored: true,
 	})
 	mustCreateBook(t, books, ctx, &models.Book{
-		ForeignID: "OL_BK2", AuthorID: author.ID, Title: "Imported Book",
+		ForeignID: "OL_BK2", AuthorID: author.ID, Title: "Unmonitored Wanted Book",
+		SortTitle: "unmonitored wanted book", Status: models.BookStatusWanted,
+		Genres: []string{}, MetadataProvider: "openlibrary", Monitored: false,
+	})
+	mustCreateBook(t, books, ctx, &models.Book{
+		ForeignID: "OL_BK3", AuthorID: author.ID, Title: "Imported Book",
 		SortTitle: "imported book", Status: models.BookStatusImported,
 		Genres: []string{}, MetadataProvider: "openlibrary", Monitored: true,
 	})
@@ -157,7 +303,7 @@ func TestAuthorsBulk_Search_FiresSearcherForWantedBooks(t *testing.T) {
 	if got.Title != "Wanted Book" {
 		t.Errorf("expected search for 'Wanted Book', got %q", got.Title)
 	}
-	// Imported book must not trigger a search.
+	// Imported and unmonitored wanted books must not trigger a search.
 	searcher.assertNoCall(t, 50*time.Millisecond)
 }
 

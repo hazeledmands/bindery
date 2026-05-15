@@ -28,7 +28,9 @@
     "enable": "Inschakelen",
     "disable": "Uitschakelen",
     "connOk": "Verbinding geslaagd!",
-    "connFail": "Test mislukt: {{error}}"
+    "connFail": "Test mislukt: {{error}}",
+    "prev": "Prev",
+    "next": "Next"
   },
   "nav": {
     "authors": "Auteurs",
@@ -40,7 +42,8 @@
     "series": "Reeksen",
     "discover": "Discover",
     "blocklist": "Blokkeerlijst",
-    "settings": "Instellingen"
+    "settings": "Instellingen",
+    "search": "Search"
   },
   "login": {
     "title": "Inloggen",
@@ -52,7 +55,10 @@
     "errorRequired": "Gebruikersnaam en wachtwoord zijn vereist",
     "errorFailed": "Inloggen mislukt",
     "signOut": "Uitloggen",
-    "signedInAs": "Ingelogd als"
+    "signedInAs": "Ingelogd als",
+    "proxyHint": "Meld u aan via uw SSO-provider",
+    "signInWith": "Inloggen met {{name}}",
+    "orLocal": "of"
   },
   "setup": {
     "title": "Eerste installatie",
@@ -119,7 +125,6 @@
     "statusImported": "In bibliotheek",
     "statusSkipped": "Overgeslagen",
     "audioLabel": "🎧 Audio",
-    "download": "Downloaden",
     "downloadFile": "Bestand downloaden",
     "setEbook": "📖 Instellen als e-boek",
     "setAudiobook": "🎧 Instellen als luisterboek",
@@ -199,6 +204,8 @@
       "logs": "Logboeken",
       "general": "Algemeen",
       "calibre": "Calibre",
+      "abs": "Audiobookshelf",
+      "grimmory": "Grimmory",
       "blocklist": "Blokkeerlijst"
     },
     "indexers": {
@@ -268,7 +275,14 @@
       "level": "Niveau:",
       "noEntries": "Geen logboekvermeldingen",
       "bufferNote": "Toont de meest recente 200 vermeldingen uit de in-process ringbuffer (laatste 1.000 vermeldingen). Logboeken worden gereset bij herstart. Wijzig het niveau hierboven om DEBUG-uitvoer vast te leggen zonder herstart.",
-      "autoRefresh": "Auto"
+      "autoRefresh": "Auto",
+      "from": "From:",
+      "to": "To:",
+      "componentPlaceholder": "Component",
+      "searchPlaceholder": "Search messages",
+      "clearFilters": "Clear filters",
+      "page": "Page {{page}}",
+      "persistNote": "Entries are persisted to the database and survive restarts. Default range: last hour."
     },
     "general": {
       "appearance": "Uiterlijk",
@@ -291,6 +305,14 @@
       "audiobookTemplateHint": "Luisterboeken worden geïmporteerd als volledige mappen (meerdelige m4b/mp3 + omslag blijven samen). Het sjabloon geeft de doelmap aan; originele bestandsnamen daarbinnen worden bewaard.",
       "apiKeys": "Externe API-sleutels",
       "googleBooksKey": "Google Books API-sleutel",
+      "storage": "Opslag",
+      "storageHint": "Paden die Bindery leest en waarnaar het schrijft. Configureer via omgevingsvariabelen (of je configuratiebestand); het draaiende proces leest ze bij het starten in.",
+      "downloadDir": "Downloadmap",
+      "audiobookDownloadDir": "Downloadmap voor luisterboeken",
+      "audiobookDownloadDirFallback": "Niet ingesteld — luisterboekdownloads gebruiken de algemene downloadmap.",
+      "libraryDir": "Bibliotheekmap (ebooks)",
+      "audiobookDir": "Luisterboekenmap",
+      "audiobookDirFallback": "Niet ingesteld — luisterboeken worden in de bibliotheekmap geïmporteerd.",
       "library": "Bibliotheek",
       "scanLibrary": "Bibliotheek scannen",
       "scanLibraryHint": "Boekendirectory doorzoeken en bestanden afstemmen met de database",
@@ -310,7 +332,11 @@
       "backupButton": "Back-up maken",
       "backupCreating": "Aanmaken...",
       "existingBackups": "Bestaande back-ups:",
-      "security": "Beveiliging"
+      "security": "Beveiliging",
+      "logRetention": "Log Retention",
+      "logRetentionLabel": "Keep log entries for",
+      "logRetentionHint": "Log entries older than this are deleted by the daily trim job.",
+      "days": "days"
     },
     "import": {
       "csvHeading": "CSV van auteursnamen",
@@ -326,6 +352,22 @@
       "resultSkipped": "overgeslagen (bestaan al)",
       "resultFailed": "mislukt",
       "showFailures": "{{count}} fout(en) tonen"
+    },
+    "oidc": {
+      "heading": "SSO / OIDC Providers",
+      "description": "Configure OpenID Connect providers. Users who sign in via OIDC are automatically provisioned a Bindery account on first login.",
+      "empty": "No OIDC providers configured.",
+      "addButton": "+ Add Provider",
+      "addHeading": "New OIDC Provider",
+      "addSave": "Add Provider",
+      "removeConfirm": "Remove this OIDC provider?",
+      "saveFail": "Failed to save providers",
+      "fieldId": "ID",
+      "fieldName": "Display Name",
+      "fieldIssuer": "Issuer URL",
+      "fieldClientId": "Client ID",
+      "fieldClientSecret": "Client Secret",
+      "fieldScopes": "Scopes"
     }
   },
   "addAuthorModal": {
@@ -387,5 +429,16 @@
       "coldStart": "Add more books to unlock personalized genre recommendations.",
       "goToSettings": "Go to Settings"
     }
+  },
+  "search": {
+    "heading": "Search Indexers",
+    "placeholder": "Title, author, or keyword…",
+    "submit": "Search",
+    "searching": "Searching…",
+    "noResults": "No results — try a different query or check your indexer configuration.",
+    "resultCount": "{{count}} results",
+    "grab": "Grab",
+    "grabbing": "Grabbing…",
+    "grabbed": "Grabbed"
   }
 }

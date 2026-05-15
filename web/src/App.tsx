@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next'
 import { api } from './api/client'
 import { AuthProvider, useAuth } from './auth/AuthContext'
 import AuthGuard from './auth/AuthGuard'
+import PublicOnlyRoute from './auth/PublicOnlyRoute'
 import LoginPage from './pages/LoginPage'
 import SetupPage from './pages/SetupPage'
 import AuthorsPage from './pages/AuthorsPage'
@@ -13,10 +14,12 @@ import BookDetailPage from './pages/BookDetailPage'
 import WantedPage from './pages/WantedPage'
 import QueuePage from './pages/QueuePage'
 import SettingsPage from './pages/SettingsPage'
+import UsersPage from './pages/UsersPage'
 import HistoryPage from './pages/HistoryPage'
 import SeriesPage from './pages/SeriesPage'
 import CalendarPage from './pages/CalendarPage'
 import DiscoverPage from './pages/DiscoverPage'
+import SearchPage from './pages/SearchPage'
 import Logo from './components/Logo'
 import { useTheme } from './theme'
 
@@ -36,7 +39,7 @@ function Shell() {
   const { t } = useTranslation()
   const [version, setVersion] = useState('')
   const [menuOpen, setMenuOpen] = useState(false)
-  const { status, logout } = useAuth()
+  const { status, logout, isAdmin } = useAuth()
 
   useEffect(() => {
     api.status().then(s => setVersion(s.version)).catch(() => {})
@@ -72,6 +75,34 @@ function Shell() {
 
             <div className="flex items-center gap-3 flex-shrink-0">
               <NavLink
+                to="/search"
+                className={({ isActive }) =>
+                  `hidden lg:block p-2 rounded-md transition-colors ${
+                    isActive ? 'bg-slate-200 dark:bg-zinc-800 text-slate-900 dark:text-white' : 'text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/50 dark:hover:bg-zinc-800/50'
+                  }`
+                }
+                title={t('nav.search')}
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z" />
+                </svg>
+              </NavLink>
+              {isAdmin && (
+                <NavLink
+                  to="/users"
+                  className={({ isActive }) =>
+                    `hidden lg:block p-2 rounded-md transition-colors ${
+                      isActive ? 'bg-slate-200 dark:bg-zinc-800 text-slate-900 dark:text-white' : 'text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/50 dark:hover:bg-zinc-800/50'
+                    }`
+                  }
+                  title={t('nav.users')}
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M15 19.128a9.38 9.38 0 0 0 2.625.372 9.337 9.337 0 0 0 4.121-.952 4.125 4.125 0 0 0-7.533-2.493M15 19.128v-.003c0-1.113-.285-2.16-.786-3.07M15 19.128v.106A12.318 12.318 0 0 1 8.624 21c-2.331 0-4.512-.645-6.374-1.766l-.001-.109a6.375 6.375 0 0 1 11.964-3.07M12 6.375a3.375 3.375 0 1 1-6.75 0 3.375 3.375 0 0 1 6.75 0Zm8.25 2.25a2.625 2.625 0 1 1-5.25 0 2.625 2.625 0 0 1 5.25 0Z" />
+                  </svg>
+                </NavLink>
+              )}
+              <NavLink
                 to="/settings"
                 className={({ isActive }) =>
                   `hidden lg:block p-2 rounded-md transition-colors ${
@@ -96,7 +127,12 @@ function Shell() {
                     {`v${version}`}
                   </a>
                 ) : (
-                  <span className="hidden lg:block text-xs text-slate-500 dark:text-zinc-600 whitespace-nowrap">{version}</span>
+                  <a
+                    href="https://github.com/vavallee/bindery/releases"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="hidden lg:block text-xs text-slate-500 dark:text-zinc-600 hover:underline whitespace-nowrap"
+                  >{version}</a>
                 )
               )}
               {status?.authenticated && status.mode !== 'disabled' && (
@@ -142,6 +178,22 @@ function Shell() {
                 </NavLink>
               ))}
               <NavLink
+                to="/search"
+                className={mobileLinkClass}
+                onClick={() => setMenuOpen(false)}
+              >
+                {t('nav.search')}
+              </NavLink>
+              {isAdmin && (
+                <NavLink
+                  to="/users"
+                  className={mobileLinkClass}
+                  onClick={() => setMenuOpen(false)}
+                >
+                  {t('nav.users')}
+                </NavLink>
+              )}
+              <NavLink
                 to="/settings"
                 className={mobileLinkClass}
                 onClick={() => setMenuOpen(false)}
@@ -161,7 +213,12 @@ function Shell() {
                     {`v${version}`}
                   </a>
                 ) : (
-                  <span className="text-xs text-slate-500 dark:text-zinc-600">{version}</span>
+                  <a
+                    href="https://github.com/vavallee/bindery/releases"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-xs text-slate-500 dark:text-zinc-600 hover:underline"
+                  >{version}</a>
                 )
               )}
               {status?.authenticated && status.mode !== 'disabled' && (
@@ -189,8 +246,10 @@ function Shell() {
           <Route path="/series" element={<SeriesPage />} />
           <Route path="/calendar" element={<CalendarPage />} />
           <Route path="/discover" element={<DiscoverPage />} />
+          <Route path="/search" element={<SearchPage />} />
           <Route path="/blocklist" element={<Navigate to="/settings" replace />} />
           <Route path="/settings" element={<SettingsPage />} />
+          {isAdmin && <Route path="/users" element={<UsersPage />} />}
         </Routes>
       </main>
 
@@ -213,13 +272,32 @@ function Shell() {
   )
 }
 
+// Read the path prefix injected by the backend at serve time. Empty string
+// means the app is mounted at the root (default / existing behaviour).
+const binderyBase: string =
+  (window as unknown as { __BINDERY_BASE__?: string }).__BINDERY_BASE__ ?? ''
+
 function App() {
   return (
-    <BrowserRouter>
+    <BrowserRouter basename={binderyBase}>
       <AuthProvider>
         <Routes>
-          <Route path="/login" element={<LoginPage />} />
-          <Route path="/setup" element={<SetupPage />} />
+          <Route
+            path="/login"
+            element={
+              <PublicOnlyRoute mode="login">
+                <LoginPage />
+              </PublicOnlyRoute>
+            }
+          />
+          <Route
+            path="/setup"
+            element={
+              <PublicOnlyRoute mode="setup">
+                <SetupPage />
+              </PublicOnlyRoute>
+            }
+          />
           <Route
             path="/*"
             element={

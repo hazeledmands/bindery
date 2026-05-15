@@ -31,7 +31,7 @@ func newAuthFixture(t *testing.T) (*AuthHandler, *db.UserRepo, *db.SettingsRepo,
 	ctx := context.Background()
 	// Session secret must exist before any issueSession call — production
 	// seeds this at bootstrap, tests must do the same or verification fails.
-	if err := settings.Set(ctx, SettingAuthSessionSecret, "test-secret-32-bytes-long-enough"); err != nil {
+	if err := settings.Set(ctx, SettingAuthSessionSecret, "test-secret-32-bytes-long-enough"); err != nil { // gitleaks:allow
 		t.Fatal(err)
 	}
 	lim := auth.NewLoginLimiter(5, 15*time.Minute)
@@ -83,10 +83,15 @@ func TestSetup_CreatesFirstAdmin(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	// User exists in DB.
+	// User exists in DB and is promoted to admin (regression: #321 — first-run
+	// setup left the user with role="user", locking the operator out of every
+	// admin-gated config page until they manually edited the database).
 	u, err := users.GetByUsername(ctx, "admin")
 	if err != nil || u == nil {
 		t.Fatalf("expected user created, got u=%v err=%v", u, err)
+	}
+	if u.Role != "admin" {
+		t.Errorf("expected first-run user promoted to admin, got role=%q", u.Role)
 	}
 	// Session cookie issued.
 	var haveCookie bool
@@ -143,6 +148,77 @@ func TestLogin_Success(t *testing.T) {
 	}
 	if !haveCookie {
 		t.Error("expected session cookie")
+	}
+}
+
+// TestLogin_CookieMaxAge_Short verifies the regression fix for mobile session
+// eviction: when rememberMe is false (the default), the response cookie must
+// carry an explicit Max-Age matching SessionDurationShort. Without Max-Age the
+// cookie reverts to a browser-session cookie, which iOS Safari and Android
+// Chrome drop when the tab is backgrounded — users got logged out on app switch.
+func TestLogin_CookieMaxAge_Short(t *testing.T) {
+	h, users, _, ctx := newAuthFixture(t)
+	hash, _ := auth.HashPassword("hunter2hunter2")
+	if _, err := users.Create(ctx, "admin", hash); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	h.Login(rec, httptest.NewRequest(http.MethodPost, "/auth/login",
+		jsonBody(t, loginRequest{Username: "admin", Password: "hunter2hunter2", RememberMe: false})))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var got *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == auth.SessionCookieName {
+			got = c
+		}
+	}
+	if got == nil {
+		t.Fatal("expected session cookie")
+	}
+	want := int(auth.SessionDurationShort.Seconds())
+	if got.MaxAge != want {
+		t.Errorf("MaxAge=%d, want %d (SessionDurationShort)", got.MaxAge, want)
+	}
+}
+
+// TestLogin_CookieMaxAge_RememberMe verifies the long-lived branch sets both
+// Max-Age (RFC 6265 preferred) and Expires (compat for stale clients) so a
+// user who ticks "Remember me" gets the full 30-day window.
+func TestLogin_CookieMaxAge_RememberMe(t *testing.T) {
+	h, users, _, ctx := newAuthFixture(t)
+	hash, _ := auth.HashPassword("hunter2hunter2")
+	if _, err := users.Create(ctx, "admin", hash); err != nil {
+		t.Fatal(err)
+	}
+	before := time.Now()
+	rec := httptest.NewRecorder()
+	h.Login(rec, httptest.NewRequest(http.MethodPost, "/auth/login",
+		jsonBody(t, loginRequest{Username: "admin", Password: "hunter2hunter2", RememberMe: true})))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var got *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == auth.SessionCookieName {
+			got = c
+		}
+	}
+	if got == nil {
+		t.Fatal("expected session cookie")
+	}
+	want := int(auth.SessionDuration.Seconds())
+	if got.MaxAge != want {
+		t.Errorf("MaxAge=%d, want %d (SessionDuration)", got.MaxAge, want)
+	}
+	// Expires should be roughly now + SessionDuration (allow 1 minute slack
+	// for slow CI). Belt-and-suspenders for clients that ignore Max-Age.
+	wantExp := before.Add(auth.SessionDuration)
+	if got.Expires.IsZero() {
+		t.Error("expected Expires set on remember-me cookie")
+	} else if delta := got.Expires.Sub(wantExp); delta < -time.Minute || delta > time.Minute {
+		t.Errorf("Expires=%v, want ~%v (delta %v)", got.Expires, wantExp, delta)
 	}
 }
 
@@ -342,5 +418,64 @@ func TestSetup_RejectsEmptyBody(t *testing.T) {
 	h.Setup(rec, httptest.NewRequest(http.MethodPost, "/auth/setup", strings.NewReader("not-json")))
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d", rec.Code)
+	}
+}
+
+// TestLogin_LocalAuthDisabled confirms POST /auth/login returns 403 when
+// local auth is disabled — before even touching the rate limiter or DB.
+func TestLogin_LocalAuthDisabled(t *testing.T) {
+	h, _, _, _ := newAuthFixture(t)
+	h = h.WithLocalAuthEnabled(false)
+
+	rec := httptest.NewRecorder()
+	h.Login(rec, httptest.NewRequest(http.MethodPost, "/auth/login",
+		jsonBody(t, loginRequest{Username: "admin", Password: "whatever"})))
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var body map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["error"] != "local login is disabled" {
+		t.Errorf("unexpected error message: %q", body["error"])
+	}
+}
+
+// TestStatus_LocalAuthEnabled_True verifies that a default handler reports
+// localAuthEnabled=true in the /auth/status response.
+func TestStatus_LocalAuthEnabled_True(t *testing.T) {
+	h, _, _, _ := newAuthFixture(t)
+	rec := httptest.NewRecorder()
+	h.Status(rec, httptest.NewRequest(http.MethodGet, "/auth/status", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp statusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.LocalAuthEnabled {
+		t.Error("expected localAuthEnabled=true by default")
+	}
+}
+
+// TestStatus_LocalAuthEnabled_False verifies that WithLocalAuthEnabled(false)
+// propagates through to the /auth/status JSON response.
+func TestStatus_LocalAuthEnabled_False(t *testing.T) {
+	h, _, _, _ := newAuthFixture(t)
+	h = h.WithLocalAuthEnabled(false)
+	rec := httptest.NewRecorder()
+	h.Status(rec, httptest.NewRequest(http.MethodGet, "/auth/status", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp statusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.LocalAuthEnabled {
+		t.Error("expected localAuthEnabled=false after WithLocalAuthEnabled(false)")
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/vavallee/bindery/internal/models"
@@ -51,12 +52,9 @@ func (r *RecommendationRepo) ReplaceBatch(ctx context.Context, userID int64, can
 	defer func() { _ = stmt.Close() }()
 
 	for _, c := range candidates {
-		genresJSON, _ := json.Marshal(c.Genres)
-		if genresJSON == nil {
-			genresJSON = []byte("[]")
-		}
+		genresJSON := marshalRecommendationGenres(c.Genres)
 
-		_, err := stmt.ExecContext(ctx,
+		_, err = stmt.ExecContext(ctx,
 			userID, c.ForeignID, c.RecType, c.Title, c.AuthorName, c.AuthorID,
 			c.ImageURL, c.Description, string(genresJSON), c.Rating, c.RatingsCount,
 			c.ReleaseDate, c.Language, c.MediaType, c.Score, c.Reason,
@@ -102,10 +100,11 @@ func (r *RecommendationRepo) List(ctx context.Context, userID int64, recType str
 	for rows.Next() {
 		var rec models.Recommendation
 		var dismissed int
+		var genresJSON string
 		err := rows.Scan(
 			&rec.ID, &rec.UserID, &rec.ForeignID, &rec.RecType,
 			&rec.Title, &rec.AuthorName, &rec.AuthorID,
-			&rec.ImageURL, &rec.Description, &rec.Genres,
+			&rec.ImageURL, &rec.Description, &genresJSON,
 			&rec.Rating, &rec.RatingsCount, &rec.ReleaseDate,
 			&rec.Language, &rec.MediaType, &rec.Score, &rec.Reason,
 			&rec.SeriesID, &rec.SeriesPos, &dismissed, &rec.BatchID,
@@ -114,6 +113,7 @@ func (r *RecommendationRepo) List(ctx context.Context, userID int64, recType str
 		if err != nil {
 			return nil, fmt.Errorf("scan recommendation: %w", err)
 		}
+		rec.Genres = unmarshalRecommendationGenres(genresJSON)
 		rec.Dismissed = dismissed != 0
 		recs = append(recs, rec)
 	}
@@ -124,13 +124,14 @@ func (r *RecommendationRepo) List(ctx context.Context, userID int64, recType str
 func (r *RecommendationRepo) GetByID(ctx context.Context, id int64) (*models.Recommendation, error) {
 	var rec models.Recommendation
 	var dismissed int
+	var genresJSON string
 	err := r.db.QueryRowContext(ctx,
 		"SELECT id, user_id, foreign_id, rec_type, title, author_name, author_id, image_url, description, genres, rating, ratings_count, release_date, language, media_type, score, reason, series_id, series_pos, dismissed, batch_id, created_at FROM recommendations WHERE id = ?",
 		id,
 	).Scan(
 		&rec.ID, &rec.UserID, &rec.ForeignID, &rec.RecType,
 		&rec.Title, &rec.AuthorName, &rec.AuthorID,
-		&rec.ImageURL, &rec.Description, &rec.Genres,
+		&rec.ImageURL, &rec.Description, &genresJSON,
 		&rec.Rating, &rec.RatingsCount, &rec.ReleaseDate,
 		&rec.Language, &rec.MediaType, &rec.Score, &rec.Reason,
 		&rec.SeriesID, &rec.SeriesPos, &dismissed, &rec.BatchID,
@@ -142,8 +143,29 @@ func (r *RecommendationRepo) GetByID(ctx context.Context, id int64) (*models.Rec
 	if err != nil {
 		return nil, fmt.Errorf("get recommendation %d: %w", id, err)
 	}
+	rec.Genres = unmarshalRecommendationGenres(genresJSON)
 	rec.Dismissed = dismissed != 0
 	return &rec, nil
+}
+
+func marshalRecommendationGenres(genres []string) []byte {
+	if genres == nil {
+		return []byte("[]")
+	}
+	genresJSON, err := json.Marshal(genres)
+	if err != nil {
+		slog.Warn("recommendations: marshal genres", "error", err)
+		return []byte("[]")
+	}
+	return genresJSON
+}
+
+func unmarshalRecommendationGenres(genresJSON string) []string {
+	var genres []string
+	if err := json.Unmarshal([]byte(genresJSON), &genres); err != nil || genres == nil {
+		return []string{}
+	}
+	return genres
 }
 
 // Dismiss marks a recommendation as dismissed and records the dismissal in

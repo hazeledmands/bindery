@@ -10,17 +10,60 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/vavallee/bindery/internal/db"
+	"github.com/vavallee/bindery/internal/httpsec"
 	"github.com/vavallee/bindery/internal/models"
 	"github.com/vavallee/bindery/internal/prowlarr"
 )
 
+// SettingProwlarrSearchTimeoutSeconds is the key for the prowlarr HTTP timeout setting.
+const SettingProwlarrSearchTimeoutSeconds = "prowlarr.search_timeout_seconds"
+
 type ProwlarrHandler struct {
 	instances *db.ProwlarrRepo
 	indexers  *db.IndexerRepo
+	settings  *db.SettingsRepo
 }
 
 func NewProwlarrHandler(instances *db.ProwlarrRepo, indexers *db.IndexerRepo) *ProwlarrHandler {
 	return &ProwlarrHandler{instances: instances, indexers: indexers}
+}
+
+// WithSettings attaches a settings repo so the handler can read the configurable
+// prowlarr.search_timeout_seconds value.
+func (h *ProwlarrHandler) WithSettings(s *db.SettingsRepo) *ProwlarrHandler {
+	h.settings = s
+	return h
+}
+
+// prowlarrClientTimeout returns the configured search timeout, defaulting to
+// the value baked into prowlarr.New (60 s) when no setting exists.
+func (h *ProwlarrHandler) prowlarrClientTimeout(ctx context.Context) time.Duration {
+	if h.settings != nil {
+		if s, _ := h.settings.Get(ctx, SettingProwlarrSearchTimeoutSeconds); s != nil {
+			if secs, err := strconv.Atoi(s.Value); err == nil && secs > 0 {
+				return time.Duration(secs) * time.Second
+			}
+		}
+	}
+	return 60 * time.Second
+}
+
+// newClient constructs a Prowlarr API client using the (possibly user-configured) timeout.
+func (h *ProwlarrHandler) newClient(ctx context.Context, url, apiKey string) *prowlarr.Client {
+	return prowlarr.NewWithTimeout(url, apiKey, h.prowlarrClientTimeout(ctx))
+}
+
+// LoadProwlarrTimeout reads prowlarr.search_timeout_seconds from settings,
+// returning 60 s when the key is absent or unparseable.
+func LoadProwlarrTimeout(ctx context.Context, s *db.SettingsRepo) time.Duration {
+	if s != nil {
+		if setting, _ := s.Get(ctx, SettingProwlarrSearchTimeoutSeconds); setting != nil {
+			if secs, err := strconv.Atoi(setting.Value); err == nil && secs > 0 {
+				return time.Duration(secs) * time.Second
+			}
+		}
+	}
+	return 60 * time.Second
 }
 
 func (h *ProwlarrHandler) List(w http.ResponseWriter, r *http.Request) {
@@ -28,6 +71,9 @@ func (h *ProwlarrHandler) List(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
+	}
+	if items == nil {
+		items = []models.ProwlarrInstance{}
 	}
 	writeJSON(w, http.StatusOK, items)
 }
@@ -60,6 +106,10 @@ func (h *ProwlarrHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url is required"})
 		return
 	}
+	if err := httpsec.ValidateOutboundURL(p.URL, httpsec.PolicyLAN); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid indexer URL: " + err.Error()})
+		return
+	}
 	if p.Name == "" {
 		p.Name = "Prowlarr"
 	}
@@ -90,6 +140,10 @@ func (h *ProwlarrHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	existing.ID = id
+	if err := httpsec.ValidateOutboundURL(existing.URL, httpsec.PolicyLAN); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid indexer URL: " + err.Error()})
+		return
+	}
 	if err := h.instances.Update(r.Context(), existing); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -126,7 +180,7 @@ func (h *ProwlarrHandler) Test(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		return
 	}
-	client := prowlarr.New(p.URL, p.APIKey)
+	client := h.newClient(r.Context(), p.URL, p.APIKey)
 	version, err := client.Test(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]string{"ok": "false", "error": err.Error()})
@@ -147,7 +201,7 @@ func (h *ProwlarrHandler) Sync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := prowlarr.New(p.URL, p.APIKey)
+	client := h.newClient(r.Context(), p.URL, p.APIKey)
 	syncer := prowlarr.NewSyncer(client, h.indexers, h.instances)
 
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)

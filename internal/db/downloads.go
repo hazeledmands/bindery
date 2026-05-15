@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/vavallee/bindery/internal/models"
@@ -16,7 +17,8 @@ type DownloadRepo struct {
 const downloadSelectColumns = `
 	id, guid, book_id, edition_id, indexer_id, download_client_id,
 	title, nzb_url, size, sabnzbd_nzo_id, torrent_id, status, protocol,
-	quality, indexer_flags, error_message, added_at, grabbed_at, completed_at, imported_at`
+	quality, indexer_flags, error_message, added_at, grabbed_at, completed_at, imported_at,
+	import_retry_count`
 
 func NewDownloadRepo(db *sql.DB) *DownloadRepo {
 	return &DownloadRepo{db: db}
@@ -26,8 +28,19 @@ func (r *DownloadRepo) List(ctx context.Context) ([]models.Download, error) {
 	return r.query(ctx, "SELECT "+downloadSelectColumns+" FROM downloads ORDER BY added_at DESC")
 }
 
+func (r *DownloadRepo) ListByUser(ctx context.Context, userID int64) ([]models.Download, error) {
+	where, args := QueryScope("", userID)
+	q := "SELECT " + downloadSelectColumns + " FROM downloads " + where + " ORDER BY added_at DESC"
+	return r.query(ctx, q, args...)
+}
+
 func (r *DownloadRepo) ListByStatus(ctx context.Context, status models.DownloadState) ([]models.Download, error) {
 	return r.query(ctx, "SELECT "+downloadSelectColumns+" FROM downloads WHERE status=? ORDER BY added_at DESC", status)
+}
+
+func (r *DownloadRepo) ListByStatusAndUser(ctx context.Context, status models.DownloadState, userID int64) ([]models.Download, error) {
+	where, args := QueryScope("WHERE status=?", userID, status)
+	return r.query(ctx, "SELECT "+downloadSelectColumns+" FROM downloads "+where+" ORDER BY added_at DESC", args...)
 }
 
 func (r *DownloadRepo) GetByGUID(ctx context.Context, guid string) (*models.Download, error) {
@@ -47,6 +60,7 @@ func (r *DownloadRepo) GetByNzoID(ctx context.Context, nzoID string) (*models.Do
 }
 
 func (r *DownloadRepo) GetByTorrentID(ctx context.Context, torrentID string) (*models.Download, error) {
+	torrentID = strings.ToLower(torrentID)
 	dl, err := r.query(ctx, "SELECT "+downloadSelectColumns+" FROM downloads WHERE torrent_id=?", torrentID)
 	if err != nil || len(dl) == 0 {
 		return nil, err
@@ -107,6 +121,7 @@ func (r *DownloadRepo) SetNzoID(ctx context.Context, id int64, nzoID string) err
 }
 
 func (r *DownloadRepo) SetTorrentID(ctx context.Context, id int64, torrentID string) error {
+	torrentID = strings.ToLower(torrentID)
 	_, err := r.db.ExecContext(ctx, "UPDATE downloads SET torrent_id=? WHERE id=?", torrentID, id)
 	return err
 }
@@ -118,14 +133,38 @@ func (r *DownloadRepo) SetError(ctx context.Context, id int64, errMsg string) er
 	return err
 }
 
+// SetErrorWithStatus transitions the download to the given failure state and
+// persists the error message. Use this for import failures (StateImportFailed,
+// StateImportBlocked) so the user can see why an import didn't complete.
+func (r *DownloadRepo) SetErrorWithStatus(ctx context.Context, id int64, status models.DownloadState, errMsg string) error {
+	var current models.DownloadState
+	if err := r.db.QueryRowContext(ctx, "SELECT status FROM downloads WHERE id=?", id).Scan(&current); err != nil {
+		return fmt.Errorf("lookup current state: %w", err)
+	}
+	if current != status && !current.CanTransitionTo(status) {
+		return models.ErrInvalidTransition{From: current, To: status}
+	}
+	_, err := r.db.ExecContext(ctx,
+		"UPDATE downloads SET status=?, error_message=? WHERE id=?",
+		status, errMsg, id)
+	return err
+}
+
+// IncrementImportRetryCount bumps the import_retry_count for the download by
+// one. It is called just before each automatic import retry (Bug #7) so the
+// retry cap can be enforced on subsequent check cycles.
+func (r *DownloadRepo) IncrementImportRetryCount(ctx context.Context, id int64) error {
+	_, err := r.db.ExecContext(ctx,
+		"UPDATE downloads SET import_retry_count = import_retry_count + 1 WHERE id=?", id)
+	return err
+}
+
 func (r *DownloadRepo) Delete(ctx context.Context, id int64) error {
 	_, err := r.db.ExecContext(ctx, "DELETE FROM downloads WHERE id=?", id)
 	return err
 }
 
-// DeleteByBookID removes all download records associated with a book.
-// Called when a book is deleted so the queue stays consistent.
-func (r *DownloadRepo) DeleteByBookID(ctx context.Context, bookID int64) error {
+func (r *DownloadRepo) DeleteByBook(ctx context.Context, bookID int64) error {
 	_, err := r.db.ExecContext(ctx, "DELETE FROM downloads WHERE book_id=?", bookID)
 	return err
 }
@@ -145,6 +184,7 @@ func (r *DownloadRepo) query(ctx context.Context, q string, args ...interface{})
 			&d.Title, &d.NZBURL, &d.Size, &d.SABnzbdNzoID, &d.TorrentID, &d.Status, &d.Protocol,
 			&d.Quality, &d.IndexerFlags, &d.ErrorMessage,
 			&d.AddedAt, &d.GrabbedAt, &d.CompletedAt, &d.ImportedAt,
+			&d.ImportRetryCount,
 		); err != nil {
 			return nil, fmt.Errorf("scan download: %w", err)
 		}

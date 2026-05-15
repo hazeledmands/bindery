@@ -3,22 +3,152 @@ package qbittorrent
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
 
+// fakeTorrentContent is minimal bencoded content used across tests.
+const fakeTorrentContent = "d8:announce27:http://tracker.example.com/ae"
+
+// newFakeIndexer returns a test server that serves fakeTorrentContent at /torrent.
+func newFakeIndexer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/torrent" {
+			_, _ = w.Write([]byte(fakeTorrentContent))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+}
+
+// TestAddTorrent_ConcurrentUniqueHashes is a regression test for Bug 2.
+// When AddTorrent is called concurrently (e.g. during a bulk grab), each call
+// must return its own unique torrent hash. Without serialisation, both
+// goroutines snapshot beforeSet while it is empty, both torrents are submitted,
+// and both goroutines resolve to the same "newest" torrent (highest AddedOn) —
+// leaving one download record permanently mapped to the wrong hash.
+func TestAddTorrent_ConcurrentUniqueHashes(t *testing.T) {
+	const (
+		hashA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		hashB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	)
+
+	var mu sync.Mutex
+	addedCount := 0
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/auth/login":
+			_, _ = w.Write([]byte("Ok."))
+		case "/api/v2/torrents/info":
+			mu.Lock()
+			count := addedCount
+			mu.Unlock()
+
+			var torrents []Torrent
+			if count >= 1 {
+				torrents = append(torrents, Torrent{Hash: hashA, Name: "Book A", AddedOn: 1000})
+			}
+			if count >= 2 {
+				torrents = append(torrents, Torrent{Hash: hashB, Name: "Book B", AddedOn: 2000})
+			}
+			body, _ := json.Marshal(torrents)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(body)
+		case "/api/v2/torrents/add":
+			// Sleep long enough to guarantee both goroutines complete their
+			// initial "before" GetTorrents snapshots before any add is
+			// acknowledged, reliably opening the race window.
+			time.Sleep(20 * time.Millisecond)
+			mu.Lock()
+			addedCount++
+			mu.Unlock()
+			_, _ = w.Write([]byte("Ok."))
+		}
+	}))
+	defer srv.Close()
+
+	indexer := newFakeIndexer(t)
+	defer indexer.Close()
+
+	c := newTestClient(srv.URL, "admin", "pass")
+	c.loggedIn = true
+
+	var wg sync.WaitGroup
+	results := make([]string, 2)
+	errs := make([]error, 2)
+
+	for i := range results {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i], errs[i] = c.AddTorrent(
+				context.Background(),
+				indexer.URL+"/torrent",
+				"", "",
+			)
+		}()
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d: %v", i, err)
+		}
+	}
+
+	if results[0] == results[1] {
+		t.Errorf("bug 2 race: both concurrent AddTorrent calls returned %q; each must return a unique hash", results[0])
+	}
+	got := map[string]bool{results[0]: true, results[1]: true}
+	if !got[hashA] || !got[hashB] {
+		t.Errorf("want one goroutine to get %q and the other %q, got %q and %q", hashA, hashB, results[0], results[1])
+	}
+}
+
+// logCatcher captures slog records for test assertions.
+type logCatcher struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (lc *logCatcher) Enabled(_ context.Context, _ slog.Level) bool { return true }
+func (lc *logCatcher) Handle(_ context.Context, r slog.Record) error {
+	lc.mu.Lock()
+	lc.records = append(lc.records, r.Clone())
+	lc.mu.Unlock()
+	return nil
+}
+func (lc *logCatcher) WithAttrs(_ []slog.Attr) slog.Handler { return lc }
+func (lc *logCatcher) WithGroup(_ string) slog.Handler      { return lc }
+
+func (lc *logCatcher) Records() []slog.Record {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	return lc.records
+}
+
 // newTestClient creates a Client pointing at the given test server URL.
 func newTestClient(serverURL, username, password string) *Client {
-	c := New("localhost", 8080, username, password, false)
+	c := New("localhost", 8080, username, password, "", false)
 	c.baseURL = serverURL
 	return c
 }
 
 func TestNew(t *testing.T) {
-	c := New("myhost", 8080, "admin", "secret", false)
+	c := New("myhost", 8080, "admin", "secret", "", false)
 	if c.baseURL != "http://myhost:8080" {
 		t.Errorf("baseURL: want %q, got %q", "http://myhost:8080", c.baseURL)
 	}
@@ -29,7 +159,7 @@ func TestNew(t *testing.T) {
 		t.Error("should not be logged in on construction")
 	}
 
-	cs := New("securehost", 443, "u", "p", true)
+	cs := New("securehost", 443, "u", "p", "", true)
 	if cs.baseURL != "https://securehost:443" {
 		t.Errorf("SSL baseURL: got %q", cs.baseURL)
 	}
@@ -87,6 +217,133 @@ func TestLogin_BadStatus(t *testing.T) {
 	c := newTestClient(srv.URL, "admin", "pass")
 	if err := c.Login(context.Background()); err == nil {
 		t.Fatal("expected error on 500 response")
+	}
+}
+
+// TestLogin_V5_NoContent verifies that qBittorrent v5.x's `204 No Content`
+// login response is treated as a success (v4.x returned `200 OK` + "Ok.").
+func TestLogin_V5_NoContent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v2/auth/login" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, "admin", "pass")
+	if err := c.Login(context.Background()); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if !c.loggedIn {
+		t.Error("loggedIn should be true after 204 response")
+	}
+}
+
+// TestLogin_SendsCSRFHeaders verifies that Origin and Referer headers are
+// sent on every login request, as required by qBittorrent v5.x CSRF checks.
+// v4.x ignores these headers, so setting them is safe across versions.
+func TestLogin_SendsCSRFHeaders(t *testing.T) {
+	var gotOrigin, gotReferer string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v2/auth/login" {
+			gotOrigin = r.Header.Get("Origin")
+			gotReferer = r.Header.Get("Referer")
+			_, _ = w.Write([]byte("Ok."))
+		}
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, "admin", "pass")
+	if err := c.Login(context.Background()); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if gotOrigin != srv.URL {
+		t.Errorf("Origin: want %q, got %q", srv.URL, gotOrigin)
+	}
+	if gotReferer != srv.URL {
+		t.Errorf("Referer: want %q, got %q", srv.URL, gotReferer)
+	}
+}
+
+// TestLogin_AuthError_BadCreds covers the "200 + Fails." path. Bindery
+// should return an *AuthError that surfaces the credentials hint.
+func TestLogin_AuthError_BadCreds(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("Fails."))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, "bad", "creds")
+	err := c.Login(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var authErr *AuthError
+	if !errors.As(err, &authErr) {
+		t.Fatalf("expected *AuthError, got %T: %v", err, err)
+	}
+	if authErr.Status != http.StatusOK || authErr.Body != "Fails." {
+		t.Errorf("AuthError fields: got status=%d body=%q", authErr.Status, authErr.Body)
+	}
+	if !strings.Contains(err.Error(), "credentials rejected") {
+		t.Errorf("expected credentials hint, got %q", err.Error())
+	}
+}
+
+// TestLogin_AuthError_BanEmpty403 covers the qBit IP-ban shape: HTTP 403
+// with an empty body. Pre-fix this surfaced as "qBittorrent login failed: "
+// (nothing useful). Now should explain IP-ban + how to clear it.
+func TestLogin_AuthError_BanEmpty403(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, "admin", "pass")
+	err := c.Login(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var authErr *AuthError
+	if !errors.As(err, &authErr) {
+		t.Fatalf("expected *AuthError, got %T: %v", err, err)
+	}
+	if authErr.Status != http.StatusForbidden || authErr.Body != "" {
+		t.Errorf("AuthError fields: got status=%d body=%q", authErr.Status, authErr.Body)
+	}
+	if !strings.Contains(err.Error(), "IP is most likely banned") {
+		t.Errorf("expected IP-ban hint, got %q", err.Error())
+	}
+}
+
+// TestTest_AuthErrorDoesNotMisdirect proves Test() no longer wraps auth
+// failures with the "could not reach + use container name" hint that only
+// makes sense for actual transport failures.
+func TestTest_AuthErrorDoesNotMisdirect(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v2/auth/login" {
+			w.WriteHeader(http.StatusForbidden) // simulate IP ban
+			return
+		}
+		t.Errorf("unexpected path: %s", r.URL.Path)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, "admin", "pass")
+	err := c.Test(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "could not reach") {
+		t.Errorf("auth failure must not be reported as 'could not reach': %q", msg)
+	}
+	if !strings.Contains(msg, "connected to qBittorrent") {
+		t.Errorf("expected 'connected to qBittorrent at ... but ...' wording: %q", msg)
+	}
+	if !strings.Contains(msg, "IP is most likely banned") {
+		t.Errorf("expected the underlying AuthError hint to propagate: %q", msg)
 	}
 }
 
@@ -211,6 +468,158 @@ func TestAddTorrent_HTTPError(t *testing.T) {
 	c := newTestClient(srv.URL, "admin", "pass")
 	if _, err := c.AddTorrent(context.Background(), "magnet:?xt=urn:btih:abc", "", ""); err == nil {
 		t.Fatal("expected error on 400")
+	}
+}
+
+// TestAddTorrent_TorrentURL_SubmitsMultipart verifies that an http URL causes
+// Bindery to fetch the torrent content and submit it via multipart rather than
+// passing the URL to qBittorrent (which may not be able to reach the indexer).
+func TestAddTorrent_TorrentURL_SubmitsMultipart(t *testing.T) {
+	var gotMultipart bool
+	var gotTorrentContent []byte
+	var mu sync.Mutex
+	added := false
+
+	indexer := newFakeIndexer(t)
+	defer indexer.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/auth/login":
+			_, _ = w.Write([]byte("Ok."))
+		case "/api/v2/torrents/add":
+			ct := r.Header.Get("Content-Type")
+			if strings.HasPrefix(ct, "multipart/form-data") {
+				gotMultipart = true
+				mr, err := r.MultipartReader()
+				if err != nil {
+					t.Errorf("parse multipart: %v", err)
+					break
+				}
+				for {
+					part, err := mr.NextPart()
+					if err == io.EOF {
+						break
+					}
+					if err != nil {
+						t.Errorf("next part: %v", err)
+						break
+					}
+					if part.FormName() == "torrents" {
+						gotTorrentContent, _ = io.ReadAll(part)
+					}
+				}
+			}
+			mu.Lock()
+			added = true
+			mu.Unlock()
+			_, _ = w.Write([]byte("Ok."))
+		case "/api/v2/torrents/info":
+			mu.Lock()
+			isAdded := added
+			mu.Unlock()
+			if isAdded {
+				_, _ = w.Write([]byte(`[{"hash":"aabbccdd","name":"test","added_on":1000}]`))
+			} else {
+				_, _ = w.Write([]byte("[]"))
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, "admin", "pass")
+	if _, err := c.AddTorrent(context.Background(), indexer.URL+"/torrent", "", ""); err != nil {
+		t.Fatalf("AddTorrent: %v", err)
+	}
+	if !gotMultipart {
+		t.Error("expected multipart/form-data submission for http URL, got url-encoded form")
+	}
+	if string(gotTorrentContent) != fakeTorrentContent {
+		t.Errorf("torrent content: want %q, got %q", fakeTorrentContent, string(gotTorrentContent))
+	}
+}
+
+// TestAddTorrent_TorrentURL_WithCategoryAndSavePath verifies that category and
+// savepath are included in the multipart body when submitting a torrent URL.
+func TestAddTorrent_TorrentURL_WithCategoryAndSavePath(t *testing.T) {
+	var gotCategory, gotSavePath string
+	var mu sync.Mutex
+	added := false
+
+	indexer := newFakeIndexer(t)
+	defer indexer.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/auth/login":
+			_, _ = w.Write([]byte("Ok."))
+		case "/api/v2/torrents/add":
+			if err := r.ParseMultipartForm(1 << 20); err == nil {
+				gotCategory = r.FormValue("category")
+				gotSavePath = r.FormValue("savepath")
+			}
+			mu.Lock()
+			added = true
+			mu.Unlock()
+			_, _ = w.Write([]byte("Ok."))
+		case "/api/v2/torrents/info":
+			mu.Lock()
+			isAdded := added
+			mu.Unlock()
+			if isAdded {
+				_, _ = w.Write([]byte(`[{"hash":"aabbccdd","name":"test","added_on":1000}]`))
+			} else {
+				_, _ = w.Write([]byte("[]"))
+			}
+		}
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, "admin", "pass")
+	if _, err := c.AddTorrent(context.Background(), indexer.URL+"/torrent", "books", "/downloads"); err != nil {
+		t.Fatalf("AddTorrent: %v", err)
+	}
+	if gotCategory != "books" {
+		t.Errorf("category: want %q, got %q", "books", gotCategory)
+	}
+	if gotSavePath != "/downloads" {
+		t.Errorf("savepath: want %q, got %q", "/downloads", gotSavePath)
+	}
+}
+
+// TestAddTorrent_TorrentURL_FetchFailure verifies that a non-200 from the
+// indexer is returned as an error and qBittorrent is never contacted.
+func TestAddTorrent_TorrentURL_FetchFailure(t *testing.T) {
+	qbitCalled := false
+
+	indexer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer indexer.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/auth/login":
+			_, _ = w.Write([]byte("Ok."))
+		case "/api/v2/torrents/add":
+			qbitCalled = true
+			_, _ = w.Write([]byte("Ok."))
+		}
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, "admin", "pass")
+	_, err := c.AddTorrent(context.Background(), indexer.URL+"/torrent", "", "")
+	if err == nil {
+		t.Fatal("expected error when indexer returns 401")
+	}
+	if !strings.Contains(err.Error(), "401") {
+		t.Errorf("error should mention 401, got: %v", err)
+	}
+	if qbitCalled {
+		t.Error("qBittorrent should not be contacted when torrent fetch fails")
 	}
 }
 
@@ -431,68 +840,113 @@ func TestEnsureLoggedIn_NotLoggedIn(t *testing.T) {
 	}
 }
 
-// TestAddTorrent_DifferentCategory verifies that AddTorrent can resolve the hash
-// even when qBittorrent assigns the torrent a different category than requested.
-// This exercises the fix for #363: the poll loop must use the unfiltered torrent
-// list, not the category-filtered one.
-func TestAddTorrent_DifferentCategory(t *testing.T) {
-	const requestedCategory = "books"
-	const actualCategory = "default" // qBittorrent assigns a different category
-
-	newTorrent := Torrent{
-		Hash:     "deadbeef1234",
-		Name:     "Some Book",
-		Category: actualCategory, // different from what Bindery requested
-		AddedOn:  1000,
-	}
-	afterBody, _ := json.Marshal([]Torrent{newTorrent})
-
-	// infoCallCount tracks how many times /torrents/info is called.
-	// The first call is the "before" snapshot (returns empty); subsequent calls
-	// are poll iterations (return the new torrent under a different category).
-	infoCallCount := 0
+// TestAddTorrent_HashFoundUnderDifferentCategory verifies that the unfiltered
+// poll finds a torrent even when qBittorrent has initially placed it under a
+// different category than the one requested.
+func TestAddTorrent_HashFoundUnderDifferentCategory(t *testing.T) {
+	const wantHash = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+	var setCategoryHash, setCategoryValue string
+	var mu sync.Mutex
+	added := false // becomes true after /torrents/add is called
+	infoQueries := []string{}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v2/auth/login":
 			_, _ = w.Write([]byte("Ok."))
 		case "/api/v2/torrents/add":
+			mu.Lock()
+			added = true
+			mu.Unlock()
 			_, _ = w.Write([]byte("Ok."))
 		case "/api/v2/torrents/info":
-			// No category filter expected — poll must use unfiltered list.
+			mu.Lock()
+			infoQueries = append(infoQueries, r.URL.RawQuery)
+			mu.Unlock()
 			if r.URL.Query().Get("category") != "" {
-				t.Errorf("poll should not filter by category, got query: %s", r.URL.RawQuery)
-			}
-			w.Header().Set("Content-Type", "application/json")
-			infoCallCount++
-			if infoCallCount == 1 {
-				// First call: before-snapshot — return empty list.
+				// A category-filtered lookup would reproduce the race from #418:
+				// qBittorrent can expose the hash before category metadata lands.
 				_, _ = w.Write([]byte("[]"))
-			} else {
-				// Subsequent calls: poll — return the new torrent.
-				_, _ = w.Write(afterBody)
+				return
 			}
+			mu.Lock()
+			isAdded := added
+			mu.Unlock()
+			if !isAdded {
+				// Before add: no torrents yet.
+				_, _ = w.Write([]byte("[]"))
+				return
+			}
+			// After add: torrent appears under "uncategorized" (different from requested "books").
+			torrents := []Torrent{{
+				Hash:     wantHash,
+				Name:     "Test Book",
+				Category: "uncategorized",
+				AddedOn:  1000,
+			}}
+			body, _ := json.Marshal(torrents)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(body)
+		case "/api/v2/torrents/setCategory":
+			_ = r.ParseForm()
+			mu.Lock()
+			setCategoryHash = r.FormValue("hashes")
+			setCategoryValue = r.FormValue("category")
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
 	defer srv.Close()
 
+	indexer := newFakeIndexer(t)
+	defer indexer.Close()
+
 	c := newTestClient(srv.URL, "admin", "pass")
-	// Use a non-magnet URL so the code falls through to the poll loop.
-	hash, err := c.AddTorrent(context.Background(), "http://example.com/file.torrent", requestedCategory, "")
+	hash, err := c.AddTorrent(context.Background(), indexer.URL+"/torrent", "books", "")
 	if err != nil {
 		t.Fatalf("AddTorrent: %v", err)
 	}
-	if !strings.EqualFold(hash, newTorrent.Hash) {
-		t.Errorf("hash: want %q, got %q", strings.ToLower(newTorrent.Hash), hash)
+	if hash != wantHash {
+		t.Errorf("hash: want %q, got %q", wantHash, hash)
+	}
+	mu.Lock()
+	gotSetCatHash := setCategoryHash
+	gotSetCatVal := setCategoryValue
+	mu.Unlock()
+	if gotSetCatHash != wantHash {
+		t.Errorf("setCategory hashes: want %q, got %q", wantHash, gotSetCatHash)
+	}
+	if gotSetCatVal != "books" {
+		t.Errorf("setCategory category: want %q, got %q", "books", gotSetCatVal)
+	}
+	mu.Lock()
+	gotInfoQueries := append([]string(nil), infoQueries...)
+	mu.Unlock()
+	if len(gotInfoQueries) == 0 {
+		t.Fatal("expected torrent info to be polled")
+	}
+	for _, rawQuery := range gotInfoQueries {
+		if rawQuery != "" {
+			t.Errorf("torrent info poll should be unfiltered, got query %q", rawQuery)
+		}
 	}
 }
 
-// TestAddTorrent_Timeout verifies that AddTorrent returns an error when the
-// poll loop exhausts its deadline without finding a new torrent.
-// The timeout is forced by using a context that is already cancelled.
-func TestAddTorrent_Timeout(t *testing.T) {
+// TestAddTorrent_HashLookupTimeout verifies that when the torrent never appears
+// within the deadline, an ERROR is logged with before/after hash lists and the
+// appropriate error is returned.
+func TestAddTorrent_HashLookupTimeout(t *testing.T) {
+	orig := hashPollTimeout
+	hashPollTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { hashPollTimeout = orig })
+
+	catcher := &logCatcher{}
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(catcher))
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v2/auth/login":
@@ -500,8 +954,7 @@ func TestAddTorrent_Timeout(t *testing.T) {
 		case "/api/v2/torrents/add":
 			_, _ = w.Write([]byte("Ok."))
 		case "/api/v2/torrents/info":
-			// Never return the new torrent — always empty list.
-			w.Header().Set("Content-Type", "application/json")
+			// Never return the new torrent — list stays empty.
 			_, _ = w.Write([]byte("[]"))
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -509,21 +962,126 @@ func TestAddTorrent_Timeout(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// Override the package-level timeout to something very short so the test
-	// doesn't take 30 seconds.
-	orig := addTorrentTimeout
-	// addTorrentTimeout is a const so we use a cancelled context instead to
-	// force an immediate context-cancellation error path, which is equivalent
-	// for our purposes: we verify AddTorrent returns an error when it can't
-	// resolve the hash.
-	_ = orig
-
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
+	indexer := newFakeIndexer(t)
+	defer indexer.Close()
 
 	c := newTestClient(srv.URL, "admin", "pass")
-	_, err := c.AddTorrent(ctx, "http://example.com/file.torrent", "books", "")
+	_, err := c.AddTorrent(context.Background(), indexer.URL+"/torrent", "books", "")
 	if err == nil {
-		t.Fatal("expected error when torrent hash cannot be resolved before timeout")
+		t.Fatal("expected error on timeout, got nil")
+	}
+	if !strings.Contains(err.Error(), "hash could not be determined") {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	records := catcher.Records()
+	if len(records) == 0 {
+		t.Fatal("expected slog.Error to be called on timeout")
+	}
+	found := false
+	for _, r := range records {
+		if r.Level == slog.LevelError && strings.Contains(r.Message, "timed out") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected ERROR log with 'timed out' message, got %d records", len(records))
+	}
+}
+
+// roundTripFunc is a test helper that implements http.RoundTripper via a function.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// qbNetTimeoutErr is a minimal net.Error that signals a timeout.
+type qbNetTimeoutErr struct{}
+
+func (e *qbNetTimeoutErr) Error() string   { return "i/o timeout" }
+func (e *qbNetTimeoutErr) Timeout() bool   { return true }
+func (e *qbNetTimeoutErr) Temporary() bool { return true }
+
+// newTransportClient creates a qBittorrent Client with a custom HTTP transport.
+func newTransportClient(transport http.RoundTripper) *Client {
+	c := New("fake-host", 8080, "admin", "pass", "", false)
+	c.http = &http.Client{Transport: transport, Jar: c.http.Jar}
+	return c
+}
+
+// TestTest_DNSNotFound verifies that a DNS lookup failure appends the Docker
+// network hint and does NOT misclassify it as an auth error.
+func TestTest_DNSNotFound(t *testing.T) {
+	dnsErr := &net.DNSError{Name: "qbittorrent-container", IsNotFound: true}
+	c := newTransportClient(roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("dial: %w", dnsErr)
+	}))
+
+	err := c.Test(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "connected to qBittorrent") {
+		t.Errorf("DNS failure must not be reported as auth error: %q", msg)
+	}
+	if !strings.Contains(msg, "same Docker network") {
+		t.Errorf("expected Docker network hint, got: %q", msg)
+	}
+}
+
+// TestTest_ConnectionRefused verifies that ECONNREFUSED appends the port hint.
+func TestTest_ConnectionRefused(t *testing.T) {
+	c := newTransportClient(roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("dial tcp: %w", syscall.ECONNREFUSED)
+	}))
+
+	err := c.Test(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "service may not be running") {
+		t.Errorf("expected port hint, got: %q", err.Error())
+	}
+}
+
+// TestTest_Timeout_QBit verifies that a timeout error appends the firewall hint.
+func TestTest_Timeout_QBit(t *testing.T) {
+	c := newTransportClient(roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, &qbNetTimeoutErr{}
+	}))
+
+	err := c.Test(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "firewall or proxy") {
+		t.Errorf("expected firewall hint, got: %q", err.Error())
+	}
+}
+
+// TestTest_ServerError_NoHint_QBit verifies that an HTTP 500 from the server
+// does NOT produce a network hint (qBittorrent responded, transport worked).
+func TestTest_ServerError_NoHint_QBit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/auth/login":
+			_, _ = w.Write([]byte("Ok."))
+		default:
+			http.Error(w, "server error", http.StatusInternalServerError)
+		}
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, "admin", "pass")
+	err := c.Test(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	for _, hint := range []string{"Docker network", "service may not be running", "firewall or proxy"} {
+		if strings.Contains(msg, hint) {
+			t.Errorf("server error must not produce hint %q; got: %q", hint, msg)
+		}
 	}
 }

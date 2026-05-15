@@ -10,6 +10,9 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+
+	"github.com/vavallee/bindery/internal/downloader/nethint"
+	"github.com/vavallee/bindery/internal/downloader/urlbase"
 )
 
 // Client interacts with the SABnzbd API.
@@ -19,14 +22,15 @@ type Client struct {
 	http    *http.Client
 }
 
-// New creates a SABnzbd client.
-func New(host string, port int, apiKey string, useSSL bool) *Client {
+// New creates a SABnzbd client. urlBase is the optional reverse-proxy
+// subpath that is appended between host:port and the /api endpoint.
+func New(host string, port int, apiKey, urlBase string, useSSL bool) *Client {
 	scheme := "http"
 	if useSSL {
 		scheme = "https"
 	}
 	return &Client{
-		baseURL: fmt.Sprintf("%s://%s:%d", scheme, host, port),
+		baseURL: fmt.Sprintf("%s://%s:%d%s", scheme, host, port, urlbase.Normalize(urlBase)),
 		apiKey:  apiKey,
 		http:    &http.Client{Timeout: 15 * time.Second},
 	}
@@ -35,7 +39,7 @@ func New(host string, port int, apiKey string, useSSL bool) *Client {
 // Test verifies connectivity by fetching categories.
 func (c *Client) Test(ctx context.Context) error {
 	if _, err := c.GetCategories(ctx); err != nil {
-		return fmt.Errorf("could not reach SABnzbd at %s — %w (in Docker use the service/container name, not localhost)", c.baseURL, err)
+		return fmt.Errorf("could not reach SABnzbd at %s — %w%s", c.baseURL, err, nethint.ForErr(err))
 	}
 	return nil
 }

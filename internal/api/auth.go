@@ -36,17 +36,27 @@ const (
 	SettingAuthAPIKey        = "auth.api_key"        //nolint:gosec // setting key name, not a credential
 	SettingAuthSessionSecret = "auth.session_secret" //nolint:gosec // setting key name, not a credential
 	SettingAuthMode          = "auth.mode"
+	SettingOIDCProviders     = "auth.oidc.providers" //nolint:gosec // setting key name, not a credential
 )
 
 // AuthHandler owns the login / setup / password / mode endpoints.
 type AuthHandler struct {
-	users    *db.UserRepo
-	settings *db.SettingsRepo
-	limiter  *auth.LoginLimiter
+	users            *db.UserRepo
+	settings         *db.SettingsRepo
+	limiter          *auth.LoginLimiter
+	localAuthEnabled bool
 }
 
 func NewAuthHandler(users *db.UserRepo, settings *db.SettingsRepo, limiter *auth.LoginLimiter) *AuthHandler {
-	return &AuthHandler{users: users, settings: settings, limiter: limiter}
+	return &AuthHandler{users: users, settings: settings, limiter: limiter, localAuthEnabled: true}
+}
+
+// WithLocalAuthEnabled controls whether local password login and local user
+// creation are allowed. When false, POST /auth/login returns 403 and the
+// admin user-create endpoint is also blocked.
+func (h *AuthHandler) WithLocalAuthEnabled(v bool) *AuthHandler {
+	h.localAuthEnabled = v
+	return h
 }
 
 // --- Request / response shapes -----------------------------------------------
@@ -63,10 +73,12 @@ type setupRequest struct {
 }
 
 type statusResponse struct {
-	Authenticated bool   `json:"authenticated"`
-	SetupRequired bool   `json:"setupRequired"`
-	Username      string `json:"username,omitempty"`
-	Mode          string `json:"mode"`
+	Authenticated    bool   `json:"authenticated"`
+	SetupRequired    bool   `json:"setupRequired"`
+	Username         string `json:"username,omitempty"`
+	Role             string `json:"role,omitempty"`
+	Mode             string `json:"mode"`
+	LocalAuthEnabled bool   `json:"localAuthEnabled"`
 }
 
 type changePasswordRequest struct {
@@ -98,18 +110,22 @@ func (h *AuthHandler) Status(w http.ResponseWriter, r *http.Request) {
 	mode := h.mode(ctx)
 
 	resp := statusResponse{
-		SetupRequired: count == 0,
-		Mode:          string(mode),
+		SetupRequired:    count == 0,
+		Mode:             string(mode),
+		LocalAuthEnabled: h.localAuthEnabled,
 	}
 
 	if uid := auth.UserIDFromContext(ctx); uid != 0 {
 		if u, _ := h.users.GetByID(ctx, uid); u != nil {
 			resp.Authenticated = true
 			resp.Username = u.Username
+			resp.Role = u.Role
 		}
 	} else if mode == auth.ModeDisabled || (mode == auth.ModeLocalOnly && auth.IsLocalRequest(r)) {
 		// Trusted bypass — the UI should render normally without a login screen.
+		// Treat as admin so role-gated UI surfaces correctly.
 		resp.Authenticated = true
+		resp.Role = "admin"
 	}
 
 	writeOK(w, resp)
@@ -147,6 +163,14 @@ func (h *AuthHandler) Setup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "create user: "+err.Error())
 		return
 	}
+	// The first user is the admin. Create defaults role to "user"; without this
+	// promotion the freshly-set-up operator is locked out of every admin-gated
+	// page (Calibre plugin, user management, etc).
+	if err := h.users.PromoteFirstUser(ctx); err != nil {
+		writeErr(w, http.StatusInternalServerError, "promote admin: "+err.Error())
+		return
+	}
+	u.Role = "admin"
 	// Log the user in immediately.
 	h.issueSession(w, r, ctx, u.ID, true)
 	slog.Info("first-run setup complete", "username", u.Username)
@@ -155,6 +179,10 @@ func (h *AuthHandler) Setup(w http.ResponseWriter, r *http.Request) {
 
 // Login validates credentials, issues a signed session cookie on success.
 func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
+	if !h.localAuthEnabled {
+		writeErr(w, http.StatusForbidden, "local login is disabled")
+		return
+	}
 	ctx := r.Context()
 	ip := clientIP(r)
 	if !h.limiter.Allow(ip) {
@@ -250,8 +278,11 @@ func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 func (h *AuthHandler) GetConfig(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	resp := authConfigResponse{
-		Mode:   string(h.mode(ctx)),
-		APIKey: h.apiKey(ctx),
+		Mode: string(h.mode(ctx)),
+	}
+	// Only expose the API key to admin users — it grants full access.
+	if auth.UserRoleFromContext(ctx) == "admin" {
+		resp.APIKey = h.apiKey(ctx)
 	}
 	if uid := auth.UserIDFromContext(ctx); uid != 0 {
 		if u, _ := h.users.GetByID(ctx, uid); u != nil {
@@ -277,6 +308,43 @@ func (h *AuthHandler) RegenerateAPIKey(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("api key regenerated")
 	writeOK(w, map[string]any{"apiKey": key})
+}
+
+// CSRF issues (or re-issues) a double-submit CSRF token bound to the caller's
+// session cookie. The token is returned as JSON and also set as a readable
+// (non-HttpOnly) cookie so the frontend JS can read it. Unauthenticated
+// callers receive a 200 with an empty token — they have no session to bind to,
+// so the cookie-absent check in RequireCSRFToken will reject mutations anyway.
+func (h *AuthHandler) CSRF(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	c, err := r.Cookie(auth.SessionCookieName)
+	if err != nil || c.Value == "" {
+		writeOK(w, map[string]any{"csrfToken": ""})
+		return
+	}
+	secret := h.sessionSecret(ctx)
+	token := auth.MakeCSRFToken(secret, c.Value)
+
+	var secure bool
+	switch CookieSecureMode() {
+	case "always":
+		secure = true
+	case "never":
+		secure = false
+	default:
+		secure = r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
+	}
+
+	// Readable (no HttpOnly) so JS can access it.
+	http.SetCookie(w, &http.Cookie{
+		Name:     auth.CSRFCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: false,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   secure,
+	})
+	writeOK(w, map[string]any{"csrfToken": token})
 }
 
 // SetMode persists the auth mode setting.
@@ -349,6 +417,7 @@ func (h *AuthHandler) issueSession(w http.ResponseWriter, r *http.Request, ctx c
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 		Secure:   secure,
+		MaxAge:   int(dur.Seconds()),
 	}
 	if rememberMe {
 		cookie.Expires = exp

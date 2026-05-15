@@ -1,20 +1,55 @@
 import { FormEvent, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { api, AuthConfig, AuthStatus, BlocklistEntry, Indexer, ProwlarrInstance, DownloadClient, NotificationConfig, QualityProfile, MetadataProfile, CalibreImportProgress, RootFolder, LogEntry, ImportList, HardcoverList } from '../api/client'
+import { api, ABSConfig, ABSImportProgress, ABSImportRun, ABSLibrary, ABSMetadataConflict, ABSReviewItem, ABSRollbackAction, ABSRollbackResult, ABSTestResult, GrimmoryConfig, GrimmoryTestResult, AuthConfig, AuthStatus, BlocklistEntry, Indexer, IndexerTestResult, ProwlarrInstance, DownloadClient, NotificationConfig, QualityProfile, MetadataProfile, CalibreImportProgress, CalibreSyncProgress, RootFolder, LogEntry, ImportList, HardcoverList, HardcoverTestResult, Author, Book, SystemStatus } from '../api/client'
+import AuthSettings from '../settings/AuthSettings'
 import Pagination from '../components/Pagination'
+import ABSConflictPanel from '../components/ABSAuthorConflictsPanel'
 import { usePagination } from '../components/usePagination'
 import ThemeToggle from '../components/ThemeToggle'
 import LanguageSwitcher from '../components/LanguageSwitcher'
 import { useAuth } from '../auth/AuthContext'
 
-type Tab = 'indexers' | 'clients' | 'notifications' | 'quality' | 'metadata' | 'general' | 'import' | 'rootfolders' | 'logs' | 'blocklist' | 'calibre'
+type Tab = 'indexers' | 'clients' | 'notifications' | 'quality' | 'metadata' | 'general' | 'import' | 'rootfolders' | 'logs' | 'blocklist' | 'calibre' | 'abs' | 'grimmory'
 
 const inputCls = 'w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600'
-const tabCls = (active: boolean) =>
-  `px-4 py-2 rounded-md text-sm font-medium transition-colors ${active ? 'bg-slate-200 dark:bg-zinc-800 text-slate-900 dark:text-white' : 'text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/50 dark:hover:bg-zinc-800/50'}`
+const absReviewResultLimit = 10
+
+function SettingsNavLink({ tab, active, onSelect, label }: { tab: Tab; active: Tab; onSelect: (t: Tab) => void; label: string }) {
+  return (
+    <button
+      onClick={() => onSelect(tab)}
+      className={`w-full text-left px-3 py-1.5 rounded-md text-sm transition-colors ${
+        active === tab
+          ? 'bg-slate-200 dark:bg-zinc-800 text-slate-900 dark:text-white font-medium'
+          : 'text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-zinc-800/50'
+      }`}
+    >
+      {label}
+    </button>
+  )
+}
+
+function Toggle({ checked, onChange, title, disabled }: { checked: boolean; onChange: () => void; title?: string; disabled?: boolean }) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      onClick={onChange}
+      title={title}
+      disabled={disabled}
+      className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-1 dark:focus-visible:ring-offset-zinc-900 disabled:opacity-50 disabled:cursor-not-allowed ${
+        checked ? 'bg-emerald-600' : 'bg-slate-300 dark:bg-zinc-700'
+      }`}
+    >
+      <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow-sm transition-transform duration-150 ${checked ? 'translate-x-4' : ''}`} />
+    </button>
+  )
+}
 
 export default function SettingsPage() {
   const { t, i18n } = useTranslation()
+  const { isAdmin } = useAuth()
   const [tab, setTab] = useState<Tab>('general')
   const [indexers, setIndexers] = useState<Indexer[]>([])
   const [clients, setClients] = useState<DownloadClient[]>([])
@@ -31,18 +66,31 @@ export default function SettingsPage() {
   const [showAddClient, setShowAddClient] = useState(false)
   const [showAddNotification, setShowAddNotification] = useState(false)
   const [editingIndexer, setEditingIndexer] = useState<number | null>(null)
+  const [indexerTestResults, setIndexerTestResults] = useState<Record<number, IndexerTestResult & { testing?: boolean }>>({})
+  const [confirmDeleteIndexer, setConfirmDeleteIndexer] = useState<number | null>(null)
   const [editingClient, setEditingClient] = useState<number | null>(null)
+  const [clientTestResult, setClientTestResult] = useState<Record<number, { ok: boolean; msg: string }>>({})
+  const [confirmDeleteClient, setConfirmDeleteClient] = useState<number | null>(null)
   const [editingNotification, setEditingNotification] = useState<number | null>(null)
+  const [notificationTestResult, setNotificationTestResult] = useState<Record<number, { ok: boolean; msg: string }>>({})
+  const [confirmDeleteNotification, setConfirmDeleteNotification] = useState<number | null>(null)
+  const [prowlarrTestResult, setProwlarrTestResult] = useState<Record<number, { ok: boolean; msg: string }>>({})
   const [logEntries, setLogEntries] = useState<LogEntry[]>([])
   const [logLevel, setLogLevel] = useState<string>('info')
   const [logFilter, setLogFilter] = useState<string>('all')
   const [logAutoRefresh, setLogAutoRefresh] = useState(true)
+  const [logComponent, setLogComponent] = useState<string>('')
+  const [logSearch, setLogSearch] = useState<string>('')
+  const [logFrom, setLogFrom] = useState<string>('')
+  const [logTo, setLogTo] = useState<string>('')
+  const [logPage, setLogPage] = useState(0)
+  const logPageSize = 200
   const logBottomRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     api.listIndexers().then(setIndexers).catch(console.error)
     api.listDownloadClients().then(setClients).catch(console.error)
-    api.listProwlarr().then(setProwlarrInstances).catch(console.error)
+    api.listProwlarr().then(r => setProwlarrInstances(r ?? [])).catch(console.error)
   }, [])
 
   useEffect(() => {
@@ -57,18 +105,31 @@ export default function SettingsPage() {
     if (tab === 'rootfolders') api.listRootFolders().then(setRootFolders).catch(console.error)
     if (tab === 'logs') {
       api.getLogLevel().then(r => setLogLevel(r.level.toLowerCase())).catch(console.error)
-      api.getLogs(undefined, 200).then(setLogEntries).catch(console.error)
+      fetchLogs()
     }
-  }, [tab])
+  }, [tab]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const fetchLogs = (page = 0) => {
+    api.getLogs({
+      level: logFilter !== 'all' ? logFilter : undefined,
+      component: logComponent || undefined,
+      from: logFrom || undefined,
+      to: logTo || undefined,
+      q: logSearch || undefined,
+      limit: logPageSize,
+      offset: page * logPageSize,
+    }).then(entries => {
+      setLogEntries(entries ?? [])
+      setLogPage(page)
+    }).catch(console.error)
+  }
 
   // Auto-refresh logs every 5 s while the tab is active and toggle is on.
   useEffect(() => {
     if (tab !== 'logs' || !logAutoRefresh) return
-    const id = setInterval(() => {
-      api.getLogs(undefined, 200).then(setLogEntries).catch(console.error)
-    }, 5000)
+    const id = setInterval(() => { fetchLogs(logPage) }, 5000)
     return () => clearInterval(id)
-  }, [tab, logAutoRefresh])
+  }, [tab, logAutoRefresh, logPage, logFilter, logComponent, logFrom, logTo, logSearch]) // eslint-disable-line react-hooks/exhaustive-deps
 
   function formatBytes(bytes: number): string {
     if (bytes === 0) return '0 B'
@@ -81,13 +142,46 @@ export default function SettingsPage() {
     <div>
       <h2 className="text-2xl font-bold mb-6">{t('settings.title')}</h2>
 
-      <div className="flex flex-wrap gap-2 mb-6">
-        {(['general', 'indexers', 'clients', 'rootfolders', 'quality', 'metadata', 'notifications', 'calibre', 'import', 'blocklist', 'logs'] as Tab[]).map(tabKey => (
-          <button key={tabKey} onClick={() => setTab(tabKey)} className={tabCls(tab === tabKey)}>
-            {t(`settings.tabs.${tabKey}`)}
-          </button>
-        ))}
-      </div>
+      <div className="flex gap-8 items-start">
+        {/* Sidebar navigation */}
+        <nav className="w-44 flex-shrink-0 space-y-0.5">
+          <SettingsNavLink tab="general" active={tab} onSelect={setTab} label={t('settings.tabs.general')} />
+
+          {isAdmin && (
+            <>
+              <div className="pt-4 pb-0.5">
+                <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400 dark:text-zinc-600 px-3 mb-1">Sources</p>
+                <SettingsNavLink tab="indexers" active={tab} onSelect={setTab} label={t('settings.tabs.indexers')} />
+                <SettingsNavLink tab="clients" active={tab} onSelect={setTab} label={t('settings.tabs.clients')} />
+                <SettingsNavLink tab="notifications" active={tab} onSelect={setTab} label={t('settings.tabs.notifications')} />
+              </div>
+
+              <div className="pt-3 pb-0.5">
+                <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400 dark:text-zinc-600 px-3 mb-1">Library</p>
+                <SettingsNavLink tab="quality" active={tab} onSelect={setTab} label={t('settings.tabs.quality')} />
+                <SettingsNavLink tab="metadata" active={tab} onSelect={setTab} label={t('settings.tabs.metadata')} />
+                <SettingsNavLink tab="rootfolders" active={tab} onSelect={setTab} label={t('settings.tabs.rootfolders')} />
+              </div>
+
+              <div className="pt-3 pb-0.5">
+                <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400 dark:text-zinc-600 px-3 mb-1">Integrations</p>
+                <SettingsNavLink tab="calibre" active={tab} onSelect={setTab} label={t('settings.tabs.calibre')} />
+                <SettingsNavLink tab="abs" active={tab} onSelect={setTab} label={t('settings.tabs.abs')} />
+                <SettingsNavLink tab="grimmory" active={tab} onSelect={setTab} label={t('settings.tabs.grimmory')} />
+              </div>
+
+              <div className="pt-3 pb-0.5">
+                <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400 dark:text-zinc-600 px-3 mb-1">System</p>
+                <SettingsNavLink tab="import" active={tab} onSelect={setTab} label={t('settings.tabs.import')} />
+                <SettingsNavLink tab="blocklist" active={tab} onSelect={setTab} label={t('settings.tabs.blocklist')} />
+                <SettingsNavLink tab="logs" active={tab} onSelect={setTab} label={t('settings.tabs.logs')} />
+              </div>
+            </>
+          )}
+        </nav>
+
+        {/* Tab content */}
+        <div className="flex-1 min-w-0">
 
       {/* Indexers */}
       {tab === 'indexers' && (
@@ -106,16 +200,14 @@ export default function SettingsPage() {
                 <div key={idx.id}>
                   <div className="flex items-center justify-between p-4 border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900">
                     <div className="flex items-center gap-3 min-w-0">
-                      <button
-                        onClick={async () => {
+                      <Toggle
+                        checked={idx.enabled}
+                        onChange={async () => {
                           const updated = await api.updateIndexer(idx.id, { ...idx, enabled: !idx.enabled })
                           setIndexers(indexers.map(i => i.id === idx.id ? updated : i))
                         }}
-                        className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0 ${idx.enabled ? 'bg-emerald-600' : 'bg-slate-300 dark:bg-zinc-700'}`}
                         title={idx.enabled ? t('common.disable') : t('common.enable')}
-                      >
-                        <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform ${idx.enabled ? 'translate-x-4' : ''}`} />
-                      </button>
+                      />
                       <div className="min-w-0">
                         <h4 className={`font-medium text-sm ${!idx.enabled ? 'text-slate-600 dark:text-zinc-500' : ''}`}>{idx.name}</h4>
                         <p className="text-xs text-slate-600 dark:text-zinc-500 truncate">{idx.url}</p>
@@ -124,29 +216,62 @@ export default function SettingsPage() {
                     <div className="flex items-center gap-3 flex-shrink-0">
                       <button onClick={() => setEditingIndexer(editingIndexer === idx.id ? null : idx.id)} className="text-xs text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white">{t('common.edit')}</button>
                       <button
+                        disabled={indexerTestResults[idx.id]?.testing}
                         onClick={async () => {
+                          setIndexerTestResults(prev => ({ ...prev, [idx.id]: { ...(prev[idx.id] ?? { ok: false, status: 0, categories: 0, bookSearch: false, latencyMs: 0, searchResults: 0 }), testing: true } }))
                           try {
-                            await api.testIndexer(idx.id)
-                            alert(t('common.connOk'))
+                            const r = await api.testIndexer(idx.id)
+                            setIndexerTestResults(prev => ({ ...prev, [idx.id]: { ...r, testing: false } }))
                           } catch (err: unknown) {
-                            alert(t('common.connFail', { error: err instanceof Error ? err.message : 'Unknown error' }))
+                            setIndexerTestResults(prev => ({ ...prev, [idx.id]: { ok: false, status: 0, categories: 0, bookSearch: false, latencyMs: 0, searchResults: 0, error: err instanceof Error ? err.message : 'Request failed', testing: false } }))
                           }
                         }}
-                        className="text-xs text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white"
+                        className="text-xs text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white disabled:opacity-50"
                       >
-                        {t('common.test')}
+                        {indexerTestResults[idx.id]?.testing ? t('common.testing') : t('common.test')}
                       </button>
-                      <button
-                        onClick={async () => {
-                          await api.deleteIndexer(idx.id)
-                          setIndexers(indexers.filter(i => i.id !== idx.id))
-                        }}
-                        className="text-xs text-red-400 hover:text-red-300"
-                      >
-                        {t('common.delete')}
-                      </button>
+                      {confirmDeleteIndexer === idx.id ? (
+                        <span className="flex items-center gap-1.5">
+                          <span className="text-xs text-slate-500 dark:text-zinc-500">{t('common.delete')}?</span>
+                          <button
+                            onClick={async () => {
+                              await api.deleteIndexer(idx.id)
+                              setIndexers(indexers.filter(i => i.id !== idx.id))
+                              setConfirmDeleteIndexer(null)
+                            }}
+                            className="text-xs text-red-500 font-medium hover:text-red-400"
+                          >{t('common.yes')}</button>
+                          <button onClick={() => setConfirmDeleteIndexer(null)} className="text-xs text-slate-500 dark:text-zinc-500 hover:text-slate-700 dark:hover:text-zinc-300">{t('common.no')}</button>
+                        </span>
+                      ) : (
+                        <button onClick={() => setConfirmDeleteIndexer(idx.id)} className="text-xs text-red-400 hover:text-red-300">
+                          {t('common.delete')}
+                        </button>
+                      )}
                     </div>
                   </div>
+                  {indexerTestResults[idx.id] && !indexerTestResults[idx.id].testing && (() => {
+                    const r = indexerTestResults[idx.id]
+                    const warn = r.ok && r.searchResults === 0
+                    const colorCls = !r.ok
+                      ? 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'
+                      : warn
+                        ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300'
+                        : 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300'
+                    const dotCls = !r.ok ? 'bg-red-500' : warn ? 'bg-amber-500' : 'bg-emerald-500'
+                    return (
+                      <div role="status" className={`mt-2 px-3 py-2 rounded text-xs flex items-center gap-2 ${colorCls}`}>
+                        <span className={`inline-block w-2 h-2 rounded-full flex-shrink-0 ${dotCls}`} />
+                        {!r.ok ? (
+                          <span>{t('settings.indexers.testFail', { error: r.error ?? 'Unknown error' })}</span>
+                        ) : warn ? (
+                          <span>{t('settings.indexers.testWarn', { status: r.status, categories: r.categories, latency: r.latencyMs })}{r.searchError ? ` — ${r.searchError}` : ''}</span>
+                        ) : (
+                          <span>{t('settings.indexers.testOk', { status: r.status, categories: r.categories, latency: r.latencyMs, results: r.searchResults })}</span>
+                        )}
+                      </div>
+                    )
+                  })()}
                   {editingIndexer === idx.id && (
                     <EditIndexerForm
                       indexer={idx}
@@ -194,16 +319,18 @@ export default function SettingsPage() {
                       {prowlarrSyncResult[p.id] && (
                         <p className="text-xs text-emerald-600 dark:text-emerald-400 mt-0.5">{prowlarrSyncResult[p.id]}</p>
                       )}
+                      {prowlarrTestResult[p.id] && (
+                        <p className={`text-xs mt-0.5 ${prowlarrTestResult[p.id].ok ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'}`}>{prowlarrTestResult[p.id].msg}</p>
+                      )}
                     </div>
                     <div className="flex items-center gap-3 flex-shrink-0">
                       <button
                         onClick={async () => {
                           try {
                             const r = await api.testProwlarr(p.id)
-                            if (r.ok === 'true') alert(`Connected — Prowlarr ${r.version}`)
-                            else alert(`Connection failed: ${r.error}`)
+                            setProwlarrTestResult(prev => ({ ...prev, [p.id]: { ok: r.ok === 'true', msg: r.ok === 'true' ? `Connected — Prowlarr ${r.version}` : `Connection failed: ${r.error}` } }))
                           } catch (err: unknown) {
-                            alert(err instanceof Error ? err.message : 'Connection failed')
+                            setProwlarrTestResult(prev => ({ ...prev, [p.id]: { ok: false, msg: err instanceof Error ? err.message : 'Connection failed' } }))
                           }
                         }}
                         className="text-xs text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white"
@@ -216,9 +343,9 @@ export default function SettingsPage() {
                             const r = await api.syncProwlarr(p.id)
                             setProwlarrSyncResult(prev => ({ ...prev, [p.id]: `Synced — added ${r.added}, updated ${r.updated}, removed ${r.removed}` }))
                             api.listIndexers().then(setIndexers).catch(console.error)
-                            api.listProwlarr().then(setProwlarrInstances).catch(console.error)
+                            api.listProwlarr().then(r => setProwlarrInstances(r ?? [])).catch(console.error)
                           } catch (err: unknown) {
-                            alert(err instanceof Error ? err.message : 'Sync failed')
+                            setProwlarrSyncResult(prev => ({ ...prev, [p.id]: `Sync failed: ${err instanceof Error ? err.message : 'Unknown error'}` }))
                           }
                         }}
                         className="text-xs text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white"
@@ -272,16 +399,14 @@ export default function SettingsPage() {
                 <div key={c.id}>
                   <div className="flex items-center justify-between p-4 border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900">
                     <div className="flex items-center gap-3 min-w-0">
-                      <button
-                        onClick={async () => {
+                      <Toggle
+                        checked={c.enabled}
+                        onChange={async () => {
                           const updated = await api.updateDownloadClient(c.id, { ...c, enabled: !c.enabled })
                           setClients(clients.map(x => x.id === c.id ? updated : x))
                         }}
-                        className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0 ${c.enabled ? 'bg-emerald-600' : 'bg-slate-300 dark:bg-zinc-700'}`}
                         title={c.enabled ? t('common.disable') : t('common.enable')}
-                      >
-                        <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform ${c.enabled ? 'translate-x-4' : ''}`} />
-                      </button>
+                      />
                       <div className="min-w-0">
                         <h4 className={`font-medium text-sm ${!c.enabled ? 'text-slate-600 dark:text-zinc-500' : ''}`}>{c.name}</h4>
                         <p className="text-xs text-slate-600 dark:text-zinc-500">{c.host}:{c.port} ({c.category})</p>
@@ -293,24 +418,33 @@ export default function SettingsPage() {
                         onClick={async () => {
                           try {
                             await api.testDownloadClient(c.id)
-                            alert(t('common.connOk'))
+                            setClientTestResult(prev => ({ ...prev, [c.id]: { ok: true, msg: t('common.connOk') } }))
                           } catch (err: unknown) {
-                            alert(t('common.connFail', { error: err instanceof Error ? err.message : 'Unknown error' }))
+                            setClientTestResult(prev => ({ ...prev, [c.id]: { ok: false, msg: t('common.connFail', { error: err instanceof Error ? err.message : 'Unknown error' }) } }))
                           }
                         }}
                         className="text-xs text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white"
                       >
                         {t('common.test')}
                       </button>
-                      <button
-                        onClick={async () => {
-                          await api.deleteDownloadClient(c.id)
-                          setClients(clients.filter(x => x.id !== c.id))
-                        }}
-                        className="text-xs text-red-400 hover:text-red-300"
-                      >
-                        {t('common.delete')}
-                      </button>
+                      {confirmDeleteClient === c.id ? (
+                        <span className="flex items-center gap-1.5">
+                          <span className="text-xs text-slate-500 dark:text-zinc-500">{t('common.delete')}?</span>
+                          <button
+                            onClick={async () => {
+                              await api.deleteDownloadClient(c.id)
+                              setClients(clients.filter(x => x.id !== c.id))
+                              setConfirmDeleteClient(null)
+                            }}
+                            className="text-xs text-red-500 font-medium hover:text-red-400"
+                          >{t('common.yes')}</button>
+                          <button onClick={() => setConfirmDeleteClient(null)} className="text-xs text-slate-500 dark:text-zinc-500 hover:text-slate-700 dark:hover:text-zinc-300">{t('common.no')}</button>
+                        </span>
+                      ) : (
+                        <button onClick={() => setConfirmDeleteClient(c.id)} className="text-xs text-red-400 hover:text-red-300">
+                          {t('common.delete')}
+                        </button>
+                      )}
                     </div>
                   </div>
                   {editingClient === c.id && (
@@ -319,6 +453,12 @@ export default function SettingsPage() {
                       onClose={() => setEditingClient(null)}
                       onSaved={(updated) => { setClients(clients.map(x => x.id === updated.id ? updated : x)); setEditingClient(null) }}
                     />
+                  )}
+                  {clientTestResult[c.id] && (
+                    <div role="status" className={`mt-1 px-3 py-1.5 rounded text-xs flex items-center gap-2 ${clientTestResult[c.id].ok ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300' : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'}`}>
+                      <span className={`inline-block w-2 h-2 rounded-full flex-shrink-0 ${clientTestResult[c.id].ok ? 'bg-emerald-500' : 'bg-red-500'}`} />
+                      {clientTestResult[c.id].msg}
+                    </div>
                   )}
                 </div>
               ))}
@@ -351,16 +491,14 @@ export default function SettingsPage() {
                   <div className="p-4 border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900">
                     <div className="flex items-start justify-between gap-3">
                       <div className="flex items-start gap-3 min-w-0">
-                        <button
-                          onClick={async () => {
+                        <Toggle
+                          checked={n.enabled}
+                          onChange={async () => {
                             const updated = await api.updateNotification(n.id, { ...n, enabled: !n.enabled })
                             setNotifications(notifications.map(x => x.id === n.id ? updated : x))
                           }}
-                          className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0 mt-0.5 ${n.enabled ? 'bg-emerald-600' : 'bg-slate-300 dark:bg-zinc-700'}`}
                           title={n.enabled ? t('common.disable') : t('common.enable')}
-                        >
-                          <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform ${n.enabled ? 'translate-x-4' : ''}`} />
-                        </button>
+                        />
                         <div className="min-w-0">
                           <h4 className={`font-medium text-sm ${!n.enabled ? 'text-slate-600 dark:text-zinc-500' : ''}`}>{n.name}</h4>
                           <p className="text-xs text-slate-600 dark:text-zinc-500 truncate mt-0.5">{n.url}</p>
@@ -379,24 +517,33 @@ export default function SettingsPage() {
                           onClick={async () => {
                             try {
                               await api.testNotification(n.id)
-                              alert(t('settings.notifications.testSent'))
+                              setNotificationTestResult(prev => ({ ...prev, [n.id]: { ok: true, msg: t('settings.notifications.testSent') } }))
                             } catch (err: unknown) {
-                              alert(t('common.connFail', { error: err instanceof Error ? err.message : 'Unknown error' }))
+                              setNotificationTestResult(prev => ({ ...prev, [n.id]: { ok: false, msg: t('common.connFail', { error: err instanceof Error ? err.message : 'Unknown error' }) } }))
                             }
                           }}
                           className="text-xs text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white"
                         >
                           {t('common.test')}
                         </button>
-                        <button
-                          onClick={async () => {
-                            await api.deleteNotification(n.id)
-                            setNotifications(notifications.filter(x => x.id !== n.id))
-                          }}
-                          className="text-xs text-red-400 hover:text-red-300"
-                        >
-                          {t('common.delete')}
-                        </button>
+                        {confirmDeleteNotification === n.id ? (
+                          <span className="flex items-center gap-1.5">
+                            <span className="text-xs text-slate-500 dark:text-zinc-500">{t('common.delete')}?</span>
+                            <button
+                              onClick={async () => {
+                                await api.deleteNotification(n.id)
+                                setNotifications(notifications.filter(x => x.id !== n.id))
+                                setConfirmDeleteNotification(null)
+                              }}
+                              className="text-xs text-red-500 font-medium hover:text-red-400"
+                            >{t('common.yes')}</button>
+                            <button onClick={() => setConfirmDeleteNotification(null)} className="text-xs text-slate-500 dark:text-zinc-500 hover:text-slate-700 dark:hover:text-zinc-300">{t('common.no')}</button>
+                          </span>
+                        ) : (
+                          <button onClick={() => setConfirmDeleteNotification(n.id)} className="text-xs text-red-400 hover:text-red-300">
+                            {t('common.delete')}
+                          </button>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -406,6 +553,12 @@ export default function SettingsPage() {
                       onClose={() => setEditingNotification(null)}
                       onSaved={(updated) => { setNotifications(notifications.map(x => x.id === updated.id ? updated : x)); setEditingNotification(null) }}
                     />
+                  )}
+                  {notificationTestResult[n.id] && (
+                    <div role="status" className={`mt-1 px-3 py-1.5 rounded text-xs flex items-center gap-2 ${notificationTestResult[n.id].ok ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300' : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'}`}>
+                      <span className={`inline-block w-2 h-2 rounded-full flex-shrink-0 ${notificationTestResult[n.id].ok ? 'bg-emerald-500' : 'bg-red-500'}`} />
+                      {notificationTestResult[n.id].msg}
+                    </div>
                   )}
                 </div>
               ))}
@@ -462,6 +615,10 @@ export default function SettingsPage() {
       )}
 
       {/* General */}
+      {tab === 'abs' && (
+        <ABSTab />
+      )}
+
       {tab === 'import' && (
         <ImportTab />
       )}
@@ -533,16 +690,16 @@ export default function SettingsPage() {
 
       {tab === 'logs' && (
         <div>
-          {/* Toolbar */}
-          <div className="flex flex-wrap items-center gap-3 mb-4">
+          {/* Toolbar row 1: heading + level pills + runtime level + auto-refresh */}
+          <div className="flex flex-wrap items-center gap-3 mb-3">
             <h3 className="text-lg font-semibold mr-auto">{t('settings.logs.heading')}</h3>
 
-            {/* Level filter (display) */}
+            {/* Level filter pills */}
             <div className="flex items-center gap-1.5 text-xs">
               {(['all', 'debug', 'info', 'warn', 'error'] as const).map(f => (
                 <button
                   key={f}
-                  onClick={() => setLogFilter(f)}
+                  onClick={() => { setLogFilter(f); fetchLogs(0) }}
                   className={`px-2.5 py-1 rounded font-medium transition-colors ${logFilter === f
                     ? f === 'error' ? 'bg-red-600 text-white'
                       : f === 'warn' ? 'bg-amber-500 text-white'
@@ -583,29 +740,72 @@ export default function SettingsPage() {
             </button>
 
             <button
-              onClick={() => api.getLogs(undefined, 200).then(setLogEntries).catch(console.error)}
+              onClick={() => fetchLogs(0)}
               className="text-xs px-2.5 py-1 rounded border border-slate-300 dark:border-zinc-700 text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white"
             >
               {t('common.refresh')}
             </button>
           </div>
 
+          {/* Toolbar row 2: date range + component + search */}
+          <div className="flex flex-wrap items-center gap-2 mb-3 text-xs">
+            <div className="flex items-center gap-1">
+              <span className="text-slate-500 dark:text-zinc-500">{t('settings.logs.from')}</span>
+              <input
+                type="datetime-local"
+                value={logFrom}
+                onChange={e => setLogFrom(e.target.value)}
+                className="bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-2 py-1 text-xs"
+              />
+            </div>
+            <div className="flex items-center gap-1">
+              <span className="text-slate-500 dark:text-zinc-500">{t('settings.logs.to')}</span>
+              <input
+                type="datetime-local"
+                value={logTo}
+                onChange={e => setLogTo(e.target.value)}
+                className="bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-2 py-1 text-xs"
+              />
+            </div>
+            <input
+              type="text"
+              placeholder={t('settings.logs.componentPlaceholder')}
+              value={logComponent}
+              onChange={e => setLogComponent(e.target.value)}
+              className="bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-2 py-1 text-xs w-32"
+            />
+            <input
+              type="text"
+              placeholder={t('settings.logs.searchPlaceholder')}
+              value={logSearch}
+              onChange={e => setLogSearch(e.target.value)}
+              className="bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-2 py-1 text-xs w-48"
+            />
+            <button
+              onClick={() => fetchLogs(0)}
+              className="px-3 py-1 rounded bg-slate-700 dark:bg-zinc-600 text-white hover:bg-slate-600 dark:hover:bg-zinc-500 text-xs"
+            >
+              {t('common.search')}
+            </button>
+            <button
+              onClick={() => {
+                setLogFrom(''); setLogTo(''); setLogComponent(''); setLogSearch(''); setLogFilter('all')
+                setTimeout(() => fetchLogs(0), 0)
+              }}
+              className="px-2 py-1 rounded border border-slate-300 dark:border-zinc-700 text-slate-500 dark:text-zinc-500 text-xs"
+            >
+              {t('settings.logs.clearFilters')}
+            </button>
+          </div>
+
           {/* Log output */}
           <div className="font-mono text-xs bg-slate-50 dark:bg-black rounded-lg border border-slate-200 dark:border-zinc-900 overflow-auto max-h-[60vh]">
             {(() => {
-              const matches = (level: string) => {
-                if (logFilter === 'all' || logFilter === 'debug') return true
-                if (logFilter === 'info') return level !== 'DEBUG'
-                if (logFilter === 'warn') return level === 'WARN' || level === 'ERROR'
-                if (logFilter === 'error') return level === 'ERROR'
-                return true
-              }
               const formatAttr = (k: string, v: unknown) => {
                 const s = String(v)
                 return /[\s=]/.test(s) ? `${k}="${s.replace(/"/g, '\\"')}"` : `${k}=${s}`
               }
-              const filtered = logEntries.filter(e => matches(e.level))
-              if (filtered.length === 0) {
+              if (logEntries.length === 0) {
                 return <p className="text-slate-500 dark:text-zinc-600 p-4 text-center">{t('settings.logs.noEntries')}</p>
               }
               return (
@@ -613,30 +813,34 @@ export default function SettingsPage() {
                   <colgroup>
                     <col className="w-36" />
                     <col className="w-14" />
+                    <col className="w-24" />
                     <col />
                     <col className="w-2/5" />
                   </colgroup>
                   <tbody>
-                    {filtered.map((e, i) => {
+                    {logEntries.map((e, i) => {
                       const levelCls =
                         e.level === 'ERROR' ? 'text-red-500 dark:text-red-400' :
                         e.level === 'WARN'  ? 'text-amber-600 dark:text-amber-400' :
                         e.level === 'DEBUG' ? 'text-slate-400 dark:text-zinc-500' :
                         'text-emerald-600 dark:text-emerald-400'
-                      const d = new Date(e.time)
-                      const ts = d.toLocaleString(i18n.resolvedLanguage, {
+                      // Support both ring buffer (time/msg/attrs) and DB (ts/message/fields) shapes.
+                      const rawTs = e.ts ?? e.time ?? ''
+                      const d = new Date(rawTs)
+                      const ts = rawTs ? d.toLocaleString(i18n.resolvedLanguage, {
                         day: '2-digit', month: '2-digit',
                         hour: '2-digit', minute: '2-digit', second: '2-digit',
                         hour12: false,
-                      })
-                      const attrStr = e.attrs
-                        ? Object.entries(e.attrs).map(([k, v]) => formatAttr(k, v)).join(' ')
-                        : ''
+                      }) : ''
+                      const msgText = e.message ?? e.msg ?? ''
+                      const attrsObj = e.fields ?? e.attrs ?? {}
+                      const attrStr = Object.entries(attrsObj).map(([k, v]) => formatAttr(k, v)).join(' ')
                       return (
-                        <tr key={i} className="border-b border-slate-200 dark:border-zinc-900 hover:bg-slate-100 dark:hover:bg-zinc-900/50">
+                        <tr key={e.id ?? i} className="border-b border-slate-200 dark:border-zinc-900 hover:bg-slate-100 dark:hover:bg-zinc-900/50">
                           <td className="pl-3 pr-2 py-0.5 text-slate-500 dark:text-zinc-600 whitespace-nowrap align-top" title={d.toISOString()}>{ts}</td>
                           <td className={`pr-2 py-0.5 whitespace-nowrap font-semibold align-top ${levelCls}`}>{e.level}</td>
-                          <td className="pr-2 py-0.5 text-slate-800 dark:text-zinc-200 break-words whitespace-pre-wrap align-top">{e.msg}</td>
+                          <td className="pr-2 py-0.5 text-slate-500 dark:text-zinc-500 whitespace-nowrap align-top">{e.component ?? ''}</td>
+                          <td className="pr-2 py-0.5 text-slate-800 dark:text-zinc-200 break-words whitespace-pre-wrap align-top">{msgText}</td>
                           <td className="pr-3 py-0.5 text-slate-500 dark:text-zinc-500 break-words whitespace-pre-wrap align-top">{attrStr}</td>
                         </tr>
                       )
@@ -647,8 +851,28 @@ export default function SettingsPage() {
             })()}
             <div ref={logBottomRef} />
           </div>
+
+          {/* Pagination */}
+          <div className="flex items-center gap-3 mt-2 text-xs text-slate-600 dark:text-zinc-400">
+            <button
+              disabled={logPage === 0}
+              onClick={() => fetchLogs(logPage - 1)}
+              className="px-2 py-1 rounded border border-slate-300 dark:border-zinc-700 disabled:opacity-40"
+            >
+              ← {t('common.prev')}
+            </button>
+            <span>{t('settings.logs.page', { page: logPage + 1 })}</span>
+            <button
+              disabled={logEntries.length < logPageSize}
+              onClick={() => fetchLogs(logPage + 1)}
+              className="px-2 py-1 rounded border border-slate-300 dark:border-zinc-700 disabled:opacity-40"
+            >
+              {t('common.next')} →
+            </button>
+          </div>
+
           <p className="text-xs text-slate-500 dark:text-zinc-600 mt-2">
-            {t('settings.logs.bufferNote')}
+            {t('settings.logs.persistNote')}
           </p>
         </div>
       )}
@@ -661,9 +885,15 @@ export default function SettingsPage() {
         <CalibreTab />
       )}
 
+      {tab === 'grimmory' && (
+        <GrimmoryTab />
+      )}
+
       {tab === 'blocklist' && (
         <BlocklistTab />
       )}
+        </div> {/* flex-1 min-w-0 content */}
+      </div> {/* flex gap-8 */}
     </div>
   )
 }
@@ -791,6 +1021,7 @@ function MetadataProfileForm({ profile, onClose, onSaved }: { profile?: Metadata
   const [skipMissingDate, setSkipMissingDate] = useState(profile?.skipMissingDate ?? false)
   const [skipMissingIsbn, setSkipMissingIsbn] = useState(profile?.skipMissingIsbn ?? false)
   const [skipPartBooks, setSkipPartBooks] = useState(profile?.skipPartBooks ?? false)
+  const [unknownLanguageBehavior, setUnknownLanguageBehavior] = useState<'pass' | 'fail'>(profile?.unknownLanguageBehavior ?? 'pass')
   const initialLangs = profile?.allowedLanguages
     ? profile.allowedLanguages.split(',').map(c => c.trim().toLowerCase()).filter(Boolean)
     : ['eng']
@@ -815,6 +1046,7 @@ function MetadataProfileForm({ profile, onClose, onSaved }: { profile?: Metadata
         skipMissingIsbn,
         skipPartBooks,
         allowedLanguages: languages.join(','),
+        unknownLanguageBehavior,
       }
       if (profile) {
         await api.updateMetadataProfile(profile.id, payload)
@@ -856,6 +1088,20 @@ function MetadataProfileForm({ profile, onClose, onSaved }: { profile?: Metadata
         </div>
         <p className="text-[11px] text-slate-500 dark:text-zinc-500 mt-2">
           {t('settings.metadata.formLanguagesHint')}
+        </p>
+      </div>
+      <div>
+        <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">{t('settings.metadata.formUnknownLanguage')}</label>
+        <select
+          value={unknownLanguageBehavior}
+          onChange={e => setUnknownLanguageBehavior(e.target.value as 'pass' | 'fail')}
+          className={inputCls}
+        >
+          <option value="pass">{t('settings.metadata.formUnknownLanguagePass')}</option>
+          <option value="fail">{t('settings.metadata.formUnknownLanguageFail')}</option>
+        </select>
+        <p className="text-[11px] text-slate-500 dark:text-zinc-500 mt-2">
+          {t('settings.metadata.formUnknownLanguageHint')}
         </p>
       </div>
       <div className="grid grid-cols-2 gap-3">
@@ -991,7 +1237,6 @@ function ImportTab() {
           </div>
         )}
       </section>
-
       <HardcoverListsSection />
 
       {err && (
@@ -1003,10 +1248,1048 @@ function ImportTab() {
   )
 }
 
+function ABSTab() {
+  return (
+    <div className="space-y-8">
+      <AudiobookshelfSection />
+    </div>
+  )
+}
+
+function AudiobookshelfSection() {
+  const [config, setConfig] = useState<ABSConfig | null>(null)
+  const [draft, setDraft] = useState({ baseUrl: '', apiKey: '', label: 'Audiobookshelf', enabled: false, libraryId: '', pathRemap: '' })
+  const [libraries, setLibraries] = useState<ABSLibrary[]>([])
+  const [showAuthorConflicts, setShowAuthorConflicts] = useState(true)
+  const [showReviewItems, setShowReviewItems] = useState(true)
+  const [showBookConflicts, setShowBookConflicts] = useState(true)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [listing, setListing] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const [libraryError, setLibraryError] = useState<string | null>(null)
+  const [testError, setTestError] = useState<string | null>(null)
+  const [testResult, setTestResult] = useState<ABSTestResult | null>(null)
+  const [importProgress, setImportProgress] = useState<ABSImportProgress | null>(null)
+  const [importDryRun, setImportDryRun] = useState(true)
+  const [importError, setImportError] = useState<string | null>(null)
+  const [runs, setRuns] = useState<ABSImportRun[]>([])
+  const [rollbackResult, setRollbackResult] = useState<ABSRollbackResult | null>(null)
+  const [rollbackError, setRollbackError] = useState<string | null>(null)
+  const [rollbackPreviewingRunId, setRollbackPreviewingRunId] = useState<number | null>(null)
+  const [rollbackApplyingRunId, setRollbackApplyingRunId] = useState<number | null>(null)
+  const [conflicts, setConflicts] = useState<ABSMetadataConflict[]>([])
+  const [reviewItems, setReviewItems] = useState<ABSReviewItem[]>([])
+  const [reviewError, setReviewError] = useState<string | null>(null)
+  const [reviewActionId, setReviewActionId] = useState<number | null>(null)
+  const [authorQueries, setAuthorQueries] = useState<Record<number, string>>({})
+  const [authorResults, setAuthorResults] = useState<Record<number, Author[]>>({})
+  const [authorSearchId, setAuthorSearchId] = useState<number | null>(null)
+  const [bookQueries, setBookQueries] = useState<Record<number, string>>({})
+  const [bookResults, setBookResults] = useState<Record<number, Book[]>>({})
+  const [bookSearchId, setBookSearchId] = useState<number | null>(null)
+  const [conflictError, setConflictError] = useState<string | null>(null)
+  const [resolvingConflictId, setResolvingConflictId] = useState<number | null>(null)
+  const [relinkingAuthorId, setRelinkingAuthorId] = useState<number | null>(null)
+
+  const applyConfig = (next: ABSConfig) => {
+    setConfig(next)
+    setDraft(prev => ({
+      ...prev,
+      baseUrl: next.baseUrl ?? '',
+      apiKey: '',
+      label: next.label || 'Audiobookshelf',
+      enabled: next.enabled,
+      libraryId: next.libraryId ?? '',
+      pathRemap: next.pathRemap ?? '',
+    }))
+  }
+
+  const refreshConflicts = async () => {
+    try {
+      setConflictError(null)
+      const page = await api.absConflicts()
+      setConflicts(page.items)
+    } catch (err: unknown) {
+      setConflictError(err instanceof Error ? err.message : 'Failed to load enrichment conflicts')
+    }
+  }
+
+  const refreshReviewItems = async () => {
+    try {
+      setReviewError(null)
+      const page = await api.absReviewItems()
+      setReviewItems(page.items)
+    } catch (err: unknown) {
+      setReviewError(err instanceof Error ? err.message : 'Failed to load review items')
+    }
+  }
+
+  const refreshRuns = async () => {
+    try {
+      setRuns(await api.absImportRuns())
+    } catch {
+      setRuns([])
+    }
+  }
+
+  const loadLibraries = async (payload?: { baseUrl?: string; apiKey?: string }) => {
+    setListing(true)
+    setLibraryError(null)
+    try {
+      const next = await api.absLibraries(payload)
+      setLibraries(next)
+      if (next.length > 0 && !next.some(lib => lib.id === draft.libraryId) && !draft.libraryId) {
+        setDraft(prev => ({ ...prev, libraryId: next[0].id }))
+      }
+    } catch (err: unknown) {
+      setLibraryError(err instanceof Error ? err.message : 'Failed to load libraries')
+    } finally {
+      setListing(false)
+    }
+  }
+
+  useEffect(() => {
+    api.absConfig()
+      .then(next => {
+        applyConfig(next)
+        if (next.baseUrl && next.apiKeyConfigured) {
+          api.absLibraries()
+            .then(setLibraries)
+            .catch(() => {})
+        }
+      })
+      .catch(err => setSaveError(err instanceof Error ? err.message : 'Failed to load Audiobookshelf config'))
+      .finally(() => setLoading(false))
+    api.absImportStatus().then(setImportProgress).catch(() => {})
+    refreshRuns().catch(() => {})
+    refreshReviewItems().catch(() => {})
+    refreshConflicts().catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    if (!importProgress?.running) return
+    const id = setInterval(() => {
+      api.absImportStatus().then(setImportProgress).catch(() => {})
+    }, 1200)
+    return () => clearInterval(id)
+  }, [importProgress?.running])
+
+  useEffect(() => {
+    if (importProgress?.running) return
+    refreshRuns().catch(() => {})
+    refreshReviewItems().catch(() => {})
+    refreshConflicts().catch(() => {})
+  }, [importProgress?.running, importProgress?.finishedAt])
+
+  const probePayload = () => ({
+    baseUrl: draft.baseUrl.trim(),
+    ...(draft.apiKey.trim() ? { apiKey: draft.apiKey.trim() } : {}),
+  })
+
+  const save = async () => {
+    setSaving(true)
+    setSaveError(null)
+    try {
+      const next = await api.absSetConfig({
+        baseUrl: draft.baseUrl.trim(),
+        apiKey: draft.apiKey.trim() || undefined,
+        label: draft.label.trim() || 'Audiobookshelf',
+        enabled: draft.enabled,
+        libraryId: draft.libraryId,
+        pathRemap: draft.pathRemap.trim(),
+      })
+      applyConfig(next)
+      if (draft.baseUrl.trim() && (draft.apiKey.trim() || next.apiKeyConfigured)) {
+        loadLibraries(probePayload()).catch(() => {})
+      }
+    } catch (err: unknown) {
+      setSaveError(err instanceof Error ? err.message : 'Failed to save Audiobookshelf settings')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const testConnection = async () => {
+    setTesting(true)
+    setTestError(null)
+    setTestResult(null)
+    try {
+      const next = await api.absTest(probePayload())
+      setTestResult(next)
+      if (next.defaultLibraryId) {
+        setDraft(prev => prev.libraryId ? prev : { ...prev, libraryId: next.defaultLibraryId })
+      }
+      if (draft.baseUrl.trim() && (draft.apiKey.trim() || config?.apiKeyConfigured)) {
+        loadLibraries(probePayload()).catch(() => {})
+      }
+    } catch (err: unknown) {
+      setTestError(err instanceof Error ? err.message : 'Connection test failed')
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  const startImport = async (dryRun: boolean) => {
+    setImportError(null)
+    setRollbackError(null)
+    setRollbackResult(null)
+    if (hasUnsavedABSConfig) {
+      setImportError('Save Audiobookshelf settings before starting an import')
+      return
+    }
+    try {
+      const next = await api.absImportStart({
+        dryRun,
+      })
+      setImportProgress(next)
+    } catch (err: unknown) {
+      setImportError(err instanceof Error ? err.message : 'Import failed to start')
+    }
+  }
+
+  const previewRollback = async (runId: number) => {
+    setRollbackPreviewingRunId(runId)
+    setRollbackError(null)
+    try {
+      setRollbackResult(await api.absImportRollbackPreview(runId))
+    } catch (err: unknown) {
+      setRollbackError(err instanceof Error ? err.message : 'Failed to preview rollback')
+    } finally {
+      setRollbackPreviewingRunId(null)
+    }
+  }
+
+  const applyRollback = async (runId: number) => {
+    setRollbackApplyingRunId(runId)
+    setRollbackError(null)
+    try {
+      const result = await api.absImportRollback(runId)
+      setRollbackResult(result)
+      setRuns(prev => prev.map(run => run.id === runId ? { ...run, status: result.status } : run))
+      await refreshRuns()
+    } catch (err: unknown) {
+      setRollbackError(err instanceof Error ? err.message : 'Failed to roll back import run')
+    } finally {
+      setRollbackApplyingRunId(null)
+    }
+  }
+
+  const resolveConflict = async (id: number, source: 'abs' | 'upstream') => {
+    setResolvingConflictId(id)
+    setConflictError(null)
+    try {
+      const updated = await api.resolveAbsConflict(id, source)
+      setConflicts(prev => prev.map(conflict => conflict.id === id ? updated : conflict))
+    } catch (err: unknown) {
+      setConflictError(err instanceof Error ? err.message : 'Failed to resolve conflict')
+    } finally {
+      setResolvingConflictId(null)
+    }
+  }
+
+  const relinkConflictAuthor = async (localId: number) => {
+    setRelinkingAuthorId(localId)
+    setConflictError(null)
+    try {
+      await api.relinkAuthorUpstream(localId)
+      await refreshConflicts()
+    } catch (err: unknown) {
+      setConflictError(err instanceof Error ? err.message : 'Failed to relink author')
+    } finally {
+      setRelinkingAuthorId(null)
+    }
+  }
+
+  const refreshConflictsQuietly = () => {
+    refreshConflicts().catch(() => {})
+  }
+
+  const reviewReasonLabel = (reason: ABSReviewItem['reviewReason']) => {
+    switch (reason) {
+      case 'unmatched_author':
+        return 'No confident author match'
+      case 'ambiguous_author':
+        return 'Multiple author matches'
+      case 'unmatched_book':
+        return 'No confident book match'
+      case 'ambiguous_book':
+        return 'Multiple book matches'
+      default:
+        return reason
+    }
+  }
+
+  const approveReviewItem = async (id: number) => {
+    setReviewActionId(id)
+    setReviewError(null)
+    try {
+      await api.approveAbsReviewItem(id)
+      await refreshReviewItems()
+      api.absImportStatus().then(setImportProgress).catch(() => {})
+      refreshRuns().catch(() => {})
+    } catch (err: unknown) {
+      setReviewError(err instanceof Error ? err.message : 'Failed to import review item')
+    } finally {
+      setReviewActionId(null)
+    }
+  }
+
+  const dismissReviewItem = async (id: number) => {
+    setReviewActionId(id)
+    setReviewError(null)
+    try {
+      await api.dismissAbsReviewItem(id)
+      await refreshReviewItems()
+    } catch (err: unknown) {
+      setReviewError(err instanceof Error ? err.message : 'Failed to dismiss review item')
+    } finally {
+      setReviewActionId(null)
+    }
+  }
+
+  const searchReviewAuthors = async (item: ABSReviewItem) => {
+    const query = (authorQueries[item.id] ?? item.primaryAuthor).trim()
+    if (!query) return
+    setAuthorSearchId(item.id)
+    setReviewError(null)
+    try {
+      const results = await api.searchAuthors(query)
+      setAuthorResults(prev => ({ ...prev, [item.id]: results }))
+    } catch (err: unknown) {
+      setReviewError(err instanceof Error ? err.message : 'Author search failed')
+    } finally {
+      setAuthorSearchId(null)
+    }
+  }
+
+  const resolveReviewAuthor = async (item: ABSReviewItem, author: Author) => {
+    setReviewActionId(item.id)
+    setReviewError(null)
+    try {
+      await api.resolveAbsReviewAuthor(item.id, {
+        foreignAuthorId: author.foreignAuthorId,
+        authorName: author.authorName,
+        applyTo: 'same_author',
+      })
+      await refreshReviewItems()
+      setAuthorResults(prev => ({ ...prev, [item.id]: [] }))
+    } catch (err: unknown) {
+      setReviewError(err instanceof Error ? err.message : 'Failed to resolve author')
+    } finally {
+      setReviewActionId(null)
+    }
+  }
+
+  const searchReviewBooks = async (item: ABSReviewItem) => {
+    const query = (bookQueries[item.id] ?? item.editedTitle ?? item.title).trim()
+    if (!query) return
+    setBookSearchId(item.id)
+    setReviewError(null)
+    try {
+      const results = await api.searchBooks(query)
+      setBookResults(prev => ({ ...prev, [item.id]: results }))
+    } catch (err: unknown) {
+      setReviewError(err instanceof Error ? err.message : 'Book search failed')
+    } finally {
+      setBookSearchId(null)
+    }
+  }
+
+  const resolveReviewBook = async (item: ABSReviewItem, book: Book) => {
+    setReviewActionId(item.id)
+    setReviewError(null)
+    const editedTitle = (bookQueries[item.id] ?? item.editedTitle ?? item.title).trim()
+    const authorForeignId = book.author?.foreignAuthorId?.trim() ?? ''
+    const authorName = book.author?.authorName?.trim() ?? ''
+    try {
+      if (!item.resolvedAuthorForeignId?.trim() && authorForeignId && authorName) {
+        await api.resolveAbsReviewAuthor(item.id, {
+          foreignAuthorId: authorForeignId,
+          authorName,
+          applyTo: 'same_author',
+        })
+      }
+      const updated = await api.resolveAbsReviewBook(item.id, {
+        foreignBookId: book.foreignBookId,
+        title: book.title,
+        editedTitle,
+      })
+      setReviewItems(prev => prev.map(current => current.id === item.id ? updated : current))
+      setBookResults(prev => ({ ...prev, [item.id]: [] }))
+    } catch (err: unknown) {
+      setReviewError(err instanceof Error ? err.message : 'Failed to resolve book')
+    } finally {
+      setReviewActionId(null)
+    }
+  }
+
+  if (loading) {
+    return <section className="text-sm text-slate-500 dark:text-zinc-500">Loading Audiobookshelf…</section>
+  }
+
+  const hasImportCredentials = Boolean(draft.apiKey.trim() || config?.apiKeyConfigured)
+  const effectiveLibraryId = draft.libraryId || testResult?.defaultLibraryId || ''
+  const savedBaseUrl = config?.baseUrl ?? ''
+  const savedLabel = config?.label || 'Audiobookshelf'
+  const savedLibraryId = config?.libraryId ?? ''
+  const savedPathRemap = config?.pathRemap ?? ''
+  const hasUnsavedABSConfig = Boolean(config) && (
+    draft.baseUrl.trim() !== savedBaseUrl.trim() ||
+    (draft.label.trim() || 'Audiobookshelf') !== savedLabel ||
+    draft.enabled !== config?.enabled ||
+    draft.libraryId !== savedLibraryId ||
+    draft.pathRemap.trim() !== savedPathRemap.trim() ||
+    Boolean(draft.apiKey.trim())
+  )
+  const canStartImport = !importProgress?.running && !hasUnsavedABSConfig && Boolean(config?.enabled) && Boolean(config?.apiKeyConfigured) && Boolean(savedBaseUrl.trim()) && Boolean(savedLibraryId)
+  const absRunStatusLabel = (status: string) => {
+    switch (status) {
+      case 'rolled_back':
+        return 'rolled back'
+      case 'completed':
+      case 'failed':
+      case 'running':
+        return status
+      default:
+        return status.replace(/_/g, ' ')
+    }
+  }
+  const rollbackActionName = (action: ABSRollbackAction) => action.displayName?.trim() || action.externalId
+
+  const rollbackActionLabel = (action: ABSRollbackAction) => {
+    const name = rollbackActionName(action)
+    switch (action.action) {
+      case 'delete_author':
+        return `Delete author ${name}`
+      case 'delete_book':
+        return `Delete book ${name}`
+      case 'delete_edition':
+        return `Delete edition ${name}`
+      case 'delete_series':
+        return `Delete series ${name}`
+      case 'restore_book':
+        return `Restore book metadata ${name}`
+      case 'unlink_series':
+        return `Remove series link ${name}`
+      case 'unlink_provenance':
+        return `Remove ABS link ${name}`
+      case 'skip':
+        return `Retain ${action.entityType} ${name}`
+      default:
+        return `${action.action.replace(/_/g, ' ')} ${name}`
+    }
+  }
+  const rollbackActionDetail = (action: ABSRollbackAction) =>
+    action.reason || `${action.entityType}${action.localId ? ` #${action.localId}` : ''}`
+  const rollbackPreviewChanges = rollbackResult?.actions.filter(action => action.action !== 'skip') ?? []
+  const rollbackPreviewRetained = rollbackResult?.actions.filter(action => action.action === 'skip') ?? []
+
+  return (
+    <section>
+      <div className="flex items-center justify-between mb-2 gap-4">
+        <div>
+          <h3 className="text-base font-semibold text-slate-800 dark:text-zinc-200">Audiobookshelf</h3>
+          <p className="text-xs text-slate-600 dark:text-zinc-500 mt-1">
+            Configure one ABS source, test API-key auth, pick a single book library, then import ABS metadata into the Bindery catalog.
+          </p>
+          {draft.enabled && (
+            <p className="text-[11px] text-sky-700 dark:text-sky-300 mt-1 max-w-xl">
+              For better initial matching, it helps to review the ABS library first and match audiobooks to Audible sources so ASINs are already present before import.
+            </p>
+          )}
+        </div>
+        <button
+          onClick={() => setDraft(prev => ({ ...prev, enabled: !prev.enabled }))}
+          className={`relative w-11 h-6 rounded-full transition-colors flex-shrink-0 ${draft.enabled ? 'bg-emerald-600' : 'bg-slate-300 dark:bg-zinc-700'}`}
+          title={draft.enabled ? 'Disable Audiobookshelf source' : 'Enable Audiobookshelf source'}
+          aria-label={draft.enabled ? 'Disable Audiobookshelf source' : 'Enable Audiobookshelf source'}
+        >
+          <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform ${draft.enabled ? 'translate-x-5' : ''}`} />
+        </button>
+      </div>
+
+      <div className="p-4 border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900 space-y-4">
+        <div className="grid gap-4 md:grid-cols-2">
+          <div>
+            <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">Source label</label>
+            <input
+              value={draft.label}
+              onChange={e => setDraft(prev => ({ ...prev, label: e.target.value }))}
+              placeholder="Audiobookshelf"
+              className={inputCls}
+            />
+          </div>
+          <div>
+            <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">Base URL</label>
+            <input
+              value={draft.baseUrl}
+              onChange={e => setDraft(prev => ({ ...prev, baseUrl: e.target.value }))}
+              placeholder="https://abs.example.com"
+              className={inputCls}
+            />
+          </div>
+        </div>
+
+        <div>
+          <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">API key</label>
+          <input
+            value={draft.apiKey}
+            onChange={e => setDraft(prev => ({ ...prev, apiKey: e.target.value }))}
+            type="password"
+            placeholder={config?.apiKeyConfigured ? 'Saved key is hidden. Enter a new key to rotate it.' : 'Paste an ABS API key'}
+            className={inputCls}
+          />
+          <p className="text-[11px] text-slate-500 dark:text-zinc-500 mt-1">
+            {config?.apiKeyConfigured
+              ? 'A key is already stored and stays write-only. Leaving this blank keeps the saved key. Use a key for a user that can access the target book library; ABS admin permissions are not required.'
+              : 'Use a key for a user that can access the target book library. ABS admin permissions are not required, and the saved key never comes back to the browser after you store it.'}
+          </p>
+        </div>
+
+        {testResult && (
+          <div className="px-3 py-2 rounded border border-emerald-300 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/30 text-sm text-emerald-800 dark:text-emerald-300">
+            Connected as <span className="font-medium">{testResult.username}</span>
+            {testResult.serverVersion ? ` on ABS ${testResult.serverVersion}` : ''}
+            {testResult.defaultLibraryId ? ` · default library ${testResult.defaultLibraryId}` : ''}
+          </div>
+        )}
+        {saveError && <div className="text-sm text-red-600 dark:text-red-400">{saveError}</div>}
+        {testError && <div className="text-sm text-red-600 dark:text-red-400">{testError}</div>}
+        {libraryError && <div className="text-sm text-red-600 dark:text-red-400">{libraryError}</div>}
+
+        {(libraries.length > 0 || draft.libraryId) && (
+          <div>
+            <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">Library</label>
+            <select
+              value={draft.libraryId}
+              onChange={e => setDraft(prev => ({ ...prev, libraryId: e.target.value }))}
+              className={inputCls}
+            >
+              <option value="">Select a library</option>
+              {libraries.map(lib => (
+                <option key={lib.id} value={lib.id}>
+                  {lib.name}{lib.provider ? ` · ${lib.provider}` : ''}
+                </option>
+              ))}
+            </select>
+            <p className="text-[11px] text-slate-500 dark:text-zinc-500 mt-1">
+              Save stores the selected library without contacting ABS. Use “List libraries” to show book libraries; imports reject non-book libraries before scanning.
+            </p>
+            {draft.libraryId && !libraries.some(lib => lib.id === draft.libraryId) && (
+              <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1">
+                Saved library ID: {draft.libraryId}. Click “List libraries” to refresh the selectable list.
+              </p>
+            )}
+          </div>
+        )}
+
+        <div>
+          <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">Path translation</label>
+          <textarea
+            value={draft.pathRemap}
+            onChange={e => setDraft(prev => ({ ...prev, pathRemap: e.target.value }))}
+            rows={3}
+            placeholder="/audiobookshelf:/books/audiobookshelf,/abs:/books"
+            className={inputCls}
+          />
+          <p className="text-[11px] text-slate-500 dark:text-zinc-500 mt-1">
+            Optional. Use comma-separated <code className="text-[10px] bg-slate-200 dark:bg-zinc-800 px-1 rounded">from:to</code> prefix rewrites when ABS reports shared-storage paths that Bindery sees under a different mount.
+          </p>
+        </div>
+
+        <div className="flex flex-wrap gap-2">
+          <button
+            onClick={save}
+            disabled={saving}
+            className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium disabled:opacity-50"
+          >
+            {saving ? 'Saving…' : 'Save source'}
+          </button>
+          <button
+            onClick={testConnection}
+            disabled={testing}
+            className="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm font-medium disabled:opacity-50"
+          >
+            {testing ? 'Testing…' : 'Test connection'}
+          </button>
+          <button
+            onClick={() => loadLibraries(probePayload())}
+            disabled={listing}
+            className="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm font-medium disabled:opacity-50"
+          >
+            {listing ? 'Loading…' : 'List libraries'}
+          </button>
+        </div>
+
+        <div className="pt-3 border-t border-slate-200 dark:border-zinc-800 space-y-3">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <label className="block text-sm font-medium text-slate-800 dark:text-zinc-200">Catalog import</label>
+              <p className="text-xs text-slate-600 dark:text-zinc-500 mt-0.5">
+                Import authors, books, series, and editions from the selected ABS library. Shared filesystem paths are reconciled into Bindery ownership automatically; when ABS and Bindery use different mount prefixes, add a path translation above. Non-visible paths stay metadata-only and are counted for manual follow-up.
+              </p>
+            </div>
+            <div className="flex flex-col items-end gap-2 flex-shrink-0">
+              <label className="flex items-center gap-2 text-xs text-slate-600 dark:text-zinc-400">
+                <input
+                  type="checkbox"
+                  checked={importDryRun}
+                  onChange={e => setImportDryRun(e.target.checked)}
+                />
+                Start with dry-run
+              </label>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => startImport(true)}
+                  disabled={!canStartImport}
+                  title={hasUnsavedABSConfig ? 'Save Audiobookshelf settings before starting an import' : undefined}
+                  className="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm font-medium disabled:opacity-50"
+                >
+                  Preview changes
+                </button>
+                <button
+                  onClick={() => startImport(importDryRun)}
+                  disabled={!canStartImport}
+                  title={hasUnsavedABSConfig ? 'Save Audiobookshelf settings before starting an import' : undefined}
+                  className="px-4 py-2 bg-sky-600 hover:bg-sky-500 rounded text-sm font-medium disabled:opacity-50"
+                >
+                  {importProgress?.running ? 'Running…' : importDryRun ? 'Run selected mode' : 'Import library'}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {hasUnsavedABSConfig && (
+            <p className="text-[11px] text-amber-700 dark:text-amber-300">
+              Save Audiobookshelf settings before starting an import so the run uses the stored source configuration.
+            </p>
+          )}
+          {!hasUnsavedABSConfig && !effectiveLibraryId && hasImportCredentials && (
+            <p className="text-[11px] text-amber-700 dark:text-amber-300">
+              Choose a library or use "Test connection" / "List libraries" to load an accessible default library before starting an import.
+            </p>
+          )}
+
+          {importError && <div className="text-sm text-red-600 dark:text-red-400">{importError}</div>}
+
+          {importProgress && (importProgress.running || importProgress.stats || importProgress.error) && (
+            <div className="rounded border border-slate-200 dark:border-zinc-800 bg-slate-50 dark:bg-zinc-950 px-3 py-2 space-y-2">
+              {importProgress.running && (
+                <div className="flex justify-between text-xs text-slate-600 dark:text-zinc-400 gap-3">
+                  <span>{importProgress.message || 'Working…'}</span>
+                  <span>{importProgress.processed} processed</span>
+                </div>
+              )}
+              {importProgress.running && importProgress.resumedFromCheckpoint && importProgress.checkpoint && (
+                <p className="text-[11px] text-amber-700 dark:text-amber-300">
+                  Resumed from page {importProgress.checkpoint.page}{importProgress.checkpoint.lastItemId ? ` after ${importProgress.checkpoint.lastItemId}` : ''}.
+                </p>
+              )}
+              {!importProgress.running && importProgress.error && (
+                <p className="text-xs text-red-600 dark:text-red-400">{importProgress.dryRun ? 'Dry-run failed' : 'Import failed'}: {importProgress.error}</p>
+              )}
+              {!importProgress.running && importProgress.stats && (
+                <p className="text-xs text-slate-700 dark:text-zinc-300">
+                  {importProgress.dryRun ? 'Dry-run complete' : 'Import complete'} —{' '}
+                  <span className="font-medium">{importProgress.stats.librariesScanned}</span> libraries scanned,{' '}
+                  <span className="font-medium">{importProgress.stats.booksCreated}</span> books created,{' '}
+                  <span className="font-medium">{importProgress.stats.booksLinked}</span> linked to existing rows,{' '}
+                  <span className="font-medium">{importProgress.stats.booksUpdated}</span> updated,{' '}
+                  <span className="font-medium">{importProgress.stats.authorsCreated}</span> authors created,{' '}
+                  <span className="font-medium">{importProgress.stats.seriesCreated}</span> series created,{' '}
+                  <span className="font-medium">{importProgress.stats.editionsAdded}</span> editions added,{' '}
+                  <span className="font-medium">{importProgress.stats.ownedMarked}</span> formats marked owned,{' '}
+                  <span className="font-medium">{importProgress.stats.reviewQueued}</span> queued for review,{' '}
+                  <span className="font-medium">{importProgress.stats.pendingManual}</span> pending manual follow-up,{' '}
+                  <span className="font-medium">{importProgress.stats.metadataRelinked}</span> metadata relinked,{' '}
+                  <span className="font-medium">{importProgress.stats.metadataConflicts}</span> conflicts queued for review.
+                </p>
+              )}
+              {importProgress.results && importProgress.results.length > 0 && (
+                <div className="max-h-64 space-y-3 overflow-y-auto pr-1">
+                  <div>
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-700 dark:text-zinc-300">
+                      Books
+                    </p>
+                    <div className="mt-1 space-y-1">
+                      {[...importProgress.results].reverse().map(result => (
+                        <div key={`${result.itemId}-${result.bookId ?? 0}`} className="flex justify-between gap-3 text-[11px] text-slate-600 dark:text-zinc-400">
+                          <span className="min-w-0 flex-1 overflow-hidden">
+                            <span className="block truncate">{result.title || result.itemId}</span>
+                            {result.message && (
+                              <span className="block truncate text-[10px] text-slate-500 dark:text-zinc-500">{result.message}</span>
+                            )}
+                          </span>
+                          <span className="flex-shrink-0 uppercase tracking-wide">{result.outcome}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {importProgress.stats && (
+                    <>
+                      <div>
+                        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-700 dark:text-zinc-300">
+                          Authors
+                        </p>
+                        <p className="mt-1 text-[11px] text-slate-600 dark:text-zinc-400">
+                          {importProgress.stats.authorsCreated} created, {importProgress.stats.authorsLinked} linked.
+                        </p>
+                      </div>
+
+                      <div>
+                        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-700 dark:text-zinc-300">
+                          Series
+                        </p>
+                        <p className="mt-1 text-[11px] text-slate-600 dark:text-zinc-400">
+                          {importProgress.stats.seriesCreated} created, {importProgress.stats.seriesLinked} linked.
+                        </p>
+                      </div>
+
+                      <div>
+                        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-700 dark:text-zinc-300">
+                          Editions
+                        </p>
+                        <p className="mt-1 text-[11px] text-slate-600 dark:text-zinc-400">
+                          {importProgress.stats.editionsAdded} added, {importProgress.stats.ownedMarked} formats marked owned.
+                        </p>
+                      </div>
+
+                      <div>
+                        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-700 dark:text-zinc-300">
+                          Follow-up
+                        </p>
+                        <p className="mt-1 text-[11px] text-slate-600 dark:text-zinc-400">
+                          {importProgress.stats.reviewQueued} queued for review, {importProgress.stats.pendingManual} pending manual, {importProgress.stats.metadataConflicts} conflicts queued.
+                        </p>
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          <div className="rounded border border-slate-200 dark:border-zinc-800 bg-slate-50 dark:bg-zinc-950 px-3 py-3 space-y-3">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-medium text-slate-800 dark:text-zinc-200">Recent runs</p>
+                <p className="text-xs text-slate-600 dark:text-zinc-500">Use a dry-run before a live import, then preview rollback against the exact batch if you need to unwind it safely.</p>
+              </div>
+              <button
+                onClick={() => refreshRuns().catch(() => {})}
+                className="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm font-medium"
+              >
+                Refresh runs
+              </button>
+            </div>
+
+            {runs.length === 0 && (
+              <p className="text-sm text-slate-500 dark:text-zinc-500">No ABS import runs recorded yet.</p>
+            )}
+
+            {runs.slice(0, 5).map(run => {
+              const rolledBack = run.status === 'rolled_back'
+              return (
+              <div key={run.id} className={`rounded border px-3 py-3 space-y-2 ${rolledBack ? 'border-slate-200 dark:border-zinc-800 bg-slate-100/70 dark:bg-zinc-900/50 opacity-75' : 'border-slate-200 dark:border-zinc-800 bg-white/70 dark:bg-zinc-950/40'}`}>
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-slate-800 dark:text-zinc-200 truncate">
+                      Run #{run.id} · {run.dryRun ? 'Dry-run' : 'Live import'} · {absRunStatusLabel(run.status)}
+                    </p>
+                    <p className="text-[11px] text-slate-500 dark:text-zinc-500">
+                      {new Date(run.startedAt).toLocaleString()} · {run.source.label || run.sourceLabel}
+                    </p>
+                  </div>
+                  {!run.dryRun && (
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => previewRollback(run.id)}
+                        disabled={rolledBack || rollbackPreviewingRunId === run.id || rollbackApplyingRunId === run.id}
+                        className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs font-medium disabled:opacity-50"
+                      >
+                        {rollbackPreviewingRunId === run.id ? 'Previewing…' : 'Preview rollback'}
+                      </button>
+                      <button
+                        onClick={() => applyRollback(run.id)}
+                        disabled={rolledBack || rollbackApplyingRunId === run.id || rollbackPreviewingRunId === run.id}
+                        className={`px-3 py-1.5 rounded text-xs font-medium disabled:opacity-50 ${rolledBack ? 'bg-slate-500 cursor-not-allowed' : 'bg-amber-600 hover:bg-amber-500'}`}
+                      >
+                        {rolledBack ? 'Rolled back' : rollbackApplyingRunId === run.id ? 'Rolling back…' : 'Apply rollback'}
+                      </button>
+                    </div>
+                  )}
+                </div>
+                <p className="text-xs text-slate-700 dark:text-zinc-300">
+                  {run.summary.error ? run.summary.error : (
+                    <>
+                      {run.summary.stats.itemsSeen} items seen, {run.summary.stats.itemsDetailFetched} detail fetches, {run.summary.stats.booksCreated} books created, {run.summary.stats.booksLinked} linked, {run.summary.stats.booksUpdated} updated, {run.summary.stats.ownedMarked} formats marked owned, {run.summary.stats.reviewQueued} queued for review, {run.summary.stats.pendingManual} pending manual.
+                    </>
+                  )}
+                </p>
+                {run.checkpoint && (
+                  <p className="text-[11px] text-amber-700 dark:text-amber-300">
+                    Last checkpoint: page {run.checkpoint.page}{run.checkpoint.lastItemId ? ` after ${run.checkpoint.lastItemId}` : ''}.
+                  </p>
+                )}
+                {rollbackResult?.runId === run.id && (
+                  <div className="rounded border border-amber-300 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/20 px-3 py-3 space-y-3">
+                    <div>
+                      <p className="text-sm font-medium text-slate-800 dark:text-zinc-200">
+                        {rollbackResult.preview ? 'Rollback preview' : 'Rollback result'}
+                      </p>
+                      <p className="text-xs text-slate-700 dark:text-zinc-300">
+                        {rollbackResult.stats.actionsPlanned} actions planned, {rollbackResult.stats.entitiesDeleted} entities deleted, {rollbackResult.stats.provenanceUnlinked} ABS links removed, {rollbackResult.stats.skipped} retained, {rollbackResult.stats.failed} failures.
+                      </p>
+                    </div>
+
+                    <div className="grid gap-3 md:grid-cols-2">
+                      <div>
+                        <p className="text-[11px] font-semibold uppercase tracking-wide text-amber-800 dark:text-amber-300">
+                          {rollbackResult.preview ? 'Would delete or change' : 'Deleted or changed'}
+                        </p>
+                        {rollbackPreviewChanges.length === 0 ? (
+                          <p className="text-[11px] text-slate-600 dark:text-zinc-400 mt-1">No entities would be deleted or changed.</p>
+                        ) : (
+                          <div className="mt-1 max-h-64 space-y-1 overflow-y-auto pr-1">
+                            {rollbackPreviewChanges.map(action => (
+                              <div key={`change-${action.entityType}-${action.externalId}-${action.localId}-${action.action}`} className="text-[11px] text-slate-700 dark:text-zinc-300">
+                                <span className="font-medium">{rollbackActionLabel(action)}</span>
+                                <span className="block text-slate-500 dark:text-zinc-500 truncate">{rollbackActionDetail(action)}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+
+                      <div>
+                        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-700 dark:text-zinc-300">
+                          {rollbackResult.preview ? 'Would be retained' : 'Retained'}
+                        </p>
+                        {rollbackPreviewRetained.length === 0 ? (
+                          <p className="text-[11px] text-slate-600 dark:text-zinc-400 mt-1">No retained entities reported.</p>
+                        ) : (
+                          <div className="mt-1 max-h-64 space-y-1 overflow-y-auto pr-1">
+                            {rollbackPreviewRetained.map(action => (
+                              <div key={`retain-${action.entityType}-${action.externalId}-${action.localId}-${action.action}`} className="text-[11px] text-slate-700 dark:text-zinc-300">
+                                <span className="font-medium">{rollbackActionLabel(action)}</span>
+                                <span className="block text-slate-500 dark:text-zinc-500 truncate">{rollbackActionDetail(action)}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+              )
+            })}
+
+            {rollbackError && <div className="text-sm text-red-600 dark:text-red-400">{rollbackError}</div>}
+          </div>
+        </div>
+
+        <ABSConflictPanel
+          title="Author conflicts"
+          description="Review placeholder ABS authors here first. If Bindery can confidently relink one to upstream metadata, you can trigger that before working through book review items."
+          entityType="author"
+          conflicts={conflicts}
+          show={showAuthorConflicts}
+          emptyMessage="No author conflicts recorded yet."
+          resolvedHeading="Resolved author choices"
+          conflictError={conflictError}
+          resolvingConflictId={resolvingConflictId}
+          onToggle={() => setShowAuthorConflicts(prev => !prev)}
+          onRefresh={refreshConflictsQuietly}
+          onResolveConflict={resolveConflict}
+          relinkAction={{
+            loadingId: relinkingAuthorId,
+            onRelink: relinkConflictAuthor,
+          }}
+        />
+
+        <div className="pt-3 border-t border-slate-200 dark:border-zinc-800 space-y-3">
+          <div className="flex items-center justify-between gap-4">
+            <button
+              type="button"
+              onClick={() => setShowReviewItems(prev => !prev)}
+              aria-expanded={showReviewItems}
+              className="min-w-0 flex-1 text-left"
+            >
+              <div className="flex items-start gap-2">
+                <span className="text-sm text-slate-500 dark:text-zinc-500 mt-0.5" aria-hidden="true">
+                  {showReviewItems ? '▾' : '▸'}
+                </span>
+                <div>
+                  <label className="block text-sm font-medium text-slate-800 dark:text-zinc-200 cursor-pointer">No-match books</label>
+                  <p className="text-xs text-slate-600 dark:text-zinc-500 mt-0.5">
+                    Low-confidence ABS items stay here until you explicitly import or dismiss them, which keeps bad metadata out of the main catalog.
+                  </p>
+                </div>
+              </div>
+            </button>
+            <button
+              onClick={() => refreshReviewItems().catch(() => {})}
+              className="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm font-medium flex-shrink-0"
+            >
+              Refresh
+            </button>
+          </div>
+
+          {showReviewItems && (
+            <>
+              {reviewItems.length === 0 && (
+                <p className="text-sm text-slate-500 dark:text-zinc-500">No queued ABS review items.</p>
+              )}
+
+              {reviewItems.map(item => (
+                <div key={item.id} className="rounded border border-slate-200 dark:border-zinc-800 bg-slate-50 dark:bg-zinc-950 px-3 py-3 space-y-2">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-slate-800 dark:text-zinc-200 truncate">{item.title || item.itemId}</p>
+                      <p className="text-xs text-slate-600 dark:text-zinc-400 truncate">{item.primaryAuthor || 'Unknown author'}</p>
+                      {item.resolvedAuthorName && (
+                        <p className="text-[11px] text-emerald-700 dark:text-emerald-300 truncate">Author: {item.resolvedAuthorName}</p>
+                      )}
+                      {item.resolvedBookTitle && (
+                        <p className="text-[11px] text-emerald-700 dark:text-emerald-300 truncate">Book: {item.resolvedBookTitle}</p>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap items-center justify-end gap-2 flex-shrink-0">
+                      {item.asin && (
+                        <span className="text-[11px] px-2 py-1 rounded bg-sky-100 dark:bg-sky-950/40 text-sky-700 dark:text-sky-300">
+                          ASIN {item.asin}
+                        </span>
+                      )}
+                      {item.fileMappingFound && (
+                        <span title={item.fileMappingMessage || undefined} className="text-[11px] px-2 py-1 rounded bg-emerald-100 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300">
+                          File Mapping Found
+                        </span>
+                      )}
+                      <span className="text-[11px] px-2 py-1 rounded bg-amber-100 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300">
+                        {reviewReasonLabel(item.reviewReason)}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="grid gap-2 md:grid-cols-2">
+                    <div className="space-y-2">
+                      <div className="flex gap-2">
+                        <input
+                          value={authorQueries[item.id] ?? item.primaryAuthor}
+                          onChange={e => setAuthorQueries(prev => ({ ...prev, [item.id]: e.target.value }))}
+                          onKeyDown={e => e.key === 'Enter' && searchReviewAuthors(item)}
+                          className={inputCls}
+                        />
+                        <button
+                          onClick={() => searchReviewAuthors(item)}
+                          disabled={authorSearchId === item.id}
+                          className="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-xs font-medium disabled:opacity-50"
+                        >
+                          {authorSearchId === item.id ? 'Searching...' : 'Author'}
+                        </button>
+                      </div>
+                      {(authorResults[item.id] ?? []).length > 0 && (
+                        <div className="max-h-48 space-y-2 overflow-y-auto pr-1">
+                          {(authorResults[item.id] ?? []).slice(0, absReviewResultLimit).map(author => (
+                            <button
+                              key={author.foreignAuthorId}
+                              type="button"
+                              onClick={() => resolveReviewAuthor(item, author)}
+                              disabled={reviewActionId === item.id}
+                              className="w-full text-left rounded border border-slate-200 dark:border-zinc-800 bg-white/70 dark:bg-zinc-950/40 px-2 py-1.5 text-xs hover:border-emerald-400 disabled:opacity-50"
+                            >
+                              <span className="block font-medium text-slate-800 dark:text-zinc-200 truncate">{author.authorName}</span>
+                              {author.disambiguation && <span className="block text-[11px] text-slate-500 dark:text-zinc-500 truncate">{author.disambiguation}</span>}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    <div className="space-y-2">
+                      <div className="flex gap-2">
+                        <input
+                          value={bookQueries[item.id] ?? item.editedTitle ?? item.title}
+                          onChange={e => setBookQueries(prev => ({ ...prev, [item.id]: e.target.value }))}
+                          onKeyDown={e => e.key === 'Enter' && searchReviewBooks(item)}
+                          className={inputCls}
+                        />
+                        <button
+                          onClick={() => searchReviewBooks(item)}
+                          disabled={bookSearchId === item.id}
+                          className="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-xs font-medium disabled:opacity-50"
+                        >
+                          {bookSearchId === item.id ? 'Searching...' : 'Book'}
+                        </button>
+                      </div>
+                      {(bookResults[item.id] ?? []).length > 0 && (
+                        <div className="max-h-48 space-y-2 overflow-y-auto pr-1">
+                          {(bookResults[item.id] ?? []).slice(0, absReviewResultLimit).map(book => (
+                            <button
+                              key={book.foreignBookId}
+                              type="button"
+                              onClick={() => resolveReviewBook(item, book)}
+                              disabled={reviewActionId === item.id}
+                              className="w-full text-left rounded border border-slate-200 dark:border-zinc-800 bg-white/70 dark:bg-zinc-950/40 px-2 py-1.5 text-xs hover:border-emerald-400 disabled:opacity-50"
+                            >
+                              <span className="block font-medium text-slate-800 dark:text-zinc-200 truncate">{book.title}</span>
+                              {book.author?.authorName && <span className="block text-[11px] text-slate-500 dark:text-zinc-500 truncate">{book.author.authorName}</span>}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      onClick={() => approveReviewItem(item.id)}
+                      disabled={reviewActionId === item.id}
+                      className="px-3 py-1.5 bg-sky-600 hover:bg-sky-500 rounded text-xs font-medium disabled:opacity-50"
+                    >
+                      {reviewActionId === item.id ? 'Importing…' : 'Import'}
+                    </button>
+                    <button
+                      onClick={() => dismissReviewItem(item.id)}
+                      disabled={reviewActionId === item.id}
+                      className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs font-medium disabled:opacity-50"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </>
+          )}
+
+          {reviewError && <div className="text-sm text-red-600 dark:text-red-400">{reviewError}</div>}
+        </div>
+
+        <ABSConflictPanel
+          title="Book conflicts"
+          description="When ABS and upstream book metadata disagree, Bindery keeps the upstream value temporarily and lets you confirm the winning source here."
+          entityType="book"
+          conflicts={conflicts}
+          show={showBookConflicts}
+          emptyMessage="No book conflicts recorded yet."
+          resolvedHeading="Resolved book choices"
+          resolvingConflictId={resolvingConflictId}
+          onToggle={() => setShowBookConflicts(prev => !prev)}
+          onRefresh={refreshConflictsQuietly}
+          onResolveConflict={resolveConflict}
+        />
+      </div>
+    </section>
+  )
+}
+
 function HardcoverListsSection() {
   const { t } = useTranslation()
   const [lists, setLists] = useState<ImportList[]>([])
   const [showAdd, setShowAdd] = useState(false)
+  const [syncingId, setSyncingId] = useState<number | null>(null)
+  const [syncError, setSyncError] = useState<{ id: number; message: string } | null>(null)
 
   useEffect(() => {
     api.listImportLists().then(all => setLists(all.filter(l => l.type === 'hardcover'))).catch(console.error)
@@ -1020,6 +2303,20 @@ function HardcoverListsSection() {
   const handleToggle = async (il: ImportList) => {
     const updated = await api.updateImportList(il.id, { ...il, enabled: !il.enabled })
     setLists(prev => prev.map(l => l.id === il.id ? updated : l))
+  }
+
+  const handleSync = async (id: number) => {
+    setSyncingId(id)
+    setSyncError(null)
+    try {
+      await api.syncImportList(id)
+      const all = await api.listImportLists()
+      setLists(all.filter(l => l.type === 'hardcover'))
+    } catch (e: unknown) {
+      setSyncError({ id, message: e instanceof Error ? e.message : 'Sync failed' })
+    } finally {
+      setSyncingId(null)
+    }
   }
 
   return (
@@ -1050,8 +2347,18 @@ function HardcoverListsSection() {
                 ? t('settings.import.hardcoverLastSync', { date: new Date(il.lastSyncAt).toLocaleString() })
                 : t('settings.import.hardcoverNeverSynced')}
             </div>
+            {syncError?.id === il.id && (
+              <div className="text-xs text-red-600 dark:text-red-400 mt-1 break-words">{syncError.message}</div>
+            )}
           </div>
           <div className="flex items-center gap-2 ml-3">
+            <button
+              onClick={() => handleSync(il.id)}
+              disabled={syncingId === il.id}
+              className="text-xs px-2 py-1 rounded bg-slate-200 dark:bg-zinc-800 text-slate-700 dark:text-zinc-300 hover:bg-slate-300 dark:hover:bg-zinc-700 disabled:opacity-50"
+            >
+              {syncingId === il.id ? 'Syncing…' : 'Sync now'}
+            </button>
             <button
               onClick={() => handleToggle(il)}
               className={`text-xs px-2 py-1 rounded ${il.enabled ? 'bg-emerald-100 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-400' : 'bg-slate-200 dark:bg-zinc-800 text-slate-500 dark:text-zinc-500'}`}
@@ -1176,11 +2483,28 @@ function GeneralTab() {
   const [settings, setSettings] = useState<Record<string, string>>({})
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState<string | null>(null)
-  const [backups, setBackups] = useState<string[]>([])
+  const [backups, setBackups] = useState<Array<{ name: string; size: number; modTime: string }>>([])
   const [creatingBackup, setCreatingBackup] = useState(false)
+  const [deletingBackup, setDeletingBackup] = useState<string | null>(null)
   const [scanningLibrary, setScanningLibrary] = useState(false)
   const [scanMessage, setScanMessage] = useState<string | null>(null)
-  const [lastScan, setLastScan] = useState<{ ran_at: string; files_found: number; reconciled: number; unmatched: number } | null>(null)
+  const scanStartedAt = useRef<number>(0)
+  const [lastScan, setLastScan] = useState<{
+    ran_at: string
+    files_found: number
+    reconciled: number
+    unmatched: number
+    tag_read_failed?: number
+    unmatched_files?: Array<{ path: string; parsed_title: string; parsed_author: string }>
+  } | null>(null)
+  const [storage, setStorage] = useState<{ downloadDir: string; audiobookDownloadDir: string; libraryDir: string; audiobookDir: string } | null>(null)
+  const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null)
+  const [hardcoverToken, setHardcoverToken] = useState('')
+  const [hardcoverTestResult, setHardcoverTestResult] = useState<(HardcoverTestResult & { testing?: boolean }) | null>(null)
+  const [rootFolders, setRootFolders] = useState<RootFolder[]>([])
+  const [newDefaultFolderPath, setNewDefaultFolderPath] = useState('')
+  const [newDefaultFolderError, setNewDefaultFolderError] = useState('')
+  const [addingDefaultFolder, setAddingDefaultFolder] = useState(false)
 
   useEffect(() => {
     api.listSettings()
@@ -1193,7 +2517,18 @@ function GeneralTab() {
       .finally(() => setLoading(false))
     api.listBackups().then(setBackups).catch(console.error)
     api.libraryScanStatus().then(setLastScan).catch(() => {/* no prior scan — ignore 404 */})
+    api.getStorage().then(setStorage).catch(console.error)
+    api.status().then(setSystemStatus).catch(console.error)
+    api.listRootFolders().then(setRootFolders).catch(console.error)
   }, [])
+
+  const refreshSystemStatus = async () => {
+    try {
+      setSystemStatus(await api.status())
+    } catch (err) {
+      console.error(err)
+    }
+  }
 
   const saveSetting = async (key: string) => {
     setSaving(key)
@@ -1206,12 +2541,77 @@ function GeneralTab() {
     }
   }
 
+  const saveHardcoverToken = async () => {
+    setSaving('hardcover.api_token')
+    setHardcoverTestResult(null)
+    try {
+      await api.setSetting('hardcover.api_token', hardcoverToken.trim())
+      setHardcoverToken('')
+      await refreshSystemStatus()
+    } catch (err) {
+      console.error(err)
+    } finally {
+      setSaving(null)
+    }
+  }
+
+  const clearHardcoverToken = async () => {
+    setSaving('hardcover.api_token')
+    setHardcoverTestResult(null)
+    try {
+      await api.setSetting('hardcover.api_token', '')
+      setHardcoverToken('')
+      await refreshSystemStatus()
+    } catch (err) {
+      console.error(err)
+    } finally {
+      setSaving(null)
+    }
+  }
+
+  const testHardcover = async () => {
+    setHardcoverTestResult({
+      ok: false,
+      tokenConfigured: hardcoverTokenConfigured,
+      searchResults: 0,
+      catalogOk: false,
+      testing: true,
+    })
+    try {
+      const result = await api.testHardcover()
+      setHardcoverTestResult(result)
+    } catch (err) {
+      setHardcoverTestResult({
+        ok: false,
+        tokenConfigured: hardcoverTokenConfigured,
+        searchResults: 0,
+        catalogOk: false,
+        error: err instanceof Error ? err.message : 'Hardcover API test failed',
+      })
+    }
+  }
+
+  const toggleEnhancedHardcover = async () => {
+    const current = (settings['hardcover.enhanced_series_enabled'] ?? 'false').toLowerCase()
+    const next = current === 'true' ? 'false' : 'true'
+    setSettings(s => ({ ...s, 'hardcover.enhanced_series_enabled': next }))
+    setSaving('hardcover.enhanced_series_enabled')
+    try {
+      await api.setSetting('hardcover.enhanced_series_enabled', next)
+      await refreshSystemStatus()
+    } catch (err) {
+      console.error(err)
+    } finally {
+      setSaving(null)
+    }
+  }
+
   const handleBackup = async () => {
     setCreatingBackup(true)
     try {
       const result = await api.createBackup()
-      setBackups(prev => [result.filename, ...prev])
-      alert(`Backup created: ${result.filename}`)
+      setBackups(prev => [result, ...prev])
+      alert(`Backup created: ${result.name}`)
     } catch (err) {
       alert('Backup failed: ' + (err instanceof Error ? err.message : 'Unknown error'))
     } finally {
@@ -1219,38 +2619,51 @@ function GeneralTab() {
     }
   }
 
+  const handleDeleteBackup = async (filename: string) => {
+    if (!confirm(`Delete backup ${filename}?`)) return
+    setDeletingBackup(filename)
+    try {
+      await api.deleteBackup(filename)
+      setBackups(prev => prev.filter(b => b.name !== filename))
+    } catch (err) {
+      alert('Delete failed: ' + (err instanceof Error ? err.message : 'Unknown error'))
+    } finally {
+      setDeletingBackup(null)
+    }
+  }
+
+  useEffect(() => {
+    if (!scanningLibrary) return
+    const id = setInterval(async () => {
+      try {
+        const status = await api.libraryScanStatus()
+        if (new Date(status.ran_at).getTime() >= scanStartedAt.current) {
+          setLastScan(status)
+          setScanMessage(null)
+          setScanningLibrary(false)
+        }
+      } catch {
+        // result not written yet — keep polling
+      }
+    }, 2000)
+    // Stop after 2 minutes regardless; the scan surely finished or something went wrong.
+    const ceiling = setTimeout(() => {
+      setScanMessage('Scan started — check back shortly for results.')
+      setScanningLibrary(false)
+    }, 120_000)
+    return () => {
+      clearInterval(id)
+      clearTimeout(ceiling)
+    }
+  }, [scanningLibrary])
+
   const handleScan = async () => {
+    scanStartedAt.current = Date.now()
     setScanningLibrary(true)
-    setScanMessage('Scanning...')
+    setScanMessage('Scanning…')
     setLastScan(null)
     try {
       await api.triggerLibraryScan()
-      // Poll for the result — the scan is async, so wait up to ~8s in 1s intervals.
-      let attempts = 0
-      const poll = async () => {
-        attempts++
-        try {
-          const status = await api.libraryScanStatus()
-          // Only accept a result that was produced after we triggered the scan.
-          const ranAt = new Date(status.ran_at).getTime()
-          const triggerTime = Date.now() - (attempts * 1000)
-          if (ranAt >= triggerTime) {
-            setLastScan(status)
-            setScanMessage(null)
-            setScanningLibrary(false)
-            return
-          }
-        } catch {
-          // result not ready yet
-        }
-        if (attempts < 8) {
-          setTimeout(poll, 1000)
-        } else {
-          setScanMessage('Scan started — results will appear after it completes.')
-          setScanningLibrary(false)
-        }
-      }
-      setTimeout(poll, 1000)
     } catch (err) {
       setScanMessage('Scan failed: ' + (err instanceof Error ? err.message : 'Unknown error'))
       setScanningLibrary(false)
@@ -1258,6 +2671,18 @@ function GeneralTab() {
   }
 
   if (loading) return <div className="text-slate-600 dark:text-zinc-500">{t('common.loading')}</div>
+
+  const enhancedHardcoverAdminEnabled = (settings['hardcover.enhanced_series_enabled'] ?? 'false').toLowerCase() === 'true'
+  const hardcoverTokenConfigured = systemStatus?.hardcoverTokenConfigured ?? false
+  const enhancedHardcoverEnabled = systemStatus?.enhancedHardcoverApi ?? false
+  const enhancedHardcoverReason = systemStatus?.enhancedHardcoverDisabledReason
+  const enhancedHardcoverStatus = enhancedHardcoverEnabled
+    ? t('settings.general.enhancedHardcoverStatusEnabled', 'Enabled')
+    : enhancedHardcoverReason === 'env_disabled'
+      ? t('settings.general.enhancedHardcoverStatusEnvDisabled', 'Disabled by BINDERY_ENHANCED_HARDCOVER_API=false.')
+      : enhancedHardcoverReason === 'missing_token'
+        ? t('settings.general.enhancedHardcoverStatusMissingToken', 'Add a Hardcover API token to enable this feature.')
+        : t('settings.general.enhancedHardcoverStatusAdminDisabled', 'Turn this on to enable enhanced series features.')
 
   return (
     <div className="space-y-8">
@@ -1292,9 +2717,10 @@ function GeneralTab() {
               How Bindery places completed downloads into the library.
               Use <strong>Hardlink</strong> or <strong>Copy</strong> to keep the source file intact for torrent seeding.
               Hardlink requires the download folder and library to be on the same filesystem/volume.
+              Use <strong>External</strong> if another tool (Calibre, Grimmory, etc.) manages your library — Bindery grabs the download and stops; your tool processes it, then Bindery reconciles on the next library scan.
             </p>
-            <div className="flex gap-2">
-              {(['move', 'copy', 'hardlink'] as const).map(m => (
+            <div className="flex gap-2 flex-wrap">
+              {(['move', 'copy', 'hardlink', 'external'] as const).map(m => (
                 <button
                   key={m}
                   onClick={async () => {
@@ -1380,6 +2806,62 @@ function GeneralTab() {
         </div>
       </section>
 
+      {/* Storage */}
+      <section>
+        <h3 className="text-base font-semibold mb-3 text-slate-800 dark:text-zinc-200">{t('settings.general.storage')}</h3>
+        <div className="p-4 border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900 space-y-3">
+          <p className="text-xs text-slate-600 dark:text-zinc-500">{t('settings.general.storageHint')}</p>
+          <div>
+            <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">
+              {t('settings.general.downloadDir')} <code className="font-mono bg-slate-200 dark:bg-zinc-800 px-1 rounded">BINDERY_DOWNLOAD_DIR</code>
+            </label>
+            <input
+              readOnly
+              value={storage?.downloadDir ?? ''}
+              className={`${inputCls} font-mono opacity-80 cursor-default`}
+            />
+          </div>
+          <div>
+            <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">
+              {t('settings.general.audiobookDownloadDir')} <code className="font-mono bg-slate-200 dark:bg-zinc-800 px-1 rounded">BINDERY_AUDIOBOOK_DOWNLOAD_DIR</code>
+            </label>
+            <input
+              readOnly
+              value={storage?.audiobookDownloadDir || (storage?.downloadDir ?? '')}
+              placeholder={storage?.downloadDir ?? ''}
+              className={`${inputCls} font-mono opacity-80 cursor-default`}
+            />
+            {storage && !storage.audiobookDownloadDir && (
+              <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">{t('settings.general.audiobookDownloadDirFallback')}</p>
+            )}
+          </div>
+          <div>
+            <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">
+              {t('settings.general.libraryDir')} <code className="font-mono bg-slate-200 dark:bg-zinc-800 px-1 rounded">BINDERY_LIBRARY_DIR</code>
+            </label>
+            <input
+              readOnly
+              value={storage?.libraryDir ?? ''}
+              className={`${inputCls} font-mono opacity-80 cursor-default`}
+            />
+          </div>
+          <div>
+            <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">
+              {t('settings.general.audiobookDir')} <code className="font-mono bg-slate-200 dark:bg-zinc-800 px-1 rounded">BINDERY_AUDIOBOOK_DIR</code>
+            </label>
+            <input
+              readOnly
+              value={storage?.audiobookDir || (storage?.libraryDir ?? '')}
+              placeholder={storage?.libraryDir ?? ''}
+              className={`${inputCls} font-mono opacity-80 cursor-default`}
+            />
+            {storage && !storage.audiobookDir && (
+              <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">{t('settings.general.audiobookDirFallback')}</p>
+            )}
+          </div>
+        </div>
+      </section>
+
       {/* Library */}
       <section>
         <h3 className="text-base font-semibold mb-3 text-slate-800 dark:text-zinc-200">{t('settings.general.library')}</h3>
@@ -1411,8 +2893,159 @@ function GeneralTab() {
               <p className="mt-1 text-slate-500 dark:text-zinc-500">
                 {new Date(lastScan.ran_at).toLocaleString()}
               </p>
+              {lastScan.unmatched_files && lastScan.unmatched_files.length > 0 && (
+                <details className="mt-3">
+                  <summary className="cursor-pointer font-medium text-slate-700 dark:text-zinc-300 hover:text-slate-900 dark:hover:text-zinc-100">
+                    Unmatched files ({lastScan.unmatched_files.length}{lastScan.unmatched_files.length >= 1000 && lastScan.unmatched > 1000 ? ' of ' + lastScan.unmatched : ''})
+                  </summary>
+                  <div className="mt-2 max-h-80 overflow-y-auto border border-slate-200 dark:border-zinc-800 rounded bg-slate-50 dark:bg-zinc-950/50">
+                    <table className="w-full text-xs">
+                      <thead className="sticky top-0 bg-slate-100 dark:bg-zinc-900 border-b border-slate-200 dark:border-zinc-800">
+                        <tr>
+                          <th className="text-left p-2 font-medium">Path</th>
+                          <th className="text-left p-2 font-medium">Parsed Title</th>
+                          <th className="text-left p-2 font-medium">Parsed Author</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {lastScan.unmatched_files.map((file, idx) => (
+                          <tr key={idx} className="border-b border-slate-100 dark:border-zinc-900 hover:bg-slate-100 dark:hover:bg-zinc-900/50">
+                            <td className="p-2 font-mono text-xs break-all">{file.path}</td>
+                            <td className="p-2">{file.parsed_title || '—'}</td>
+                            <td className="p-2">{file.parsed_author || '—'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
+              )}
             </div>
           )}
+        </div>
+      </section>
+
+      {/* Default library location */}
+      <section>
+        <h3 className="text-base font-semibold mb-3 text-slate-800 dark:text-zinc-200">Default library location</h3>
+        <div className="p-4 border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900 space-y-3">
+          <div>
+            <label className="block text-sm font-medium text-slate-800 dark:text-zinc-200 mb-1">Default root folder</label>
+            <p className="text-xs text-slate-600 dark:text-zinc-500 mb-2">
+              When an author has no per-author root folder set, Bindery uses this location. Leave unset to fall back to <code className="font-mono bg-slate-200 dark:bg-zinc-800 px-1 rounded">BINDERY_LIBRARY_DIR</code>.
+            </p>
+            <select
+              value={settings['library.defaultRootFolderId'] ?? ''}
+              onChange={async e => {
+                const next = e.target.value
+                setSettings(s => ({ ...s, 'library.defaultRootFolderId': next }))
+                await api.setSetting('library.defaultRootFolderId', next).catch(console.error)
+              }}
+              className="w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-emerald-500"
+            >
+              <option value="">— Unset (use BINDERY_LIBRARY_DIR) —</option>
+              {rootFolders.map(rf => (
+                <option key={rf.id} value={String(rf.id)}>{rf.path}</option>
+              ))}
+            </select>
+          </div>
+          {!addingDefaultFolder ? (
+            <button
+              onClick={() => { setAddingDefaultFolder(true); setNewDefaultFolderError('') }}
+              className="text-xs text-emerald-600 dark:text-emerald-400 hover:underline"
+            >
+              + Add root folder
+            </button>
+          ) : (
+            <div className="space-y-2">
+              <label className="block text-xs text-slate-600 dark:text-zinc-400">New root folder path</label>
+              <div className="flex gap-2">
+                <input
+                  value={newDefaultFolderPath}
+                  onChange={e => setNewDefaultFolderPath(e.target.value)}
+                  placeholder="/mnt/books"
+                  className="flex-1 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500 font-mono"
+                />
+                <button
+                  onClick={async () => {
+                    if (!newDefaultFolderPath.trim()) return
+                    setNewDefaultFolderError('')
+                    try {
+                      const created = await api.addRootFolder(newDefaultFolderPath.trim())
+                      setRootFolders(prev => [...prev, created])
+                      setSettings(s => ({ ...s, 'library.defaultRootFolderId': String(created.id) }))
+                      await api.setSetting('library.defaultRootFolderId', String(created.id)).catch(console.error)
+                      setNewDefaultFolderPath('')
+                      setAddingDefaultFolder(false)
+                    } catch (err) {
+                      setNewDefaultFolderError(err instanceof Error ? err.message : 'Failed to add folder')
+                    }
+                  }}
+                  className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded text-xs font-medium"
+                >
+                  Add
+                </button>
+                <button
+                  onClick={() => { setAddingDefaultFolder(false); setNewDefaultFolderPath(''); setNewDefaultFolderError('') }}
+                  className="px-3 py-2 bg-slate-300 dark:bg-zinc-700 hover:bg-slate-400 dark:hover:bg-zinc-600 rounded text-xs font-medium"
+                >
+                  Cancel
+                </button>
+              </div>
+              {newDefaultFolderError && <p className="text-xs text-red-500">{newDefaultFolderError}</p>}
+            </div>
+          )}
+        </div>
+      </section>
+
+      {/* Metadata provider */}
+      <section>
+        <h3 className="text-base font-semibold mb-3 text-slate-800 dark:text-zinc-200">{t('settings.general.metadataProvider', 'Metadata Provider')}</h3>
+        <div className="p-4 border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900">
+          <label className="block text-sm font-medium text-slate-800 dark:text-zinc-200 mb-1">
+            {t('settings.general.metadataProviderLabel', 'Primary metadata provider')}
+          </label>
+          <p className="text-xs text-slate-600 dark:text-zinc-500 mb-2">
+            {t('settings.general.metadataProviderHint', 'Selects the source used for author and book search. DNB (Deutsche Nationalbibliothek) is recommended for German, Austrian, and Swiss catalogues — it covers German-language publications since 1913 where OpenLibrary coverage is thin. OpenLibrary remains the default for other regions. The non-primary provider is always used as an enricher.')}
+          </p>
+          <select
+            value={settings['metadata.primary_provider'] ?? 'openlibrary'}
+            onChange={async e => {
+              const next = e.target.value
+              setSettings(s => ({ ...s, 'metadata.primary_provider': next }))
+              await api.setSetting('metadata.primary_provider', next).catch(console.error)
+            }}
+            className="bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-emerald-500"
+          >
+            <option value="openlibrary">{t('settings.general.metadataProviderOpenlibrary', 'OpenLibrary (default)')}</option>
+            <option value="dnb">{t('settings.general.metadataProviderDnb', 'DNB — Deutsche Nationalbibliothek (German/DACH)')}</option>
+          </select>
+        </div>
+      </section>
+
+      {/* Author defaults */}
+      <section>
+        <h3 className="text-base font-semibold mb-3 text-slate-800 dark:text-zinc-200">{t('settings.general.authorDefaults', 'Author defaults')}</h3>
+        <div className="p-4 border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900">
+          <label className="block text-sm font-medium text-slate-800 dark:text-zinc-200 mb-1">
+            {t('settings.general.defaultMediaTypeLabel', 'Default media type')}
+          </label>
+          <p className="text-xs text-slate-600 dark:text-zinc-500 mb-2">
+            {t('settings.general.defaultMediaTypeHint', 'Applied to new authors when no explicit choice is made. Existing authors are unaffected — use the Authors page bulk action to migrate them.')}
+          </p>
+          <select
+            value={settings['default.media_type'] ?? 'ebook'}
+            onChange={async e => {
+              const next = e.target.value
+              setSettings(s => ({ ...s, 'default.media_type': next }))
+              await api.setSetting('default.media_type', next).catch(console.error)
+            }}
+            className="bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-emerald-500"
+          >
+            <option value="ebook">{t('mediaType.ebook', 'Ebook')}</option>
+            <option value="audiobook">{t('mediaType.audiobook', 'Audiobook')}</option>
+            <option value="both">{t('mediaType.both', 'Both')}</option>
+          </select>
         </div>
       </section>
 
@@ -1425,18 +3058,16 @@ function GeneralTab() {
               <label className="block text-sm font-medium text-slate-800 dark:text-zinc-200">{t('settings.general.autoGrabLabel')}</label>
               <p className="text-xs text-slate-600 dark:text-zinc-500 mt-0.5">{t('settings.general.autoGrabHint')}</p>
             </div>
-            <button
-              onClick={async () => {
+            <Toggle
+              checked={(settings['autoGrab.enabled'] ?? 'true') !== 'false'}
+              onChange={async () => {
                 const current = (settings['autoGrab.enabled'] ?? 'true').toLowerCase()
                 const next = current === 'false' ? 'true' : 'false'
                 setSettings(s => ({ ...s, 'autoGrab.enabled': next }))
                 await api.setSetting('autoGrab.enabled', next).catch(console.error)
               }}
-              className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0 ${(settings['autoGrab.enabled'] ?? 'true') !== 'false' ? 'bg-emerald-600' : 'bg-slate-300 dark:bg-zinc-700'}`}
               title={(settings['autoGrab.enabled'] ?? 'true') !== 'false' ? t('common.disable') : t('common.enable')}
-            >
-              <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform ${(settings['autoGrab.enabled'] ?? 'true') !== 'false' ? 'translate-x-4' : ''}`} />
-            </button>
+            />
           </div>
         </div>
       </section>
@@ -1450,24 +3081,25 @@ function GeneralTab() {
               <label className="block text-sm font-medium text-slate-800 dark:text-zinc-200">{t('settings.general.recommendationsLabel')}</label>
               <p className="text-xs text-slate-600 dark:text-zinc-500 mt-0.5">{t('settings.general.recommendationsHint')}</p>
             </div>
-            <button
-              onClick={async () => {
+            <Toggle
+              checked={(settings['recommendations.enabled'] ?? 'false') === 'true'}
+              onChange={async () => {
                 const current = (settings['recommendations.enabled'] ?? 'false').toLowerCase()
                 const next = current === 'true' ? 'false' : 'true'
                 setSettings(s => ({ ...s, 'recommendations.enabled': next }))
                 await api.setSetting('recommendations.enabled', next).catch(console.error)
               }}
-              className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0 ${(settings['recommendations.enabled'] ?? 'false') === 'true' ? 'bg-emerald-600' : 'bg-slate-300 dark:bg-zinc-700'}`}
               title={(settings['recommendations.enabled'] ?? 'false') === 'true' ? t('common.disable') : t('common.enable')}
-            >
-              <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform ${(settings['recommendations.enabled'] ?? 'false') === 'true' ? 'translate-x-4' : ''}`} />
-            </button>
+            />
           </div>
         </div>
       </section>
 
       {/* Security */}
       <SecuritySection />
+
+      {/* OIDC providers */}
+      <AuthSettings />
 
       {/* API Keys */}
       <section>
@@ -1490,6 +3122,93 @@ function GeneralTab() {
               >
                 {saving === 'googlebooks.apiKey' ? t('common.saving') : t('common.save')}
               </button>
+            </div>
+          </div>
+
+          <div className="border-t border-slate-200 dark:border-zinc-800 pt-4 space-y-3">
+            <div>
+              <div className="flex items-center justify-between gap-3 mb-1">
+                <label className="block text-xs text-slate-600 dark:text-zinc-400">
+                  {t('settings.general.hardcoverApiToken', 'Hardcover API Token')}
+                </label>
+                <span className={`text-[11px] font-medium ${hardcoverTokenConfigured ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-500 dark:text-zinc-500'}`}>
+                  {hardcoverTokenConfigured
+                    ? t('settings.general.hardcoverTokenConfigured', 'Token configured')
+                    : t('settings.general.hardcoverTokenNotConfigured', 'No token configured')}
+                </span>
+              </div>
+              <div className="flex gap-2">
+                <input
+                  value={hardcoverToken}
+                  onChange={e => setHardcoverToken(e.target.value)}
+                  placeholder={hardcoverTokenConfigured
+                    ? t('settings.general.hardcoverApiTokenConfiguredPlaceholder', 'Saved token is hidden. Enter a new token to rotate it.')
+                    : t('settings.general.hardcoverApiTokenPlaceholder', 'Paste a Hardcover API token')}
+                  type="password"
+                  className="flex-1 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600"
+                />
+                <button
+                  onClick={saveHardcoverToken}
+                  disabled={saving === 'hardcover.api_token' || !hardcoverToken.trim()}
+                  className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded text-xs font-medium disabled:opacity-50"
+                  aria-label={t('settings.general.hardcoverSaveToken', 'Save Hardcover API token')}
+                >
+                  {saving === 'hardcover.api_token' ? t('common.saving') : t('common.save')}
+                </button>
+                {hardcoverTokenConfigured && (
+                  <button
+                    onClick={clearHardcoverToken}
+                    disabled={saving === 'hardcover.api_token'}
+                    className="px-3 py-2 bg-slate-300 dark:bg-zinc-700 hover:bg-slate-400 dark:hover:bg-zinc-600 rounded text-xs font-medium disabled:opacity-50"
+                    aria-label={t('settings.general.hardcoverClearToken', 'Clear Hardcover API token')}
+                  >
+                    {t('settings.general.hardcoverClearToken', 'Clear')}
+                  </button>
+                )}
+                <button
+                  onClick={testHardcover}
+                  disabled={!hardcoverTokenConfigured || hardcoverTestResult?.testing || saving === 'hardcover.api_token'}
+                  className="px-3 py-2 bg-slate-300 dark:bg-zinc-700 hover:bg-slate-400 dark:hover:bg-zinc-600 rounded text-xs font-medium disabled:opacity-50"
+                  aria-label={t('settings.general.hardcoverTestApi', 'Test Hardcover API')}
+                >
+                  {hardcoverTestResult?.testing ? t('common.testing', 'Testing...') : t('common.test', 'Test')}
+                </button>
+              </div>
+              <a
+                href="https://hardcover.app/account/api"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-block mt-1 text-xs text-emerald-600 dark:text-emerald-400 hover:underline"
+              >
+                {t('settings.general.hardcoverApiTokenLink', 'Create or copy a Hardcover API token')}
+              </a>
+              {hardcoverTestResult && !hardcoverTestResult.testing && (
+                <p className={`mt-1 text-xs ${hardcoverTestResult.ok ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>
+                  {hardcoverTestResult.ok
+                    ? (hardcoverTestResult.message || t('settings.general.hardcoverTestOk', 'Hardcover API connected.'))
+                    : (hardcoverTestResult.error || t('settings.general.hardcoverTestFailed', 'Hardcover API test failed.'))}
+                </p>
+              )}
+            </div>
+
+            <div className="flex items-center justify-between gap-4">
+              <div className="min-w-0">
+                <label className="block text-sm font-medium text-slate-800 dark:text-zinc-200">
+                  {t('settings.general.enhancedHardcoverSeries', 'Enhanced Hardcover series')}
+                </label>
+                <p className="text-xs text-slate-600 dark:text-zinc-500 mt-0.5">
+                  {t('settings.general.enhancedHardcoverSeriesHint', 'Use Hardcover-backed series matching, catalog diffs, and missing-book fill.')}
+                </p>
+                <p className={`text-xs mt-1 ${enhancedHardcoverEnabled ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-600 dark:text-zinc-500'}`}>
+                  {enhancedHardcoverStatus}
+                </p>
+              </div>
+              <Toggle
+                checked={enhancedHardcoverAdminEnabled}
+                onChange={toggleEnhancedHardcover}
+                disabled={saving === 'hardcover.enhanced_series_enabled'}
+                title={enhancedHardcoverAdminEnabled ? t('common.disable') : t('common.enable')}
+              />
             </div>
           </div>
         </div>
@@ -1517,6 +3236,37 @@ function GeneralTab() {
         </div>
       </section>
 
+      {/* Log retention */}
+      <section>
+        <h3 className="text-base font-semibold mb-3 text-slate-800 dark:text-zinc-200">{t('settings.general.logRetention')}</h3>
+        <div className="p-4 border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <label className="block text-sm font-medium text-slate-800 dark:text-zinc-200">{t('settings.general.logRetentionLabel')}</label>
+              <p className="text-xs text-slate-600 dark:text-zinc-500 mt-0.5">{t('settings.general.logRetentionHint')}</p>
+            </div>
+            <div className="flex items-center gap-2 flex-shrink-0">
+              <input
+                type="number"
+                min={1}
+                max={365}
+                value={settings['log.retention_days'] ?? '14'}
+                onChange={e => setSettings(s => ({ ...s, 'log.retention_days': e.target.value }))}
+                className="w-20 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-2 py-1 text-sm text-right"
+              />
+              <span className="text-sm text-slate-600 dark:text-zinc-400">{t('settings.general.days')}</span>
+              <button
+                onClick={() => saveSetting('log.retention_days')}
+                disabled={saving === 'log.retention_days'}
+                className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium disabled:opacity-50"
+              >
+                {saving === 'log.retention_days' ? t('common.saving') : t('common.save')}
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
       {/* Backup */}
       <section>
         <h3 className="text-base font-semibold mb-3 text-slate-800 dark:text-zinc-200">{t('settings.general.backup')}</h3>
@@ -1539,11 +3289,48 @@ function GeneralTab() {
               <p className="text-xs text-slate-600 dark:text-zinc-500 mb-2">{t('settings.general.existingBackups')}</p>
               <ul className="space-y-1">
                 {backups.map(b => (
-                  <li key={b} className="text-xs text-slate-600 dark:text-zinc-400 font-mono">{b}</li>
+                  <li key={b.name} className="flex items-center justify-between text-xs text-slate-600 dark:text-zinc-400">
+                    <span>
+                      <span className="font-mono">{b.name}</span>
+                      <span className="ml-2 text-slate-500 dark:text-zinc-500">{formatBackupSize(b.size)} · {formatRelativeTime(b.modTime)}</span>
+                    </span>
+                    <button
+                      onClick={() => handleDeleteBackup(b.name)}
+                      disabled={deletingBackup === b.name}
+                      className="ml-4 text-red-600 dark:text-red-400 hover:underline disabled:opacity-50"
+                    >
+                      {deletingBackup === b.name ? '…' : t('common.delete')}
+                    </button>
+                  </li>
                 ))}
               </ul>
             </div>
           )}
+        </div>
+      </section>
+
+      <section>
+        <h3 className="text-base font-semibold mb-3 text-slate-800 dark:text-zinc-200">{t('settings.general.telemetry')}</h3>
+        <div className="p-4 border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900 space-y-3">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <label className="block text-sm font-medium text-slate-800 dark:text-zinc-200">{t('settings.general.telemetryLabel')}</label>
+              <p className="text-xs text-slate-600 dark:text-zinc-500 mt-0.5">{t('settings.general.telemetryHint')}</p>
+            </div>
+            <Toggle
+              checked={(settings['telemetry.enabled'] ?? 'true') !== 'false'}
+              onChange={async () => {
+                const current = (settings['telemetry.enabled'] ?? 'true').toLowerCase()
+                const next = current !== 'false' ? 'false' : 'true'
+                setSettings(s => ({ ...s, 'telemetry.enabled': next }))
+                await api.setSetting('telemetry.enabled', next).catch(console.error)
+              }}
+              title={(settings['telemetry.enabled'] ?? 'true') !== 'false' ? t('common.disable') : t('common.enable')}
+            />
+          </div>
+          <p className="text-xs text-slate-500 dark:text-zinc-600">
+            {t('settings.general.telemetryDetail')}
+          </p>
         </div>
       </section>
     </div>
@@ -1552,6 +3339,160 @@ function GeneralTab() {
 
 function parseCats(s: string): number[] {
   return s.split(',').map(t => parseInt(t.trim(), 10)).filter(n => !isNaN(n))
+}
+
+function formatBackupSize(bytes: number): string {
+  if (!bytes || bytes <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)))
+  return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`
+}
+
+function formatRelativeTime(iso: string): string {
+  const t = Date.parse(iso)
+  if (isNaN(t)) return ''
+  const diffSec = Math.round((Date.now() - t) / 1000)
+  const abs = Math.abs(diffSec)
+  if (abs < 60) return diffSec >= 0 ? 'just now' : 'in a moment'
+  const mins = Math.round(diffSec / 60)
+  if (Math.abs(mins) < 60) return mins >= 0 ? `${mins}m ago` : `in ${-mins}m`
+  const hrs = Math.round(diffSec / 3600)
+  if (Math.abs(hrs) < 24) return hrs >= 0 ? `${hrs}h ago` : `in ${-hrs}h`
+  const days = Math.round(diffSec / 86400)
+  return days >= 0 ? `${days}d ago` : `in ${-days}d`
+}
+
+function GrimmoryTab() {
+  const [config, setConfig] = useState<GrimmoryConfig | null>(null)
+  const [draft, setDraft] = useState({ baseUrl: '', apiKey: '', enabled: false })
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const [testing, setTesting] = useState(false)
+  const [testResult, setTestResult] = useState<GrimmoryTestResult | null>(null)
+  const [testError, setTestError] = useState<string | null>(null)
+
+  useEffect(() => {
+    api.grimmoryConfig()
+      .then(cfg => {
+        setConfig(cfg)
+        setDraft({ baseUrl: cfg.baseUrl ?? '', apiKey: '', enabled: cfg.enabled })
+      })
+      .catch(console.error)
+      .finally(() => setLoading(false))
+  }, [])
+
+  const save = async () => {
+    setSaving(true)
+    setSaveError(null)
+    setTestResult(null)
+    try {
+      const payload: { enabled: boolean; baseUrl: string; apiKey?: string } = {
+        enabled: draft.enabled,
+        baseUrl: draft.baseUrl,
+      }
+      if (draft.apiKey) payload.apiKey = draft.apiKey
+      const next = await api.grimmorySetConfig(payload)
+      setConfig(next)
+      setDraft(prev => ({ ...prev, apiKey: '' }))
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Save failed')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const test = async () => {
+    setTesting(true)
+    setTestResult(null)
+    setTestError(null)
+    try {
+      const payload: { baseUrl?: string; apiKey?: string } = { baseUrl: draft.baseUrl }
+      if (draft.apiKey) payload.apiKey = draft.apiKey
+      const r = await api.grimmoryTest(payload)
+      setTestResult(r)
+    } catch (err) {
+      setTestError(err instanceof Error ? err.message : 'Test failed')
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  if (loading) return <div className="text-slate-600 dark:text-zinc-500">Loading…</div>
+
+  return (
+    <div className="space-y-6 max-w-lg">
+      <div>
+        <h3 className="text-lg font-semibold mb-1">Grimmory</h3>
+        <p className="text-xs text-slate-600 dark:text-zinc-500 mb-4">
+          Push newly imported books to a{' '}
+          <a href="https://grimmory.org" target="_blank" rel="noopener noreferrer" className="underline">Grimmory</a>{' '}
+          self-hosted library. Enable the Grimmory REST API (<code>API_DOCS_ENABLED=true</code>) and provide
+          your server URL and API token.
+        </p>
+      </div>
+
+      <label className="flex items-center gap-3 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={draft.enabled}
+          onChange={e => setDraft(prev => ({ ...prev, enabled: e.target.checked }))}
+          className="w-4 h-4 accent-emerald-500"
+        />
+        <span className="text-sm font-medium">Enable Grimmory integration</span>
+      </label>
+
+      <div className="space-y-3">
+        <div>
+          <label className="block text-xs font-medium mb-1">Server URL</label>
+          <input
+            type="text"
+            value={draft.baseUrl}
+            onChange={e => setDraft(prev => ({ ...prev, baseUrl: e.target.value }))}
+            placeholder="https://grimmory.example.com"
+            className={inputCls}
+          />
+        </div>
+        <div>
+          <label className="block text-xs font-medium mb-1">
+            API Key{config?.apiKeyConfigured && !draft.apiKey ? ' (configured — leave blank to keep)' : ''}
+          </label>
+          <input
+            type="password"
+            value={draft.apiKey}
+            onChange={e => setDraft(prev => ({ ...prev, apiKey: e.target.value }))}
+            placeholder={config?.apiKeyConfigured ? '••••••••' : 'Paste API token here'}
+            className={inputCls}
+          />
+        </div>
+      </div>
+
+      <div className="flex gap-2 flex-wrap">
+        <button
+          onClick={save}
+          disabled={saving}
+          className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded text-sm font-medium"
+        >
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+        <button
+          onClick={test}
+          disabled={testing || !draft.baseUrl}
+          className="px-4 py-2 bg-slate-200 dark:bg-zinc-700 hover:bg-slate-300 dark:hover:bg-zinc-600 disabled:opacity-50 rounded text-sm font-medium"
+        >
+          {testing ? 'Testing…' : 'Test Connection'}
+        </button>
+      </div>
+
+      {saveError && <p className="text-red-500 text-xs">{saveError}</p>}
+      {testError && <p className="text-red-500 text-xs">{testError}</p>}
+      {testResult && (
+        <p className={`text-xs ${testResult.ok ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-500'}`}>
+          {testResult.message}
+        </p>
+      )}
+    </div>
+  )
 }
 
 function CalibreTab() {
@@ -1609,10 +3550,14 @@ function CalibreSection({
   const [saveError, setSaveError] = useState<{ key: string; msg: string } | null>(null)
   const [importProgress, setImportProgress] = useState<CalibreImportProgress | null>(null)
   const [importError, setImportError] = useState<string | null>(null)
-  const [showPluginApiKey, setShowPluginApiKey] = useState(false)
+  const [syncProgress, setSyncProgress] = useState<CalibreSyncProgress | null>(null)
+  const [syncError, setSyncError] = useState<string | null>(null)
+  const [syncModalOpen, setSyncModalOpen] = useState(false)
+  const [bridgeReachable, setBridgeReachable] = useState<boolean | null>(null)
 
   const saveSettingWithError = async (key: string) => {
     setSaveError(null)
+    setTestResult(null)
     const err = await saveSetting(key)
     if (err) setSaveError({ key, msg: err })
   }
@@ -1636,7 +3581,31 @@ function CalibreSection({
   // the live bar instead of a dead "Import library" button.
   useEffect(() => {
     api.calibreImportStatus().then(setImportProgress).catch(() => {})
+    api.calibreSyncStatus().then(p => {
+      setSyncProgress(p)
+      // If a sync is already running when the tab mounts, surface the
+      // modal so the user can watch it finish instead of wondering what
+      // the disabled button is doing.
+      if (p.running) setSyncModalOpen(true)
+    }).catch(() => {})
   }, [])
+
+  // Silently probe plugin reachability so the "Push all to Calibre"
+  // button can enable/disable without the user having to click Test
+  // first. Re-probes whenever mode, url, or api key changes.
+  const pluginURL = settings['calibre.plugin_url'] ?? ''
+  const pluginKey = settings['calibre.plugin_api_key'] ?? ''
+  useEffect(() => {
+    if (mode !== 'plugin' || !pluginURL) {
+      setBridgeReachable(null)
+      return
+    }
+    let cancelled = false
+    api.testCalibre()
+      .then(() => { if (!cancelled) setBridgeReachable(true) })
+      .catch(() => { if (!cancelled) setBridgeReachable(false) })
+    return () => { cancelled = true }
+  }, [mode, pluginURL, pluginKey])
 
   // Poll while an import is running.
   useEffect(() => {
@@ -1646,6 +3615,15 @@ function CalibreSection({
     }, 1000)
     return () => clearInterval(id)
   }, [importProgress?.running])
+
+  // Poll while a bulk sync is running. 2s matches the task spec.
+  useEffect(() => {
+    if (!syncProgress?.running) return
+    const id = setInterval(() => {
+      api.calibreSyncStatus().then(setSyncProgress).catch(() => {})
+    }, 2000)
+    return () => clearInterval(id)
+  }, [syncProgress?.running])
 
   const startImport = async () => {
     setImportError(null)
@@ -1657,14 +3635,35 @@ function CalibreSection({
     }
   }
 
+  const startSync = async () => {
+    setSyncError(null)
+    setSyncModalOpen(true)
+    try {
+      const p = await api.calibreSyncStart()
+      setSyncProgress(p)
+    } catch (err) {
+      setSyncError(err instanceof Error ? err.message : 'Push failed to start')
+    }
+  }
+
   const runTest = async () => {
     setTesting(true)
     setTestResult(null)
+    const isPlugin = mode === 'plugin'
     try {
       const r = await api.testCalibre()
-      setTestResult({ ok: true, msg: `${r.message}${r.version ? ' — ' + r.version : ''}` })
+      const prefix = isPlugin ? '✓ Plugin reachable' : '✓ calibredb reachable'
+      const detail = r.version || r.message
+      setTestResult({ ok: true, msg: detail ? `${prefix} — ${detail}` : prefix })
+      // Mirror into bridgeReachable so the Push-all button flips to enabled
+      // on a successful manual test, without waiting for the silent probe
+      // to re-fire (which only triggers on mode/url/key *changes*).
+      if (isPlugin) setBridgeReachable(true)
     } catch (err) {
-      setTestResult({ ok: false, msg: err instanceof Error ? err.message : 'Test failed' })
+      const reason = err instanceof Error ? err.message : 'Test failed'
+      const prefix = isPlugin ? '✗ Could not reach plugin' : '✗ calibredb unreachable'
+      setTestResult({ ok: false, msg: `${prefix} — ${reason}` })
+      if (isPlugin) setBridgeReachable(false)
     } finally {
       setTesting(false)
     }
@@ -1679,14 +3678,36 @@ function CalibreSection({
     <section>
       <h3 className="text-base font-semibold mb-3 text-slate-800 dark:text-zinc-200">Calibre</h3>
       <div className="p-4 border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900 space-y-4">
-        <p className="text-xs text-slate-600 dark:text-zinc-500 -mt-1">
-          Mirror imported books into a Calibre library via{' '}
-          <code className="text-[11px] bg-slate-200 dark:bg-zinc-800 px-1 rounded">calibredb add</code>.
-          Requires Calibre and Bindery to share the library directory (e.g. via a volume mount).
-        </p>
 
+        {/* Shared library path — used by both write integration and library import */}
         <div>
-          <label className="block text-sm font-medium text-slate-800 dark:text-zinc-200 mb-2">Mode</label>
+          <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">Library path</label>
+          <p className="text-xs text-slate-600 dark:text-zinc-500 mb-2">
+            Directory containing <code className="text-[11px] bg-slate-200 dark:bg-zinc-800 px-1 rounded">metadata.db</code>.
+            Used by both the write integration and library import.
+          </p>
+          <div className="flex gap-2">
+            <input
+              value={settings['calibre.library_path'] ?? ''}
+              onChange={e => setSettings(s => ({ ...s, 'calibre.library_path': e.target.value }))}
+              placeholder="/data/calibre-library"
+              className="flex-1 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600"
+            />
+            <button
+              onClick={() => saveSettingWithError('calibre.library_path')}
+              disabled={saving === 'calibre.library_path'}
+              className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded text-xs font-medium disabled:opacity-50"
+            >
+              {saving === 'calibre.library_path' ? 'Saving...' : 'Save'}
+            </button>
+          </div>
+          {saveError?.key === 'calibre.library_path' && (
+            <p className="text-xs text-red-600 dark:text-red-400 mt-1">{saveError.msg}</p>
+          )}
+        </div>
+
+        <div className="pt-1 border-t border-slate-200 dark:border-zinc-800">
+          <label className="block text-sm font-medium text-slate-800 dark:text-zinc-200 mb-2 mt-3">Write integration</label>
           <div className="space-y-1.5">
             {([
               { v: 'off',       label: 'Off',           desc: 'No Calibre call on import.' },
@@ -1710,33 +3731,6 @@ function CalibreSection({
             ))}
           </div>
         </div>
-
-        {mode === 'calibredb' && (
-          <div>
-            <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">Library path</label>
-            <p className="text-xs text-slate-600 dark:text-zinc-500 mb-2">
-              Directory containing <code className="text-[11px] bg-slate-200 dark:bg-zinc-800 px-1 rounded">metadata.db</code>. Passed to <code className="text-[11px] bg-slate-200 dark:bg-zinc-800 px-1 rounded">calibredb add --with-library</code>.
-            </p>
-            <div className="flex gap-2">
-              <input
-                value={settings['calibre.library_path'] ?? ''}
-                onChange={e => setSettings(s => ({ ...s, 'calibre.library_path': e.target.value }))}
-                placeholder="/data/calibre-library"
-                className="flex-1 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600"
-              />
-              <button
-                onClick={() => saveSettingWithError('calibre.library_path')}
-                disabled={saving === 'calibre.library_path'}
-                className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded text-xs font-medium disabled:opacity-50"
-              >
-                {saving === 'calibre.library_path' ? 'Saving...' : 'Save'}
-              </button>
-            </div>
-            {saveError?.key === 'calibre.library_path' && (
-              <p className="text-xs text-red-600 dark:text-red-400 mt-1">{saveError.msg}</p>
-            )}
-          </div>
-        )}
 
         {mode === 'calibredb' && (
           <div>
@@ -1797,47 +3791,13 @@ function CalibreSection({
               Bearer token configured in the plugin&rsquo;s Calibre Preferences dialog.
             </p>
             <div className="flex gap-2">
-              <div className="relative flex-1">
-                <input
-                  type={showPluginApiKey ? 'text' : 'password'}
-                  value={settings['calibre.plugin_api_key'] ?? ''}
-                  onChange={e => setSettings(s => ({ ...s, 'calibre.plugin_api_key': e.target.value }))}
-                  placeholder="plugin api key"
-                  autoComplete="off"
-                  className="w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 pr-9 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowPluginApiKey(v => !v)}
-                  className="absolute inset-y-0 right-0 flex items-center px-2.5 text-slate-500 dark:text-zinc-400 hover:text-slate-700 dark:hover:text-zinc-200"
-                  title={showPluginApiKey ? 'Hide key' : 'Show key'}
-                >
-                  {showPluginApiKey ? (
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />
-                    </svg>
-                  ) : (
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
-                    </svg>
-                  )}
-                </button>
-              </div>
-              <button
-                type="button"
-                onClick={() => {
-                  const bytes = new Uint8Array(32)
-                  crypto.getRandomValues(bytes)
-                  const key = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('')
-                  setSettings(s => ({ ...s, 'calibre.plugin_api_key': key }))
-                  setShowPluginApiKey(true)
-                }}
-                className="px-3 py-2 bg-slate-200 dark:bg-zinc-700 hover:bg-slate-300 dark:hover:bg-zinc-600 border border-slate-300 dark:border-zinc-600 rounded text-xs font-medium text-slate-700 dark:text-zinc-200"
-                title="Generate a random 32-byte key"
-              >
-                Generate
-              </button>
+              <input
+                type="password"
+                value={settings['calibre.plugin_api_key'] ?? ''}
+                onChange={e => setSettings(s => ({ ...s, 'calibre.plugin_api_key': e.target.value }))}
+                placeholder="plugin api key"
+                className="flex-1 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600"
+              />
               <button
                 onClick={() => saveSettingWithError('calibre.plugin_api_key')}
                 disabled={saving === 'calibre.plugin_api_key'}
@@ -1871,6 +3831,32 @@ function CalibreSection({
           </div>
         )}
 
+        {/* Bulk push: Bindery → Calibre (plugin only). Pushes every imported
+            book's on-disk file to the plugin; 409 is treated as idempotent. */}
+        {mode === 'plugin' && (
+          <div className="pt-3 border-t border-slate-200 dark:border-zinc-800">
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <label className="block text-sm font-medium text-slate-800 dark:text-zinc-200">Push all to Calibre</label>
+                <p className="text-xs text-slate-600 dark:text-zinc-500 mt-0.5">
+                  Send every imported book in Bindery to the Calibre Bridge plugin. Books already in Calibre are skipped (idempotent).
+                </p>
+                {bridgeReachable === false && (
+                  <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">Bridge not reachable — check plugin URL / API key above.</p>
+                )}
+              </div>
+              <button
+                onClick={startSync}
+                disabled={syncProgress?.running || bridgeReachable !== true}
+                className="px-4 py-2 bg-sky-600 hover:bg-sky-500 rounded text-sm font-medium disabled:opacity-50 flex-shrink-0"
+                title={bridgeReachable !== true ? 'Enable plugin mode and verify the bridge is reachable first' : ''}
+              >
+                {syncProgress?.running ? 'Pushing…' : 'Push all to Calibre'}
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Library import (read side): Calibre → Bindery */}
         <div className="pt-3 border-t border-slate-200 dark:border-zinc-800 space-y-3">
           <div className="flex items-center justify-between">
@@ -1878,68 +3864,36 @@ function CalibreSection({
               <label className="block text-sm font-medium text-slate-800 dark:text-zinc-200">Library import</label>
               <p className="text-xs text-slate-600 dark:text-zinc-500 mt-0.5">
                 Read your existing Calibre library and import books, authors, and editions into Bindery.
-                Works independently of the write mode above — you can import from Calibre without Calibre being on the same host.
-                Mount your Calibre library directory into the container (e.g. <code className="text-[11px] bg-slate-200 dark:bg-zinc-800 px-1 rounded">-v /path/to/library:/calibre:ro</code>) and set the path below.
+                Works independently of the write mode above.
               </p>
             </div>
-            <button
-              onClick={async () => {
+            <Toggle
+              checked={libraryImportEnabled}
+              onChange={async () => {
                 const next = libraryImportEnabled ? 'false' : 'true'
                 setSettings(s => ({ ...s, 'calibre.library_import_enabled': next }))
                 await api.setSetting('calibre.library_import_enabled', next).catch(console.error)
               }}
-              className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0 ml-4 ${libraryImportEnabled ? 'bg-emerald-600' : 'bg-slate-300 dark:bg-zinc-700'}`}
               title={libraryImportEnabled ? 'Disable library import' : 'Enable library import'}
-            >
-              <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform ${libraryImportEnabled ? 'translate-x-4' : ''}`} />
-            </button>
+            />
           </div>
 
           {libraryImportEnabled && (
             <>
-              <div>
-                <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">Library path</label>
-                <p className="text-xs text-slate-600 dark:text-zinc-500 mb-2">
-                  Directory containing <code className="text-[11px] bg-slate-200 dark:bg-zinc-800 px-1 rounded">metadata.db</code>.
-                  For Docker: mount your Calibre library and point here (e.g. <code className="text-[11px] bg-slate-200 dark:bg-zinc-800 px-1 rounded">/calibre</code>).
-                  For Kubernetes: use the same NFS share both pods mount (e.g. <code className="text-[11px] bg-slate-200 dark:bg-zinc-800 px-1 rounded">/media/BOOKS</code>).
-                </p>
-                <div className="flex gap-2">
-                  <input
-                    value={settings['calibre.library_path'] ?? ''}
-                    onChange={e => setSettings(s => ({ ...s, 'calibre.library_path': e.target.value }))}
-                    placeholder="/calibre"
-                    className="flex-1 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600"
-                  />
-                  <button
-                    onClick={() => saveSettingWithError('calibre.library_path')}
-                    disabled={saving === 'calibre.library_path'}
-                    className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded text-xs font-medium disabled:opacity-50"
-                  >
-                    {saving === 'calibre.library_path' ? 'Saving...' : 'Save'}
-                  </button>
-                </div>
-                {saveError?.key === 'calibre.library_path' && (
-                  <p className="text-xs text-red-600 dark:text-red-400 mt-1">{saveError.msg}</p>
-                )}
-              </div>
-
               <div className="flex items-center justify-between">
                 <div>
                   <label className="block text-sm font-medium text-slate-800 dark:text-zinc-200">Sync on startup</label>
                   <p className="text-xs text-slate-600 dark:text-zinc-500 mt-0.5">Re-import each time Bindery starts. Safe to leave on — imports are incremental and idempotent.</p>
                 </div>
-                <button
-                  onClick={async () => {
+                <Toggle
+                  checked={syncOnStartup}
+                  onChange={async () => {
                     const next = syncOnStartup ? 'false' : 'true'
                     setSettings(s => ({ ...s, 'calibre.sync_on_startup': next }))
                     await api.setSetting('calibre.sync_on_startup', next).catch(console.error)
                   }}
-                  className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0 ${syncOnStartup ? 'bg-emerald-600' : 'bg-slate-300 dark:bg-zinc-700'}`}
                   title={syncOnStartup ? 'Disable' : 'Enable'}
-                >
-                  <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform ${syncOnStartup ? 'translate-x-4' : ''}`} />
-                </button>
+                />
               </div>
 
               <div className="flex items-center justify-between">
@@ -2002,7 +3956,149 @@ function CalibreSection({
           )}
         </div>
       </div>
+
+      <div className="bg-slate-100 dark:bg-zinc-900 rounded-lg p-5 border border-slate-300 dark:border-zinc-800">
+        <h3 className="text-base font-semibold mb-3 text-slate-800 dark:text-zinc-200">Calibre-Web-Automated (CWA)</h3>
+        <p className="text-xs text-slate-600 dark:text-zinc-500 mb-4">
+          When set, every successful ebook import is also copied into this directory so a sibling{' '}
+          <a href="https://github.com/crocodilestick/Calibre-Web-Automated" target="_blank" rel="noopener noreferrer" className="text-emerald-700 dark:text-emerald-400 underline">CWA</a>{' '}
+          container can ingest it. Bindery keeps its own copy. Leave blank to disable.
+        </p>
+        <div>
+          <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">Ingest folder path</label>
+          <p className="text-xs text-slate-600 dark:text-zinc-500 mb-2">Mount the same path into both containers. CWA's docs use <code className="text-[11px] bg-slate-200 dark:bg-zinc-800 px-1 rounded">/cwa-book-ingest</code>.</p>
+          <div className="flex gap-2">
+            <input
+              value={settings['cwa.ingest_path'] ?? ''}
+              onChange={e => setSettings(s => ({ ...s, 'cwa.ingest_path': e.target.value }))}
+              placeholder="/cwa-book-ingest"
+              className="flex-1 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600"
+            />
+            <button
+              onClick={() => saveSettingWithError('cwa.ingest_path')}
+              disabled={saving === 'cwa.ingest_path'}
+              className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded text-xs font-medium disabled:opacity-50"
+            >
+              {saving === 'cwa.ingest_path' ? 'Saving...' : 'Save'}
+            </button>
+          </div>
+          {saveError?.key === 'cwa.ingest_path' && (
+            <p className="text-xs text-red-600 dark:text-red-400 mt-1">{saveError.msg}</p>
+          )}
+        </div>
+      </div>
+
+      {syncModalOpen && (
+        <CalibreSyncModal
+          progress={syncProgress}
+          error={syncError}
+          onClose={() => setSyncModalOpen(false)}
+        />
+      )}
     </section>
+  )
+}
+
+// CalibreSyncModal renders the live progress of a bulk "Push all to
+// Calibre" job. Stays open while running; once finished, the user
+// dismisses it explicitly so they can read the per-book error list.
+function CalibreSyncModal({
+  progress,
+  error,
+  onClose,
+}: {
+  progress: CalibreSyncProgress | null
+  error: string | null
+  onClose: () => void
+}) {
+  const stats = progress?.stats
+  const total = stats?.total ?? 0
+  const processed = stats?.processed ?? 0
+  const pct = total > 0 ? Math.min(100, (processed / total) * 100) : 0
+  const running = !!progress?.running
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" role="dialog" aria-modal="true">
+      <div className="w-full max-w-xl rounded-lg bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 shadow-xl">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200 dark:border-zinc-800">
+          <h3 className="text-base font-semibold text-slate-800 dark:text-zinc-100">Push all to Calibre</h3>
+          <button
+            onClick={onClose}
+            disabled={running}
+            className="text-slate-500 hover:text-slate-700 dark:text-zinc-400 dark:hover:text-zinc-200 disabled:opacity-40"
+            title={running ? 'Wait for the push to finish' : 'Close'}
+          >
+            ✕
+          </button>
+        </div>
+        <div className="p-4 space-y-3">
+          {error && (
+            <p className="text-xs text-red-600 dark:text-red-400">{error}</p>
+          )}
+          {progress && (
+            <>
+              <div className="flex justify-between text-xs text-slate-600 dark:text-zinc-400">
+                <span>{progress.message || (running ? 'Working…' : 'Idle')}</span>
+                <span>{processed} / {total || '?'}</span>
+              </div>
+              <div className="h-1.5 bg-slate-200 dark:bg-zinc-800 rounded overflow-hidden">
+                <div className="h-full bg-sky-600 transition-[width] duration-300" style={{ width: `${pct}%` }} />
+              </div>
+              <div className="grid grid-cols-3 gap-2 text-xs">
+                <div className="rounded border border-slate-200 dark:border-zinc-800 px-2 py-1.5">
+                  <div className="text-slate-600 dark:text-zinc-500">Pushed</div>
+                  <div className="font-semibold text-emerald-600 dark:text-emerald-400">{stats?.pushed ?? 0}</div>
+                </div>
+                <div className="rounded border border-slate-200 dark:border-zinc-800 px-2 py-1.5">
+                  <div className="text-slate-600 dark:text-zinc-500">Already in Calibre</div>
+                  <div className="font-semibold text-slate-700 dark:text-zinc-300">{stats?.alreadyInCalibre ?? 0}</div>
+                </div>
+                <div className="rounded border border-slate-200 dark:border-zinc-800 px-2 py-1.5">
+                  <div className="text-slate-600 dark:text-zinc-500">Failed</div>
+                  <div className="font-semibold text-red-600 dark:text-red-400">{stats?.failed ?? 0}</div>
+                </div>
+              </div>
+              {!running && progress.error && (
+                <p className="text-xs text-red-600 dark:text-red-400">Sync failed: {progress.error}</p>
+              )}
+              {!running && progress.finishedAt && !progress.error && (
+                <p className="text-xs text-emerald-600 dark:text-emerald-400">
+                  Done — pushed {stats?.pushed ?? 0}, already in Calibre {stats?.alreadyInCalibre ?? 0}, failed {stats?.failed ?? 0}.
+                </p>
+              )}
+              {progress.errors && progress.errors.length > 0 && (
+                <div className="mt-2 max-h-48 overflow-y-auto rounded border border-slate-200 dark:border-zinc-800">
+                  <table className="w-full text-xs">
+                    <thead className="bg-slate-100 dark:bg-zinc-800 sticky top-0">
+                      <tr>
+                        <th className="text-left px-2 py-1 text-slate-600 dark:text-zinc-400 font-medium">Title</th>
+                        <th className="text-left px-2 py-1 text-slate-600 dark:text-zinc-400 font-medium">Reason</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {progress.errors.map((e, i) => (
+                        <tr key={`${e.bookId}-${i}`} className="border-t border-slate-200 dark:border-zinc-800">
+                          <td className="px-2 py-1 text-slate-800 dark:text-zinc-200">{e.title || `#${e.bookId}`}</td>
+                          <td className="px-2 py-1 text-red-600 dark:text-red-400">{e.reason}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+        <div className="px-4 py-3 border-t border-slate-200 dark:border-zinc-800 flex justify-end">
+          <button
+            onClick={onClose}
+            disabled={running}
+            className="px-3 py-1.5 bg-slate-600 hover:bg-slate-500 rounded text-sm font-medium disabled:opacity-50 text-white"
+          >
+            {running ? 'Running…' : 'Close'}
+          </button>
+        </div>
+      </div>
+    </div>
   )
 }
 
@@ -2061,9 +4157,14 @@ function EditClientForm({ client, onClose, onSaved }: { client: DownloadClient; 
   const [type, setType] = useState(client.type || 'sabnzbd')
   const [host, setHost] = useState(client.host)
   const [port, setPort] = useState(String(client.port))
-  const [credential, setCredential] = useState(client.type === 'qbittorrent' || client.type === 'transmission' ? (client.password || '') : (client.apiKey || ''))
+  const usesPassword = client.type === 'qbittorrent' || client.type === 'transmission' || client.type === 'nzbget' || client.type === 'deluge'
+  const [credential, setCredential] = useState(usesPassword ? (client.password || '') : (client.apiKey || ''))
   const [username, setUsername] = useState(client.username || '')
+  const [useSSL, setUseSSL] = useState(client.useSsl || false)
+  const [urlBase, setUrlBase] = useState(client.urlBase || '')
   const [category, setCategory] = useState(client.category)
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
   const labelCls = 'block text-xs text-slate-600 dark:text-zinc-400 mb-1'
 
   const handleTypeChange = (newType: string) => {
@@ -2072,12 +4173,23 @@ function EditClientForm({ client, onClose, onSaved }: { client: DownloadClient; 
     setUsername('')
   }
 
+  const isPasswordClient = (t: string) => t === 'qbittorrent' || t === 'transmission' || t === 'nzbget' || t === 'deluge'
+  const hasUsername = (t: string) => t === 'qbittorrent' || t === 'transmission' || t === 'nzbget'
+
   const submit = async () => {
-    const data = type === 'qbittorrent' || type === 'transmission'
-      ? { ...client, name, type, host, port: parseInt(port), username, password: credential, apiKey: '', category }
-      : { ...client, name, type, host, port: parseInt(port), apiKey: credential, username: '', password: '', category }
-    const updated = await api.updateDownloadClient(client.id, data)
-    onSaved(updated)
+    const data = isPasswordClient(type)
+      ? { ...client, name, type, host, port: parseInt(port), username: hasUsername(type) ? username : '', password: credential, apiKey: '', category, useSsl: useSSL, urlBase: urlBase.trim() }
+      : { ...client, name, type, host, port: parseInt(port), apiKey: credential, username: '', password: '', category, useSsl: useSSL, urlBase: urlBase.trim() }
+    setSaving(true)
+    setSaveError(null)
+    try {
+      const updated = await api.updateDownloadClient(client.id, data)
+      onSaved(updated)
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Failed to save')
+    } finally {
+      setSaving(false)
+    }
   }
 
   return (
@@ -2091,8 +4203,10 @@ function EditClientForm({ client, onClose, onSaved }: { client: DownloadClient; 
           <label className={labelCls}>Client Type</label>
           <select value={type} onChange={e => handleTypeChange(e.target.value)} className="w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600">
             <option value="sabnzbd">SABnzbd</option>
+            <option value="nzbget">NZBGet</option>
             <option value="qbittorrent">qBittorrent</option>
             <option value="transmission">Transmission</option>
+            <option value="deluge">Deluge</option>
           </select>
         </div>
       </div>
@@ -2102,26 +4216,43 @@ function EditClientForm({ client, onClose, onSaved }: { client: DownloadClient; 
           <input value={host} onChange={e => setHost(e.target.value)} placeholder="Host" className="flex-1 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600" />
           <input value={port} onChange={e => setPort(e.target.value)} placeholder="Port" className="w-24 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600" />
         </div>
-        <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">In Docker, use the service/container name (e.g. <code className="font-mono">sabnzbd</code>) — not <code className="font-mono">localhost</code>.</p>
+        <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">Hostname or IP only — no <code className="font-mono">http://</code> prefix. In Docker, use the service/container name (e.g. <code className="font-mono">nzbget</code>) — not <code className="font-mono">localhost</code>.</p>
       </div>
-      {(type === 'qbittorrent' || type === 'transmission') && (
+      <div className="flex items-center gap-2">
+        <input
+          type="checkbox"
+          id={`edit-ssl-${client.id}`}
+          checked={useSSL}
+          onChange={e => setUseSSL(e.target.checked)}
+          className="rounded border-slate-300 dark:border-zinc-700"
+        />
+        <label htmlFor={`edit-ssl-${client.id}`} className={labelCls}>Use SSL</label>
+      </div>
+      <div>
+        <label className={labelCls}>URL Base</label>
+        <input value={urlBase} onChange={e => setUrlBase(e.target.value)} placeholder="/sabnzbd" className={inputCls} />
+        <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">Optional path prefix for reverse proxy deployments (e.g. <code className="font-mono">/sabnzbd</code>). Leave blank for direct connections.</p>
+      </div>
+      {hasUsername(type) && (
         <div>
           <label className={labelCls}>Username</label>
           <input value={username} onChange={e => setUsername(e.target.value)} placeholder="Username" className={inputCls} />
         </div>
       )}
       <div>
-        <label className={labelCls}>{type === 'qbittorrent' || type === 'transmission' ? 'Password' : 'API Key'}</label>
-        <input value={credential} onChange={e => setCredential(e.target.value)} placeholder={type === 'qbittorrent' || type === 'transmission' ? 'Password' : 'API Key'} type="password" className={inputCls} />
+        <label className={labelCls}>{isPasswordClient(type) ? 'Password' : 'API Key'}</label>
+        <input value={credential} onChange={e => setCredential(e.target.value)} placeholder={isPasswordClient(type) ? 'Password' : 'API Key'} type="password" className={inputCls} />
       </div>
       <div>
-        <label className={labelCls}>{type === 'transmission' ? 'Download Directory' : 'Category'}</label>
-        <input value={category} onChange={e => setCategory(e.target.value)} placeholder={type === 'transmission' ? '/downloads (leave blank for default)' : 'Category'} className={inputCls} />
+        <label className={labelCls}>{type === 'transmission' ? 'Download Directory' : 'Category / Label'}</label>
+        <input value={category} onChange={e => setCategory(e.target.value)} placeholder={type === 'transmission' ? '/downloads (leave blank for default)' : 'books'} className={inputCls} />
         {type === 'transmission' && <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">Optional absolute path override. Leave blank to use Transmission's configured default download directory.</p>}
+        {type === 'deluge' && <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">Applied via the Deluge label plugin. Leave blank if the plugin is not installed.</p>}
       </div>
+      {saveError && <p className="text-sm text-red-500">{saveError}</p>}
       <div className="flex gap-2 justify-end">
         <button onClick={onClose} className="px-3 py-1.5 text-sm text-slate-600 dark:text-zinc-400">Cancel</button>
-        <button onClick={submit} className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium">Save</button>
+        <button onClick={submit} disabled={saving} className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium disabled:opacity-50">Save</button>
       </div>
     </div>
   )
@@ -2230,18 +4361,30 @@ function AddIndexerForm({ onClose, onAdded }: { onClose: () => void; onAdded: (i
 
 function AddClientForm({ onClose, onAdded }: { onClose: () => void; onAdded: (c: DownloadClient) => void }) {
   const [name, setName] = useState('SABnzbd')
-  const [type, setType] = useState<'sabnzbd' | 'qbittorrent' | 'transmission'>('sabnzbd')
+  const [type, setType] = useState<'sabnzbd' | 'nzbget' | 'qbittorrent' | 'transmission' | 'deluge'>('sabnzbd')
   const [host, setHost] = useState('')
   const [port, setPort] = useState('8080')
   const [credential, setCredential] = useState('')
   const [username, setUsername] = useState('')
+  const [useSSL, setUseSSL] = useState(false)
+  const [urlBase, setUrlBase] = useState('')
   const [category, setCategory] = useState('books')
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
   const labelCls = 'block text-xs text-slate-600 dark:text-zinc-400 mb-1'
 
-  const handleTypeChange = (newType: 'sabnzbd' | 'qbittorrent' | 'transmission') => {
+  const isPasswordClient = (t: string) => t === 'qbittorrent' || t === 'transmission' || t === 'nzbget' || t === 'deluge'
+  const hasUsername = (t: string) => t === 'qbittorrent' || t === 'transmission' || t === 'nzbget'
+
+  const handleTypeChange = (newType: 'sabnzbd' | 'nzbget' | 'qbittorrent' | 'transmission' | 'deluge') => {
     setType(newType)
     setCredential('')
     setUsername('')
+    if (newType === 'nzbget') {
+      setName('NZBGet')
+      setPort('6789')
+      return
+    }
     if (newType === 'qbittorrent') {
       setName('qBittorrent')
       setPort('8080')
@@ -2252,16 +4395,29 @@ function AddClientForm({ onClose, onAdded }: { onClose: () => void; onAdded: (c:
       setPort('9091')
       return
     }
+    if (newType === 'deluge') {
+      setName('Deluge')
+      setPort('8112')
+      return
+    }
     setName('SABnzbd')
     setPort('8080')
   }
 
   const submit = async () => {
-    const data = type === 'qbittorrent' || type === 'transmission'
-      ? { name, host, port: parseInt(port), username, password: credential, apiKey: '', category, type, enabled: true }
-      : { name, host, port: parseInt(port), apiKey: credential, username: '', password: '', category, type, enabled: true }
-    const c = await api.addDownloadClient(data)
-    onAdded(c)
+    const data = isPasswordClient(type)
+      ? { name, host, port: parseInt(port), username: hasUsername(type) ? username : '', password: credential, apiKey: '', category, type, enabled: true, useSsl: useSSL, urlBase: urlBase.trim() }
+      : { name, host, port: parseInt(port), apiKey: credential, username: '', password: '', category, type, enabled: true, useSsl: useSSL, urlBase: urlBase.trim() }
+    setSaving(true)
+    setSaveError(null)
+    try {
+      const c = await api.addDownloadClient(data)
+      onAdded(c)
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Failed to save')
+    } finally {
+      setSaving(false)
+    }
   }
 
   return (
@@ -2273,10 +4429,12 @@ function AddClientForm({ onClose, onAdded }: { onClose: () => void; onAdded: (c:
         </div>
         <div className="w-40">
           <label className={labelCls}>Client Type</label>
-          <select value={type} onChange={e => handleTypeChange(e.target.value as 'sabnzbd' | 'qbittorrent' | 'transmission')} className="w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600">
+          <select value={type} onChange={e => handleTypeChange(e.target.value as 'sabnzbd' | 'nzbget' | 'qbittorrent' | 'transmission' | 'deluge')} className="w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600">
             <option value="sabnzbd">SABnzbd</option>
+            <option value="nzbget">NZBGet</option>
             <option value="qbittorrent">qBittorrent</option>
             <option value="transmission">Transmission</option>
+            <option value="deluge">Deluge</option>
           </select>
         </div>
       </div>
@@ -2286,26 +4444,43 @@ function AddClientForm({ onClose, onAdded }: { onClose: () => void; onAdded: (c:
           <input value={host} onChange={e => setHost(e.target.value)} placeholder="Host" className="flex-1 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600" />
           <input value={port} onChange={e => setPort(e.target.value)} placeholder="Port" className="w-24 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600" />
         </div>
-        <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">In Docker, use the service/container name (e.g. <code className="font-mono">sabnzbd</code>) — not <code className="font-mono">localhost</code>.</p>
+        <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">Hostname or IP only — no <code className="font-mono">http://</code> prefix. In Docker, use the service/container name (e.g. <code className="font-mono">nzbget</code>) — not <code className="font-mono">localhost</code>.</p>
       </div>
-      {(type === 'qbittorrent' || type === 'transmission') && (
+      <div className="flex items-center gap-2">
+        <input
+          type="checkbox"
+          id="add-ssl"
+          checked={useSSL}
+          onChange={e => setUseSSL(e.target.checked)}
+          className="rounded border-slate-300 dark:border-zinc-700"
+        />
+        <label htmlFor="add-ssl" className={labelCls}>Use SSL</label>
+      </div>
+      <div>
+        <label className={labelCls}>URL Base</label>
+        <input value={urlBase} onChange={e => setUrlBase(e.target.value)} placeholder="/sabnzbd" className={inputCls} />
+        <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">Optional path prefix for reverse proxy deployments (e.g. <code className="font-mono">/sabnzbd</code>). Leave blank for direct connections.</p>
+      </div>
+      {hasUsername(type) && (
         <div>
           <label className={labelCls}>Username</label>
           <input value={username} onChange={e => setUsername(e.target.value)} placeholder="Username" className={inputCls} />
         </div>
       )}
       <div>
-        <label className={labelCls}>{type === 'qbittorrent' || type === 'transmission' ? 'Password' : 'API Key'}</label>
-        <input value={credential} onChange={e => setCredential(e.target.value)} placeholder={type === 'qbittorrent' || type === 'transmission' ? 'Password' : 'API Key'} type="password" className={inputCls} />
+        <label className={labelCls}>{isPasswordClient(type) ? 'Password' : 'API Key'}</label>
+        <input value={credential} onChange={e => setCredential(e.target.value)} placeholder={isPasswordClient(type) ? 'Password' : 'API Key'} type="password" className={inputCls} />
       </div>
       <div>
-        <label className={labelCls}>{type === 'transmission' ? 'Download Directory' : 'Category'}</label>
-        <input value={category} onChange={e => setCategory(e.target.value)} placeholder={type === 'transmission' ? '/downloads (leave blank for default)' : 'Category'} className={inputCls} />
+        <label className={labelCls}>{type === 'transmission' ? 'Download Directory' : 'Category / Label'}</label>
+        <input value={category} onChange={e => setCategory(e.target.value)} placeholder={type === 'transmission' ? '/downloads (leave blank for default)' : 'books'} className={inputCls} />
         {type === 'transmission' && <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">Optional absolute path override. Leave blank to use Transmission's configured default download directory.</p>}
+        {type === 'deluge' && <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">Applied via the Deluge label plugin. Leave blank if the plugin is not installed.</p>}
       </div>
+      {saveError && <p className="text-sm text-red-500">{saveError}</p>}
       <div className="flex gap-2 justify-end">
         <button onClick={onClose} className="px-3 py-1.5 text-sm text-slate-600 dark:text-zinc-400">Cancel</button>
-        <button onClick={submit} className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium">Save</button>
+        <button onClick={submit} disabled={saving} className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium disabled:opacity-50">Save</button>
       </div>
     </div>
   )
@@ -2375,11 +4550,11 @@ function SecuritySection() {
   const [savingMode, setSavingMode] = useState(false)
   const [copied, setCopied] = useState(false)
 
-  useEffect(() => { loadCfg() }, [])
-
   const loadCfg = () => {
     api.authConfig().then(setCfg).catch(console.error)
   }
+
+  useEffect(() => { loadCfg() }, [])
 
   const regenerate = async () => {
     if (!confirm('Regenerate the API key? Existing integrations using the old key will stop working.')) return
@@ -2722,20 +4897,29 @@ function AddProwlarrForm({ onClose, onAdded }: { onClose: () => void; onAdded: (
   const [apiKey, setApiKey] = useState('')
   const [syncOnStartup, setSyncOnStartup] = useState(true)
   const [syncing, setSyncing] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const labelCls = 'block text-xs text-slate-600 dark:text-zinc-400 mb-1'
 
   const submit = async () => {
     setSyncing(true)
+    setError(null)
+    let p: ProwlarrInstance
     try {
-      const p = await api.addProwlarr({ name, url, apiKey, syncOnStartup, enabled: true })
-      // Auto-sync immediately so the user sees indexers appear right away.
-      try {
-        await api.syncProwlarr(p.id)
-        const updated = await api.listProwlarr()
-        onAdded(updated.find(i => i.id === p.id) ?? p)
-      } catch {
-        onAdded(p)
-      }
+      p = await api.addProwlarr({ name, url, apiKey, syncOnStartup, enabled: true })
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Save failed')
+      setSyncing(false)
+      return
+    }
+    // Save succeeded — auto-sync so indexers appear right away. Sync failures
+    // are non-fatal: the instance is already persisted, the user can retry sync
+    // from the row's button.
+    try {
+      await api.syncProwlarr(p.id)
+      const updated = await api.listProwlarr()
+      onAdded(updated.find(i => i.id === p.id) ?? p)
+    } catch {
+      onAdded(p)
     } finally {
       setSyncing(false)
     }
@@ -2758,15 +4942,12 @@ function AddProwlarrForm({ onClose, onAdded }: { onClose: () => void; onAdded: (
         <input value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="API Key" type="password" className={inputCls} />
       </div>
       <div className="flex items-center gap-2">
-        <button
-          type="button"
-          onClick={() => setSyncOnStartup(!syncOnStartup)}
-          className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0 ${syncOnStartup ? 'bg-emerald-600' : 'bg-slate-300 dark:bg-zinc-700'}`}
-        >
-          <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform ${syncOnStartup ? 'translate-x-4' : ''}`} />
-        </button>
+        <Toggle checked={syncOnStartup} onChange={() => setSyncOnStartup(!syncOnStartup)} />
         <span className="text-xs text-slate-600 dark:text-zinc-400">Sync on startup</span>
       </div>
+      {error && (
+        <div className="text-xs text-red-600 dark:text-red-400 break-words">{error}</div>
+      )}
       <div className="flex gap-2 justify-end">
         <button onClick={onClose} className="px-3 py-1.5 text-sm text-slate-600 dark:text-zinc-400">Cancel</button>
         <button onClick={submit} disabled={!url || !apiKey || syncing} className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium disabled:opacity-50">

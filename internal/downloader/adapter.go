@@ -1,13 +1,16 @@
 // Package downloader provides a unified interface for dispatching download
-// requests to different download clients (SABnzbd, Transmission, qBittorrent).
+// requests to different download clients (SABnzbd, NZBGet, Transmission, qBittorrent, Deluge).
 package downloader
 
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
+	"github.com/vavallee/bindery/internal/downloader/deluge"
+	"github.com/vavallee/bindery/internal/downloader/nzbget"
 	"github.com/vavallee/bindery/internal/downloader/qbittorrent"
 	"github.com/vavallee/bindery/internal/downloader/sabnzbd"
 	"github.com/vavallee/bindery/internal/downloader/transmission"
@@ -18,6 +21,20 @@ type LiveStatus struct {
 	Percentage string
 	TimeLeft   string
 	Speed      string
+	Size       int64
+	SizeLeft   int64
+	// Status is an optional client-specific status string. For Transmission,
+	// non-empty errorString values are exposed as error statuses; otherwise the
+	// integer torrent status code is serialised via strconv.Itoa.
+	Status string
+}
+
+// liveStatusIsError reports whether ls represents an error state.
+// It handles human-readable strings from clients such as qBittorrent, Deluge,
+// SABnzbd, NZBGet, and Transmission errorString overlays.
+func liveStatusIsError(ls LiveStatus) bool {
+	s := strings.ToLower(ls.Status)
+	return strings.Contains(s, "error") || strings.Contains(s, "fail")
 }
 
 type SendResult struct {
@@ -27,7 +44,12 @@ type SendResult struct {
 }
 
 func IsTorrentClient(clientType string) bool {
-	return clientType == "transmission" || clientType == "qbittorrent"
+	return clientType == "transmission" || clientType == "qbittorrent" || clientType == "deluge"
+}
+
+// IsNZBGetClient reports whether the given client type is NZBGet.
+func IsNZBGetClient(clientType string) bool {
+	return clientType == "nzbget"
 }
 
 func ProtocolForClient(clientType string) string {
@@ -40,13 +62,19 @@ func ProtocolForClient(clientType string) string {
 func TestClient(ctx context.Context, client *models.DownloadClient) error {
 	switch client.Type {
 	case "transmission":
-		trans := transmission.New(client.Host, client.Port, client.Username, client.Password, client.UseSSL)
+		trans := transmission.New(client.Host, client.Port, client.Username, client.Password, client.URLBase, client.UseSSL)
 		return trans.Test(ctx)
 	case "qbittorrent":
-		qb := qbittorrent.New(client.Host, client.Port, client.Username, client.Password, client.UseSSL)
+		qb := qbittorrent.New(client.Host, client.Port, client.Username, client.Password, client.URLBase, client.UseSSL)
 		return qb.Test(ctx)
+	case "deluge":
+		dl := deluge.New(client.Host, client.Port, client.Password, client.URLBase, client.UseSSL)
+		return dl.Test(ctx)
+	case "nzbget":
+		ng := nzbget.New(client.Host, client.Port, client.Username, client.Password, client.URLBase, client.UseSSL)
+		return ng.Test(ctx)
 	default:
-		sab := sabnzbd.New(client.Host, client.Port, client.APIKey, client.UseSSL)
+		sab := sabnzbd.New(client.Host, client.Port, client.APIKey, client.URLBase, client.UseSSL)
 		return sab.Test(ctx)
 	}
 }
@@ -59,7 +87,7 @@ func SendDownload(ctx context.Context, client *models.DownloadClient, sourceURL,
 
 	switch client.Type {
 	case "transmission":
-		trans := transmission.New(client.Host, client.Port, client.Username, client.Password, client.UseSSL)
+		trans := transmission.New(client.Host, client.Port, client.Username, client.Password, client.URLBase, client.UseSSL)
 		// Transmission's download-dir must be an absolute path. The Category
 		// field is repurposed as an optional path override for Transmission; if
 		// the user left it as a bare label (e.g. "books") we pass "" so
@@ -78,7 +106,7 @@ func SendDownload(ctx context.Context, client *models.DownloadClient, sourceURL,
 		result.RemoteID = strconv.FormatInt(torrentID, 10)
 		return result, nil
 	case "qbittorrent":
-		qb := qbittorrent.New(client.Host, client.Port, client.Username, client.Password, client.UseSSL)
+		qb := qbittorrent.New(client.Host, client.Port, client.Username, client.Password, client.URLBase, client.UseSSL)
 		hash, err := qb.AddTorrent(ctx, sourceURL, client.Category, "")
 		if err != nil {
 			return nil, err
@@ -89,8 +117,27 @@ func SendDownload(ctx context.Context, client *models.DownloadClient, sourceURL,
 		}
 		result.RemoteID = hash
 		return result, nil
+	case "deluge":
+		dl := deluge.New(client.Host, client.Port, client.Password, client.URLBase, client.UseSSL)
+		hash, err := dl.AddTorrent(ctx, sourceURL, client.Category)
+		if err != nil {
+			return nil, err
+		}
+		if hash == "" {
+			return nil, fmt.Errorf("downloader accepted request but did not return a trackable torrent ID")
+		}
+		result.RemoteID = hash
+		return result, nil
+	case "nzbget":
+		ng := nzbget.New(client.Host, client.Port, client.Username, client.Password, client.URLBase, client.UseSSL)
+		nzbID, err := ng.Add(ctx, sourceURL, title, client.Category, 0)
+		if err != nil {
+			return nil, err
+		}
+		result.RemoteID = strconv.Itoa(nzbID)
+		return result, nil
 	default:
-		sab := sabnzbd.New(client.Host, client.Port, client.APIKey, client.UseSSL)
+		sab := sabnzbd.New(client.Host, client.Port, client.APIKey, client.URLBase, client.UseSSL)
 		resp, err := sab.AddURL(ctx, sourceURL, title, client.Category, 0)
 		if err != nil {
 			return nil, err
@@ -112,19 +159,35 @@ func RemoveDownload(ctx context.Context, client *models.DownloadClient, dl *mode
 		if err != nil {
 			return fmt.Errorf("invalid transmission torrent id %q: %w", *dl.TorrentID, err)
 		}
-		trans := transmission.New(client.Host, client.Port, client.Username, client.Password, client.UseSSL)
+		trans := transmission.New(client.Host, client.Port, client.Username, client.Password, client.URLBase, client.UseSSL)
 		return trans.RemoveTorrent(ctx, torrentID, deleteFiles)
 	case "qbittorrent":
 		if dl.TorrentID == nil || *dl.TorrentID == "" {
 			return nil
 		}
-		qb := qbittorrent.New(client.Host, client.Port, client.Username, client.Password, client.UseSSL)
+		qb := qbittorrent.New(client.Host, client.Port, client.Username, client.Password, client.URLBase, client.UseSSL)
 		return qb.DeleteTorrent(ctx, *dl.TorrentID, deleteFiles)
+	case "deluge":
+		if dl.TorrentID == nil || *dl.TorrentID == "" {
+			return nil
+		}
+		delugeClient := deluge.New(client.Host, client.Port, client.Password, client.URLBase, client.UseSSL)
+		return delugeClient.RemoveTorrent(ctx, *dl.TorrentID, deleteFiles)
+	case "nzbget":
+		if dl.SABnzbdNzoID == nil || *dl.SABnzbdNzoID == "" {
+			return nil
+		}
+		nzbID, err := nzbget.ParseNZBID(*dl.SABnzbdNzoID)
+		if err != nil {
+			return err
+		}
+		ng := nzbget.New(client.Host, client.Port, client.Username, client.Password, client.URLBase, client.UseSSL)
+		return ng.Remove(ctx, nzbID)
 	default:
 		if dl.SABnzbdNzoID == nil || *dl.SABnzbdNzoID == "" {
 			return nil
 		}
-		sab := sabnzbd.New(client.Host, client.Port, client.APIKey, client.UseSSL)
+		sab := sabnzbd.New(client.Host, client.Port, client.APIKey, client.URLBase, client.UseSSL)
 		return sab.Delete(ctx, *dl.SABnzbdNzoID, deleteFiles)
 	}
 }
@@ -141,7 +204,7 @@ func RemoveDownload(ctx context.Context, client *models.DownloadClient, dl *mode
 func GetStalledIDs(ctx context.Context, client *models.DownloadClient) (map[string]bool, bool, error) {
 	switch client.Type {
 	case "qbittorrent":
-		qb := qbittorrent.New(client.Host, client.Port, client.Username, client.Password, client.UseSSL)
+		qb := qbittorrent.New(client.Host, client.Port, client.Username, client.Password, client.URLBase, client.UseSSL)
 		torrents, err := qb.GetTorrents(ctx, client.Category)
 		if err != nil {
 			return nil, true, err
@@ -155,7 +218,7 @@ func GetStalledIDs(ctx context.Context, client *models.DownloadClient) (map[stri
 		}
 		return out, true, nil
 	case "transmission":
-		trans := transmission.New(client.Host, client.Port, client.Username, client.Password, client.UseSSL)
+		trans := transmission.New(client.Host, client.Port, client.Username, client.Password, client.URLBase, client.UseSSL)
 		torrents, err := trans.GetTorrents(ctx, client.Category)
 		if err != nil {
 			return nil, true, err
@@ -165,6 +228,19 @@ func GetStalledIDs(ctx context.Context, client *models.DownloadClient) (map[stri
 			// status 0 = stopped; treat stopped+error as stalled
 			if t.Status == 0 && strings.TrimSpace(t.ErrorString) != "" {
 				out[strconv.FormatInt(t.ID, 10)] = true
+			}
+		}
+		return out, true, nil
+	case "deluge":
+		dl := deluge.New(client.Host, client.Port, client.Password, client.URLBase, client.UseSSL)
+		torrents, err := dl.GetTorrents(ctx)
+		if err != nil {
+			return nil, true, err
+		}
+		out := make(map[string]bool, len(torrents))
+		for h, t := range torrents {
+			if strings.ToLower(t.State) == "error" {
+				out[h] = true
 			}
 		}
 		return out, true, nil
@@ -178,12 +254,16 @@ func GetLiveStatuses(ctx context.Context, client *models.DownloadClient) (map[st
 		statuses, err := getTorrentLiveStatuses(ctx, client)
 		return statuses, true, err
 	}
+	if IsNZBGetClient(client.Type) {
+		statuses, err := getNZBGetLiveStatuses(ctx, client)
+		return statuses, false, err
+	}
 	statuses, err := getSABLiveStatuses(ctx, client)
 	return statuses, false, err
 }
 
 func getSABLiveStatuses(ctx context.Context, client *models.DownloadClient) (map[string]LiveStatus, error) {
-	sab := sabnzbd.New(client.Host, client.Port, client.APIKey, client.UseSSL)
+	sab := sabnzbd.New(client.Host, client.Port, client.APIKey, client.URLBase, client.UseSSL)
 	queue, err := sab.GetQueue(ctx)
 	if err != nil {
 		return nil, err
@@ -195,6 +275,34 @@ func getSABLiveStatuses(ctx context.Context, client *models.DownloadClient) (map
 			Percentage: slot.Percentage,
 			TimeLeft:   slot.TimeLeft,
 			Speed:      queue.Speed,
+			Size:       megabytesStringToBytes(slot.MB),
+			SizeLeft:   megabytesStringToBytes(slot.MBLeft),
+			Status:     slot.Status,
+		}
+	}
+	return out, nil
+}
+
+func getNZBGetLiveStatuses(ctx context.Context, client *models.DownloadClient) (map[string]LiveStatus, error) {
+	ng := nzbget.New(client.Host, client.Port, client.Username, client.Password, client.URLBase, client.UseSSL)
+	groups, err := ng.GetQueue(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]LiveStatus, len(groups))
+	for _, g := range groups {
+		id := strconv.Itoa(g.NZBID)
+		pct := ""
+		if g.FileSizeMB > 0 {
+			done := g.FileSizeMB - g.RemainingSizeMB
+			pct = fmt.Sprintf("%.1f", done/g.FileSizeMB*100)
+		}
+		out[id] = LiveStatus{
+			Percentage: pct,
+			Size:       megabytesToBytes(g.FileSizeMB),
+			SizeLeft:   megabytesToBytes(g.RemainingSizeMB),
+			Status:     g.Status,
 		}
 	}
 	return out, nil
@@ -202,7 +310,7 @@ func getSABLiveStatuses(ctx context.Context, client *models.DownloadClient) (map
 
 func getTorrentLiveStatuses(ctx context.Context, client *models.DownloadClient) (map[string]LiveStatus, error) {
 	if client.Type == "transmission" {
-		trans := transmission.New(client.Host, client.Port, client.Username, client.Password, client.UseSSL)
+		trans := transmission.New(client.Host, client.Port, client.Username, client.Password, client.URLBase, client.UseSSL)
 		torrents, err := trans.GetTorrents(ctx, client.Category)
 		if err != nil {
 			return nil, err
@@ -211,16 +319,43 @@ func getTorrentLiveStatuses(ctx context.Context, client *models.DownloadClient) 
 		out := make(map[string]LiveStatus, len(torrents))
 		for _, t := range torrents {
 			id := strconv.FormatInt(t.ID, 10)
+			status := strconv.Itoa(t.Status)
+			if errString := strings.TrimSpace(t.ErrorString); errString != "" {
+				status = "error: " + errString
+			}
 			out[id] = LiveStatus{
 				Percentage: fmt.Sprintf("%.1f", t.PercentDone*100),
 				TimeLeft:   etaToTimeLeft(t.ETA),
 				Speed:      bytesPerSecondToString(t.DownloadRate),
+				Size:       t.TotalSize,
+				SizeLeft:   t.LeftUntilDone,
+				Status:     status,
 			}
 		}
 		return out, nil
 	}
 
-	qb := qbittorrent.New(client.Host, client.Port, client.Username, client.Password, client.UseSSL)
+	if client.Type == "deluge" {
+		dl := deluge.New(client.Host, client.Port, client.Password, client.URLBase, client.UseSSL)
+		torrents, err := dl.GetTorrents(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make(map[string]LiveStatus, len(torrents))
+		for h, t := range torrents {
+			out[h] = LiveStatus{
+				Percentage: fmt.Sprintf("%.1f", t.Progress),
+				TimeLeft:   etaToTimeLeft(t.ETA),
+				Speed:      bytesPerSecondToString(t.DownloadRate),
+				Size:       t.TotalSize,
+				SizeLeft:   maxInt64(t.TotalSize-t.TotalDone, 0),
+				Status:     t.State,
+			}
+		}
+		return out, nil
+	}
+
+	qb := qbittorrent.New(client.Host, client.Port, client.Username, client.Password, client.URLBase, client.UseSSL)
 	torrents, err := qb.GetTorrents(ctx, client.Category)
 	if err != nil {
 		return nil, err
@@ -231,9 +366,43 @@ func getTorrentLiveStatuses(ctx context.Context, client *models.DownloadClient) 
 		out[strings.ToLower(t.Hash)] = LiveStatus{
 			Percentage: fmt.Sprintf("%.1f", t.Progress*100),
 			TimeLeft:   etaToTimeLeft(int64(t.ETA)),
+			Speed:      bytesPerSecondToString(t.DLSpeed),
+			Size:       t.Size,
+			SizeLeft:   t.AmountLeft,
+			Status:     t.State,
 		}
 	}
 	return out, nil
+}
+
+func megabytesStringToBytes(s string) int64 {
+	s = strings.TrimSpace(strings.ReplaceAll(s, ",", ""))
+	if s == "" {
+		return 0
+	}
+	fields := strings.Fields(s)
+	if len(fields) > 0 {
+		s = fields[0]
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil || v <= 0 {
+		return 0
+	}
+	return megabytesToBytes(v)
+}
+
+func megabytesToBytes(v float64) int64 {
+	if v <= 0 {
+		return 0
+	}
+	return int64(math.Round(v * 1024 * 1024))
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func etaToTimeLeft(etaSeconds int64) string {

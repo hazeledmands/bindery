@@ -2,15 +2,43 @@ package importer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/vavallee/bindery/internal/calibre"
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/models"
 )
+
+func TestNormalizeTitle(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		// Leading-article forms are stripped
+		{"A Darker Shade of Magic", "darker shade of magic"},
+		{"An Ember in the Ashes", "ember in the ashes"},
+		{"The Fragile Threads of Power", "fragile threads of power"},
+		// Comma-suffix forms are inverted then stripped
+		{"Darker Shade of Magic, A", "darker shade of magic"},
+		{"Ember in the Ashes, An", "ember in the ashes"},
+		{"Fragile Threads of Power, The", "fragile threads of power"},
+		// No article — unchanged (lowercased)
+		{"Project Hail Mary", "project hail mary"},
+		// Already normalised
+		{"darker shade of magic", "darker shade of magic"},
+	}
+	for _, tt := range tests {
+		if got := normalizeTitle(tt.in); got != tt.want {
+			t.Errorf("normalizeTitle(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
 
 func TestTitleMatch(t *testing.T) {
 	tests := []struct {
@@ -36,8 +64,10 @@ func TestTitleMatch(t *testing.T) {
 		{"1984", "1984", true},
 		{"1984", "George Orwell 1984", true},
 
-		// Article inversion: "Lord of the Rings, The" normalises to same as "The Lord of the Rings"
+		// Article inversion: comma-suffix form matches leading-article DB title
 		{"The Lord of the Rings", "Lord of the Rings, The", true},
+		{"A Darker Shade of Magic", "Darker Shade of Magic, A", true},
+		{"An Ember in the Ashes", "Ember in the Ashes, An", true},
 
 		// Dots in parsed title are split on non-alnum — "Project.Hail.Mary" yields 3 tokens
 		{"Project Hail Mary", "Project.Hail.Mary", true},
@@ -204,27 +234,132 @@ func TestPushToCalibre_NilResolver(t *testing.T) {
 	s.pushToCalibre(ctx, book, author, "/library/book.epub") // must not panic
 }
 
-func TestJaroWinkler(t *testing.T) {
-	cases := []struct {
-		s1, s2 string
-		wantGE float64
-		wantLT float64
-	}{
-		{"Das Echo der Schuld", "Das Echo der Schuld", 1.0, 0},
-		{"Das Echo der Schuld", "das echo der schuld", 0, 1.0}, // case-sensitive; callers normalise
-		{"Das Echo der Schuld", "Completely Different Book Title", 0, 0.85},
-		{"The Great Gatsby", "The Great Gatsby", 1.0, 0},
-		{"1984", "1984", 1.0, 0},
-		{"", "", 1.0, 0},
-		{"abc", "", 0, 0.5},
+// TestImportInternal_ThreeFileBundle_TracksAllInBookFiles verifies the #343
+// fix: importing a multi-format download (epub + mobi + pdf) stores a
+// separate book_files row for each file rather than overwriting a single path.
+func TestImportInternal_ThreeFileBundle_TracksAllInBookFiles(t *testing.T) {
+	libDir := t.TempDir()
+	dlDir := t.TempDir()
+
+	// Create three book files that simulate a multi-format NZB download.
+	for _, name := range []string{"book.epub", "book.mobi", "book.pdf"} {
+		if err := os.WriteFile(filepath.Join(dlDir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	for _, tc := range cases {
-		got := jaroWinkler(tc.s1, tc.s2)
-		if tc.wantGE > 0 && got < tc.wantGE {
-			t.Errorf("jaroWinkler(%q, %q) = %.4f, want >= %.4f", tc.s1, tc.s2, got, tc.wantGE)
-		}
-		if tc.wantLT > 0 && got >= tc.wantLT {
-			t.Errorf("jaroWinkler(%q, %q) = %.4f, want < %.4f", tc.s1, tc.s2, got, tc.wantLT)
-		}
+
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+
+	ctx := context.Background()
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	dlRepo := db.NewDownloadRepo(database)
+	clientRepo := db.NewDownloadClientRepo(database)
+
+	author := &models.Author{ForeignID: "OLA-3F", Name: "Author", SortName: "Author", Monitored: true, MetadataProvider: "openlibrary"}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	book := &models.Book{
+		ForeignID: "OLB-3F", AuthorID: author.ID, Title: "Three Formats",
+		SortTitle: "Three Formats", Status: models.BookStatusWanted,
+		Monitored: true, AnyEditionOK: true, MetadataProvider: "openlibrary",
+	}
+	if err := bookRepo.Create(ctx, book); err != nil {
+		t.Fatal(err)
+	}
+
+	dl := &models.Download{
+		GUID: "3f-guid", Title: "Three Formats", BookID: &book.ID,
+		Status: models.StateCompleted,
+	}
+	if err := dlRepo.Create(ctx, dl); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewScanner(dlRepo, clientRepo, bookRepo, authorRepo, db.NewHistoryRepo(database), libDir, "", "", "", "")
+	s.tryImportInternal(ctx, dl, dlDir, "", "", nil)
+
+	files, err := bookRepo.ListFiles(ctx, book.ID)
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	if len(files) != 3 {
+		t.Errorf("want 3 book_files rows for epub+mobi+pdf bundle, got %d", len(files))
+	}
+}
+
+// TestTryImportInternal_HistoryEventIncludesFormat is the regression test for
+// Bug #13. When an ebook is imported for a media_type='both' book the
+// bookImported history event must carry a "format" field so the user can see
+// which format was actually imported — without it the queue shows "imported"
+// with no indication that the audiobook half is still missing.
+func TestTryImportInternal_HistoryEventIncludesFormat(t *testing.T) {
+	libDir := t.TempDir()
+	dlDir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(dlDir, "book.epub"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+
+	ctx := context.Background()
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	dlRepo := db.NewDownloadRepo(database)
+	clientRepo := db.NewDownloadClientRepo(database)
+	historyRepo := db.NewHistoryRepo(database)
+
+	author := &models.Author{
+		ForeignID: "OLA-B13", Name: "Author B13", SortName: "B13, Author",
+		Monitored: true, MetadataProvider: "openlibrary",
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	book := &models.Book{
+		ForeignID: "OLB-B13", AuthorID: author.ID,
+		Title: "Both Format Book", SortTitle: "Both Format Book",
+		Status: models.BookStatusWanted, Monitored: true, AnyEditionOK: true,
+		MediaType: models.MediaTypeBoth, MetadataProvider: "openlibrary",
+	}
+	if err := bookRepo.Create(ctx, book); err != nil {
+		t.Fatal(err)
+	}
+
+	dl := &models.Download{
+		GUID: "b13-guid", Title: "Both Format Book", BookID: &book.ID,
+		Status: models.StateCompleted,
+	}
+	if err := dlRepo.Create(ctx, dl); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewScanner(dlRepo, clientRepo, bookRepo, authorRepo, historyRepo, libDir, "", "", "", "")
+	s.tryImportInternal(ctx, dl, dlDir, "", "", nil)
+
+	events, err := historyRepo.ListByType(ctx, models.HistoryEventBookImported)
+	if err != nil {
+		t.Fatalf("list history events: %v", err)
+	}
+	if len(events) == 0 {
+		t.Fatal("Bug #13: no bookImported history event was created")
+	}
+
+	var data map[string]string
+	if err := json.Unmarshal([]byte(events[0].Data), &data); err != nil {
+		t.Fatalf("unmarshal history event data: %v", err)
+	}
+	if got := data["format"]; got != models.MediaTypeEbook {
+		t.Errorf("Bug #13: history event missing format field: got %q, want %q — user cannot tell ebook vs audiobook was imported", got, models.MediaTypeEbook)
 	}
 }

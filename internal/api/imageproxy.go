@@ -39,8 +39,22 @@ type ImageProxyHandler struct {
 // <dataDir>/image-cache/.
 func NewImageProxyHandler(dataDir string) *ImageProxyHandler {
 	h := &ImageProxyHandler{
-		cacheDir:    filepath.Join(dataDir, "image-cache"),
-		client:      &http.Client{Timeout: 15 * time.Second},
+		cacheDir: filepath.Join(dataDir, "image-cache"),
+		client: &http.Client{
+			Timeout: 15 * time.Second,
+			// Re-validate redirect targets — a permissive upstream could otherwise
+			// redirect from a public host into the LAN (cloud metadata, internal
+			// services) and leak the body back through the cache.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if err := httpsec.ValidateOutboundURL(req.URL.String(), httpsec.PolicyStrict); err != nil {
+					return fmt.Errorf("redirect blocked: %w", err)
+				}
+				if len(via) >= 5 {
+					return fmt.Errorf("too many redirects")
+				}
+				return nil
+			},
+		},
 		validateURL: func(u string) error { return httpsec.ValidateOutboundURL(u, httpsec.PolicyStrict) },
 	}
 	go h.migrateFlatCache()
@@ -118,22 +132,37 @@ func (h *ImageProxyHandler) Serve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Write to cache (best-effort — a write failure is not fatal).
-	// Atomic: write to .tmp, then rename so readers never see partial files.
+	// Unique temp files prevent concurrent goroutines serving the same URL from
+	// clobbering each other mid-write before the atomic rename.
 	if mkErr := os.MkdirAll(filepath.Dir(imgFile), imageDirMode); mkErr == nil { // #nosec G301 G304 G703 -- path derived from sha256(url), not user input
-		tmp := imgFile + ".tmp"
-		if err := os.WriteFile(tmp, body, imageCacheMode); err == nil { // #nosec
-			_ = os.Rename(tmp, imgFile) // #nosec
+		if f, ferr := os.CreateTemp(filepath.Dir(imgFile), ".img-*"); ferr == nil { // #nosec G304
+			if _, werr := f.Write(body); werr == nil {
+				_ = f.Chmod(imageCacheMode)
+				f.Close()
+				_ = os.Rename(f.Name(), imgFile) // #nosec G304
+			} else {
+				f.Close()
+				_ = os.Remove(f.Name())
+			}
 		}
-		ctTmp := ctFile + ".tmp"
-		if err := os.WriteFile(ctTmp, []byte(ct), imageCacheMode); err == nil { // #nosec
-			_ = os.Rename(ctTmp, ctFile) // #nosec
+		if f, ferr := os.CreateTemp(filepath.Dir(imgFile), ".ct-*"); ferr == nil { // #nosec G304
+			if _, werr := f.Write([]byte(ct)); werr == nil {
+				_ = f.Chmod(imageCacheMode)
+				f.Close()
+				_ = os.Rename(f.Name(), ctFile) // #nosec G304
+			} else {
+				f.Close()
+				_ = os.Remove(f.Name())
+			}
 		}
 	}
 
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Cache-Control", "public, max-age=2592000")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
-	_, _ = w.Write(body)
+	if _, err := w.Write(body); err != nil {
+		slog.Warn("imageproxy: write response", "error", err)
+	}
 }
 
 // hexKeyRe matches a 64-character lowercase hex string (sha256 output).

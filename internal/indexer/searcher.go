@@ -27,8 +27,10 @@ func NewSearcher() *Searcher {
 // MatchCriteria describes what we're searching for. Year and ISBN are
 // optional and only used for ranking — they never cause a result to be
 // rejected. MediaType filters the indexer category set; "audiobook" narrows
-// to the Newznab audio tree (3000-range, primarily 3030), anything else
-// narrows to the books tree (7000-range).
+// to the Newznab audiobook subcategory (303x, primarily 3030), anything else
+// narrows to the ebook subcategory (702x, primarily 7020). The broad parent
+// categories 7000 and 3000 are never sent — they cause indexers to return
+// noisier, less-targeted result sets.
 // AllowedLanguages is the author's metadata-profile language list; when it
 // contains exactly "eng" (or "en"), foreign-tagged releases are filtered out.
 type MatchCriteria struct {
@@ -39,6 +41,7 @@ type MatchCriteria struct {
 	ASIN             string   // for audiobook ASIN anchoring
 	MediaType        string   // models.MediaTypeEbook or models.MediaTypeAudiobook
 	AllowedLanguages []string // from author's MetadataProfile; empty = no filter
+	AuthorAliases    []string // alternate names (e.g. latin-script romanisations for non-latin authors)
 }
 
 // filterCategoriesForMedia returns the subset of configured indexer
@@ -49,19 +52,17 @@ type MatchCriteria struct {
 // than silently sending an ebook query — otherwise the search appears to
 // succeed but returns the wrong kind of release.
 //
-// Parent categories (7000 for ebook, 3000 for audiobook) are dropped when
-// any child of that tree is already present — sending a parent alongside its
-// children causes indexers to return the broader (and noisier) result set.
-// If only the parent is configured, it is widened to the sane child default:
-// 7020 for ebook, 3030 for audiobook.
+// Indexers with non-standard taxonomies (category IDs > 9999, e.g. MaM's
+// 100xxx subcategories) are passed through as-is when no standard-range
+// match exists. Substituting a standard fallback ID (3030, 7020) on such
+// indexers returns unrelated results because the standard IDs do not cover
+// the indexer's extended subcategory tree.
 func filterCategoriesForMedia(cats []int, mediaType string) []int {
-	wantPrefix := 7
-	parent := 7000
-	childDefault := 7020
+	wantTens := 702
+	fallback := []int{7020}
 	if mediaType == "audiobook" {
-		wantPrefix = 3
-		parent = 3000
-		childDefault = 3030
+		wantTens = 303
+		fallback = []int{3030}
 	}
 
 	fallback := []int{childDefault}
@@ -72,14 +73,20 @@ func filterCategoriesForMedia(cats []int, mediaType string) []int {
 
 	// Collect all categories matching the target tree.
 	var out []int
+	hasNonStandard := false
 	for _, c := range cats {
-		if c/1000 == wantPrefix {
+		if c/10 == wantTens {
 			out = append(out, c)
+		}
+		if c > 9999 {
+			hasNonStandard = true
 		}
 	}
 
 	if len(out) == 0 {
-		// No categories in the requested tree at all — use the safe child default.
+		if hasNonStandard {
+			return cats
+		}
 		return fallback
 	}
 
@@ -184,6 +191,7 @@ func (s *Searcher) searchBookSingle(ctx context.Context, indexers []models.Index
 				hits[i].IndexerID = idx.ID
 				hits[i].IndexerName = idx.Name
 				hits[i].Protocol = protocol
+				hits[i].IndexerPriority = idx.Priority
 			}
 
 			mu.Lock()
@@ -198,7 +206,7 @@ func (s *Searcher) searchBookSingle(ctx context.Context, indexers []models.Index
 
 	results = dedupe(results)
 	results = filterUsenetJunk(results)
-	results = filterRelevant(results, c.Title, c.Author)
+	results = filterRelevant(results, c.Title, c.Author, c.AuthorAliases)
 	rankResults(results, c)
 	return results
 }
@@ -231,6 +239,7 @@ func (s *Searcher) SearchQuery(ctx context.Context, indexers []models.Indexer, q
 				hits[i].IndexerID = idx.ID
 				hits[i].IndexerName = idx.Name
 				hits[i].Protocol = protocol
+				hits[i].IndexerPriority = idx.Priority
 			}
 
 			mu.Lock()
@@ -280,24 +289,119 @@ func primaryTitle(title string) string {
 	return title
 }
 
+// stripPossessivePrefix removes a leading "Author's " possessive from a book
+// title when the author's name (or a portion of it) forms the possessive
+// opener. For example, "Tom Clancy's Rainbow Six" with author "Tom Clancy"
+// returns "Rainbow Six". This prevents "clancys" from appearing as a keyword
+// and failing to match releases named "Tom Clancy - Rainbow Six".
+//
+// The comparison is case-insensitive. Both ASCII apostrophes (') and Unicode
+// right-single-quotation-marks (’) are recognised as the possessive
+// marker. The function tries the full author name first, then each leading
+// prefix (first name, first+second name, etc.) in descending length order,
+// accepting the longest match. If no possessive prefix is found the original
+// title is returned unchanged.
+func stripPossessivePrefix(title, author string) string {
+	if title == "" || author == "" {
+		return title
+	}
+	// Normalise apostrophe variants so we only need to test one form.
+	normTitle := strings.ReplaceAll(title, "’", "'")
+	lowerTitle := strings.ToLower(normTitle)
+
+	authorFields := strings.Fields(author)
+	// Try longest prefix down to a single word (must be ≥ 2 chars to avoid
+	// matching short words that happen to be possessive).
+	for n := len(authorFields); n >= 1; n-- {
+		prefix := strings.ToLower(strings.Join(authorFields[:n], " ")) + "'s "
+		if strings.HasPrefix(lowerTitle, prefix) {
+			// Slice normTitle (not title): both use ASCII apostrophe, so
+			// len(prefix) is a valid byte offset into normTitle. Slicing the
+			// original title mis-aligns when it contains a Unicode
+			// right-single-quotation-mark (3 bytes vs ASCII 1 byte).
+			stripped := strings.TrimSpace(normTitle[len(prefix):])
+			if stripped != "" {
+				return stripped
+			}
+		}
+	}
+	return title
+}
+
+// authorTokens splits an author name into a (significant, all-lowercased)
+// token list suitable for word-boundary matching. Significant means >=3 chars
+// of letters/digits; shorter tokens (typically initials like "R." or "R")
+// are treated as optional and dropped. German umlauts are transliterated to
+// match NormalizeRelease. Returns nil for empty / all-initials input — the
+// caller should fall back to surname-only behaviour.
+func authorTokens(author string) []string {
+	if author == "" {
+		return nil
+	}
+	var out []string
+	for _, w := range strings.Fields(strings.ToLower(author)) {
+		w = strings.ReplaceAll(w, "'", "")
+		w = strings.Trim(w, ".,;:()[]")
+		w = transliterateUmlauts(w)
+		if len(w) >= 3 {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// authorMatchesRelease reports whether the normalized release plausibly
+// belongs to the requested author. The check is:
+//   - Empty author tokens: caller-defined; this function returns false.
+//   - 1 significant token (single-name pseudonym, e.g. "Plato"): word-boundary
+//     match on that token.
+//   - 2+ significant tokens: accept a contiguous "first ... last" phrase
+//     match (preferred), or — as a fallback — every significant token at a
+//     word boundary anywhere in the release.
+//
+// Initials (tokens <3 chars like "R." in "George R. R. Martin") have already
+// been stripped by authorTokens, so they are effectively optional: a release
+// named "George Martin ..." matches "George R. R. Martin".
+func authorMatchesRelease(normResult string, tokens []string) bool {
+	switch len(tokens) {
+	case 0:
+		return false
+	case 1:
+		return WordBoundaryRegex(tokens[0]).MatchString(normResult)
+	default:
+		// Prefer contiguous "first ... last" phrase.
+		if ContainsPhrase(normResult, tokens) {
+			return true
+		}
+		// Fallback: every significant token must appear at a word boundary.
+		for _, tok := range tokens {
+			if !WordBoundaryRegex(tok).MatchString(normResult) {
+				return false
+			}
+		}
+		return true
+	}
+}
+
 // titleMatchesResult returns true if the normalized result contains the
 // significant words of the title either as a contiguous phrase or (for
 // multi-word titles as a fallback) with every significant word appearing at
 // a word boundary. A single-significant-word title additionally requires the
-// author's surname to be present.
-func titleMatchesResult(normResult string, titleKws []string, surname string, allowKwFallback bool) bool {
+// author to be present (first+last for multi-token authors, surname-only for
+// single-token authors); see authorMatchesRelease.
+func titleMatchesResult(normResult string, titleKws []string, authorToks []string, allowKwFallback bool) bool {
 	switch len(titleKws) {
 	case 0:
-		return surname != "" && WordBoundaryRegex(surname).MatchString(normResult)
+		return authorMatchesRelease(normResult, authorToks)
 	case 1:
 		if !WordBoundaryRegex(titleKws[0]).MatchString(normResult) {
 			return false
 		}
-		if surname == "" {
-			// No surname to anchor on — accept (can't do better).
+		if len(authorToks) == 0 {
+			// No author tokens to anchor on — accept (can't do better).
 			return true
 		}
-		return WordBoundaryRegex(surname).MatchString(normResult)
+		return authorMatchesRelease(normResult, authorToks)
 	default:
 		if ContainsPhrase(normResult, titleKws) {
 			return true
@@ -331,11 +435,45 @@ func titleMatchesResult(normResult string, titleKws []string, surname string, al
 // any result happened to phrase-match) caused correctly-titled releases to be
 // dropped when an abbreviated result set the gate — e.g. "Name.Wind.epub"
 // enabling strict mode that then rejected "Name.of.the.Wind.epub".
-func filterRelevant(results []newznab.SearchResult, title, author string) []newznab.SearchResult {
+func filterRelevant(results []newznab.SearchResult, title, author string, aliases []string) []newznab.SearchResult {
+	// Strip edition qualifiers ("(German Edition)" etc.) and normalize
+	// smart quotes before tokenizing, so they don't become spurious keywords.
+	title = newznab.NormalizeQueryTitle(title)
+	// Strip possessive author prefix before keyword extraction.
+	// "Tom Clancy's Rainbow Six" → "Rainbow Six" when author is "Tom Clancy",
+	// preventing "clancys" from becoming a keyword that fails to match releases
+	// like "Tom Clancy - Rainbow Six". See issue #409.
+	title = stripPossessivePrefix(title, author)
 	fullKws := sigWords(title)
 	primaryKws := sigWords(primaryTitle(title))
 	authorKws := sigWords(author)
 	surname := AuthorSurname(author)
+
+	// Build candidate author token sets. The primary set is from `author`. When
+	// the primary surname is non-ASCII (e.g. "春樹" for "村上春樹"), also
+	// include token sets from any latin-script aliases (e.g.
+	// "Haruki Murakami") so release names romanised by indexers are not
+	// incorrectly filtered out. Each token set is used independently: a
+	// release matching any one alias' tokens is accepted.
+	authorTokenSets := [][]string{authorTokens(author)}
+	if !isAllASCIILower(surname) {
+		for _, alias := range aliases {
+			if s := AuthorSurname(alias); s != "" && isAllASCIILower(s) {
+				if toks := authorTokens(alias); len(toks) > 0 {
+					authorTokenSets = append(authorTokenSets, toks)
+				}
+			}
+		}
+	}
+
+	tryMatch := func(n string, kws []string) bool {
+		for _, toks := range authorTokenSets {
+			if titleMatchesResult(n, kws, toks, true) {
+				return true
+			}
+		}
+		return false
+	}
 
 	if len(fullKws) == 0 && len(primaryKws) == 0 && len(authorKws) == 0 {
 		return results
@@ -353,16 +491,28 @@ func filterRelevant(results []newznab.SearchResult, title, author string) []newz
 
 		// allowFallback=true: each result gets phrase match first, then keyword
 		// fallback if the phrase fails. No batch-level gate.
-		fullOK := titleMatchesResult(n, fullKws, surname, true)
+		fullOK := tryMatch(n, fullKws)
 		primaryOK := false
 		if !fullOK && len(primaryKws) > 0 && !sameKws(primaryKws, fullKws) {
-			primaryOK = titleMatchesResult(n, primaryKws, surname, true)
+			primaryOK = tryMatch(n, primaryKws)
 		}
 		if fullOK || primaryOK {
 			filtered = append(filtered, r)
 		}
 	}
 	return filtered
+}
+
+// isAllASCIILower returns true when every byte in the lowercased s is 7-bit ASCII.
+// AuthorSurname already returns lowercase, so this is equivalent to checking
+// whether the surname string contains only ASCII characters.
+func isAllASCIILower(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] > 127 {
+			return false
+		}
+	}
+	return true
 }
 
 func sameKws(a, b []string) bool {
@@ -375,6 +525,13 @@ func sameKws(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// DedupeResults removes duplicate search results (by GUID, falling back to
+// title+URL when the GUID is empty). Callers fanning out multiple SearchBook
+// calls (e.g. dual-format books) use this to merge the per-format result sets.
+func DedupeResults(results []newznab.SearchResult) []newznab.SearchResult {
+	return dedupe(results)
 }
 
 func dedupe(results []newznab.SearchResult) []newznab.SearchResult {
@@ -483,6 +640,11 @@ func scoreResult(r newznab.SearchResult, c MatchCriteria) float64 {
 	if c.ASIN != "" && strings.Contains(strings.ToUpper(r.Title), strings.ToUpper(c.ASIN)) {
 		score += 250
 	}
+
+	// Indexer priority: each priority point adds directly to the score so a
+	// higher-priority indexer wins ties and can outweigh small quality gaps.
+	// Default priority is 0, so deployments that never configure it are unaffected.
+	score += float64(r.IndexerPriority)
 
 	return score
 }

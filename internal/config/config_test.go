@@ -18,6 +18,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.LogLevel != "info" {
 		t.Errorf("expected default log level info, got %s", cfg.LogLevel)
 	}
+	if !cfg.EnhancedHardcoverAPI {
+		t.Error("expected enhanced Hardcover API to default to enabled")
+	}
 
 	// DBPath/DataDir are platform-dependent as of #7. CI runs on linux so
 	// here we only assert the linux invariant; per-platform coverage lives
@@ -35,6 +38,7 @@ func TestLoadDefaults(t *testing.T) {
 func TestLoadFromEnv(t *testing.T) {
 	t.Setenv("BINDERY_PORT", "9999")
 	t.Setenv("BINDERY_LOG_LEVEL", "debug")
+	t.Setenv("BINDERY_ENHANCED_HARDCOVER_API", "false")
 
 	cfg := Load()
 
@@ -43,6 +47,9 @@ func TestLoadFromEnv(t *testing.T) {
 	}
 	if cfg.LogLevel != "debug" {
 		t.Errorf("expected log level debug, got %s", cfg.LogLevel)
+	}
+	if cfg.EnhancedHardcoverAPI {
+		t.Error("expected enhanced Hardcover API to respect BINDERY_ENHANCED_HARDCOVER_API=false")
 	}
 }
 
@@ -109,5 +116,91 @@ func TestDefaultDataDir_FallsBackOnDirError(t *testing.T) {
 	got := defaultDataDir("darwin", func() (string, error) { return "", os.ErrNotExist })
 	if got != "/config" {
 		t.Errorf("expected fallback /config on UserConfigDir error, got %s", got)
+	}
+}
+
+func TestRateLimitDefaults(t *testing.T) {
+	// Ensure no relevant env vars are set.
+	t.Setenv("BINDERY_RATE_LIMIT_MAX_FAILURES", "")
+	t.Setenv("BINDERY_RATE_LIMIT_WINDOW_MINUTES", "")
+
+	cfg := Load()
+
+	if cfg.RateLimitMaxFailures != 5 {
+		t.Errorf("default RateLimitMaxFailures = %d; want 5", cfg.RateLimitMaxFailures)
+	}
+	if cfg.RateLimitWindowMinutes != 15 {
+		t.Errorf("default RateLimitWindowMinutes = %d; want 15", cfg.RateLimitWindowMinutes)
+	}
+}
+
+func TestRateLimitFromEnv(t *testing.T) {
+	t.Setenv("BINDERY_RATE_LIMIT_MAX_FAILURES", "10")
+	t.Setenv("BINDERY_RATE_LIMIT_WINDOW_MINUTES", "30")
+
+	cfg := Load()
+
+	if cfg.RateLimitMaxFailures != 10 {
+		t.Errorf("RateLimitMaxFailures = %d; want 10", cfg.RateLimitMaxFailures)
+	}
+	if cfg.RateLimitWindowMinutes != 30 {
+		t.Errorf("RateLimitWindowMinutes = %d; want 30", cfg.RateLimitWindowMinutes)
+	}
+}
+
+// TestAuthPolicyDefaults verifies the three auth-policy env vars default to
+// the expected safe values: local auth on, OIDC auto-provision on, email-link off.
+func TestAuthPolicyDefaults(t *testing.T) {
+	t.Setenv("BINDERY_LOCAL_AUTH_ENABLED", "")
+	t.Setenv("BINDERY_OIDC_AUTO_PROVISION", "")
+	t.Setenv("BINDERY_OIDC_EMAIL_LINK", "")
+
+	cfg := Load()
+
+	if !cfg.LocalAuthEnabled {
+		t.Error("LocalAuthEnabled: expected default true")
+	}
+	if !cfg.OIDCAutoProvision {
+		t.Error("OIDCAutoProvision: expected default true")
+	}
+	if cfg.OIDCEmailLink {
+		t.Error("OIDCEmailLink: expected default false")
+	}
+}
+
+// TestAuthPolicyFromEnv verifies explicit values override the defaults.
+func TestAuthPolicyFromEnv(t *testing.T) {
+	cases := []struct {
+		localAuth     string
+		autoProvision string
+		emailLink     string
+		wantLocal     bool
+		wantProv      bool
+		wantLink      bool
+	}{
+		{"false", "false", "true", false, false, true},
+		{"0", "0", "1", false, false, true},
+		{"no", "no", "yes", false, false, true},
+		{"true", "true", "false", true, true, false},
+		{"1", "1", "0", true, true, false},
+	}
+	for _, c := range cases {
+		t.Run(c.localAuth+"/"+c.autoProvision+"/"+c.emailLink, func(t *testing.T) {
+			t.Setenv("BINDERY_LOCAL_AUTH_ENABLED", c.localAuth)
+			t.Setenv("BINDERY_OIDC_AUTO_PROVISION", c.autoProvision)
+			t.Setenv("BINDERY_OIDC_EMAIL_LINK", c.emailLink)
+
+			cfg := Load()
+
+			if cfg.LocalAuthEnabled != c.wantLocal {
+				t.Errorf("LocalAuthEnabled=%v, want %v", cfg.LocalAuthEnabled, c.wantLocal)
+			}
+			if cfg.OIDCAutoProvision != c.wantProv {
+				t.Errorf("OIDCAutoProvision=%v, want %v", cfg.OIDCAutoProvision, c.wantProv)
+			}
+			if cfg.OIDCEmailLink != c.wantLink {
+				t.Errorf("OIDCEmailLink=%v, want %v", cfg.OIDCEmailLink, c.wantLink)
+			}
+		})
 	}
 }

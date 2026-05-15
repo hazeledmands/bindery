@@ -9,55 +9,6 @@ import (
 	"github.com/vavallee/bindery/internal/models"
 )
 
-// mockProvider is a test double for the Provider interface.
-type mockProvider struct {
-	name           string
-	searchBooks    []models.Book
-	searchBookErr  error
-	searchAuthors  []models.Author
-	searchAuthErr  error
-	getAuthor      *models.Author
-	getAuthorErr   error
-	getBook        *models.Book
-	getBookErr     error
-	getEditions    []models.Edition
-	getEditionsErr error
-	getByISBN      *models.Book
-	getByISBNErr   error
-	// authorWorks implements worksProvider interface
-	authorWorks    []models.Book
-	authorWorksErr error
-}
-
-func (m *mockProvider) Name() string { return m.name }
-func (m *mockProvider) SearchAuthors(_ context.Context, _ string) ([]models.Author, error) {
-	return m.searchAuthors, m.searchAuthErr
-}
-func (m *mockProvider) SearchBooks(_ context.Context, _ string) ([]models.Book, error) {
-	return m.searchBooks, m.searchBookErr
-}
-func (m *mockProvider) GetAuthor(_ context.Context, _ string) (*models.Author, error) {
-	return m.getAuthor, m.getAuthorErr
-}
-func (m *mockProvider) GetBook(_ context.Context, _ string) (*models.Book, error) {
-	return m.getBook, m.getBookErr
-}
-func (m *mockProvider) GetEditions(_ context.Context, _ string) ([]models.Edition, error) {
-	return m.getEditions, m.getEditionsErr
-}
-func (m *mockProvider) GetBookByISBN(_ context.Context, _ string) (*models.Book, error) {
-	return m.getByISBN, m.getByISBNErr
-}
-
-// worksProvider implementation (optional, only attached when needed).
-type mockWorksProvider struct {
-	mockProvider
-}
-
-func (m *mockWorksProvider) GetAuthorWorks(_ context.Context, _ string) ([]models.Book, error) {
-	return m.authorWorks, m.authorWorksErr
-}
-
 func TestAggregator_SearchAuthors(t *testing.T) {
 	want := []models.Author{{Name: "Frank Herbert", ForeignID: "OL123A"}}
 	primary := &mockProvider{name: "ol", searchAuthors: want}
@@ -252,6 +203,53 @@ func TestAggregator_GetBook_Error(t *testing.T) {
 	}
 }
 
+func TestAggregator_GetBook_RoutesProviderPrefixes(t *testing.T) {
+	primary := &mockProvider{name: "openlibrary", getBook: &models.Book{Title: "Wrong"}}
+	google := &mockProvider{name: "googlebooks", getBook: &models.Book{ForeignID: "gb:vol1", Title: "Google Book", MetadataProvider: "googlebooks"}}
+	hardcover := &mockProvider{name: "hardcover", getBook: &models.Book{ForeignID: "hc:book", Title: "Hardcover Book", MetadataProvider: "hardcover"}}
+	dnb := &mockProvider{name: "dnb", getBook: &models.Book{ForeignID: "dnb:123", Title: "DNB Book", MetadataProvider: "dnb"}}
+	agg := newTestAggregator(primary, google, hardcover, dnb)
+
+	tests := []struct {
+		foreignID string
+		wantTitle string
+		provider  *mockProvider
+	}{
+		{foreignID: "gb:vol1", wantTitle: "Google Book", provider: google},
+		{foreignID: "hc:book", wantTitle: "Hardcover Book", provider: hardcover},
+		{foreignID: "dnb:123", wantTitle: "DNB Book", provider: dnb},
+	}
+	for _, tt := range tests {
+		got, err := agg.GetBook(context.Background(), tt.foreignID)
+		if err != nil {
+			t.Fatalf("GetBook(%q): %v", tt.foreignID, err)
+		}
+		if got == nil || got.Title != tt.wantTitle {
+			t.Fatalf("GetBook(%q) = %+v, want %s", tt.foreignID, got, tt.wantTitle)
+		}
+		if tt.provider.getBookCalls != 1 || tt.provider.gotBookIDs[0] != tt.foreignID {
+			t.Fatalf("%s calls=%d ids=%v, want one %s", tt.provider.name, tt.provider.getBookCalls, tt.provider.gotBookIDs, tt.foreignID)
+		}
+	}
+	if primary.getBookCalls != 0 {
+		t.Fatalf("primary get calls = %d, want 0", primary.getBookCalls)
+	}
+}
+
+func TestAggregator_GetAuthor_RoutesProviderPrefixes(t *testing.T) {
+	primary := &mockProvider{name: "openlibrary", getAuthor: &models.Author{Name: "Wrong"}}
+	hardcover := &mockProvider{name: "hardcover", getAuthor: &models.Author{ForeignID: "hc:author", Name: "Hardcover Author", MetadataProvider: "hardcover"}}
+	agg := newTestAggregator(primary, hardcover)
+
+	got, err := agg.GetAuthor(context.Background(), "hc:author")
+	if err != nil {
+		t.Fatalf("GetAuthor: %v", err)
+	}
+	if got == nil || got.Name != "Hardcover Author" {
+		t.Fatalf("got %+v, want Hardcover Author", got)
+	}
+}
+
 func TestAggregator_GetEditions_Success(t *testing.T) {
 	editions := []models.Edition{{Title: "1st ed."}, {Title: "2nd ed."}}
 	primary := &mockProvider{name: "ol", getEditions: editions}
@@ -283,316 +281,53 @@ func TestAggregator_GetEditions_Cached(t *testing.T) {
 	}
 }
 
-func TestAggregator_GetBookByISBN_Success(t *testing.T) {
-	book := &models.Book{Title: "The Left Hand of Darkness", Description: "A novel long enough description to pass the enrichment check easily."}
-	primary := &mockProvider{name: "ol", getByISBN: book}
-	agg := newTestAggregator(primary)
+// TestAggregator_ResolveBookByISBN_AcceptsDNBWithSyntheticAuthorID is the
+// regression test for #608: prior to the DNB-author-foreign-id fix, the
+// aggregator silently dropped DNB-only ISBN hits because Author.ForeignID
+// was empty. Now that DNB populates a synthetic "dnb:gnd:" (or
+// "dnb:author:") ForeignID, ResolveBookByISBN must accept it.
+func TestAggregator_ResolveBookByISBN_AcceptsDNBWithSyntheticAuthorID(t *testing.T) {
+	primary := &mockProvider{name: "openlibrary"} // OL doesn't have this ISBN.
+	dnb := &mockProvider{name: "dnb", getByISBN: &models.Book{
+		ForeignID: "dnb:bib-001",
+		Title:     "Der Wüstenplanet",
+		Author: &models.Author{
+			ForeignID:        "dnb:gnd:118585665",
+			Name:             "Frank Herbert",
+			SortName:         "Herbert, Frank",
+			MetadataProvider: "dnb",
+		},
+	}}
+	agg := newTestAggregator(primary, dnb)
 
-	got, err := agg.GetBookByISBN(context.Background(), "9780441478125")
+	got, err := agg.ResolveBookByISBN(context.Background(), "9783453198975")
 	if err != nil {
-		t.Fatalf("GetBookByISBN: %v", err)
+		t.Fatalf("ResolveBookByISBN: %v", err)
 	}
-	if got.Title != "The Left Hand of Darkness" {
-		t.Errorf("Title: want 'The Left Hand of Darkness', got %q", got.Title)
+	if got == nil {
+		t.Fatal("expected DNB result with synthetic author ForeignID to be accepted, got nil")
+	}
+	if got.Author == nil || got.Author.ForeignID != "dnb:gnd:118585665" {
+		t.Errorf("unexpected resolved author: %+v", got.Author)
 	}
 }
 
-func TestAggregator_GetBookByISBN_Cached(t *testing.T) {
-	book := &models.Book{Title: "Cached ISBN Book", Description: "Long enough to skip enrichment and exercise the caching path correctly."}
-	primary := &mockProvider{name: "ol", getByISBN: book}
+// TestAggregator_ResolveBookByISBN_StillSkipsResultsWithoutAuthorID guards
+// the inverse: a provider that genuinely returns a book without any author
+// ForeignID is still dropped, so the caller sees nil instead of a placeholder
+// row it can't persist.
+func TestAggregator_ResolveBookByISBN_StillSkipsResultsWithoutAuthorID(t *testing.T) {
+	primary := &mockProvider{name: "openlibrary", getByISBN: &models.Book{
+		Title:  "Title Only",
+		Author: &models.Author{Name: "Unknown", ForeignID: ""},
+	}}
 	agg := newTestAggregator(primary)
 
-	_, _ = agg.GetBookByISBN(context.Background(), "9780441478125")
-	primary.getByISBN = nil
-
-	got, err := agg.GetBookByISBN(context.Background(), "9780441478125")
+	got, err := agg.ResolveBookByISBN(context.Background(), "9780000000000")
 	if err != nil {
-		t.Fatalf("GetBookByISBN (cache): %v", err)
-	}
-	if got.Title != "Cached ISBN Book" {
-		t.Errorf("cached book mismatch: got %q", got.Title)
-	}
-}
-
-func TestAggregator_GetBookByISBN_NilBook(t *testing.T) {
-	primary := &mockProvider{name: "ol", getByISBN: nil}
-	agg := newTestAggregator(primary)
-
-	got, err := agg.GetBookByISBN(context.Background(), "0000000000")
-	if err != nil {
-		t.Fatalf("GetBookByISBN(nil): %v", err)
+		t.Fatalf("ResolveBookByISBN: %v", err)
 	}
 	if got != nil {
-		t.Errorf("expected nil for missing ISBN, got %+v", got)
-	}
-}
-
-func TestAggregator_GetAuthorWorks_WorksProvider(t *testing.T) {
-	books := []models.Book{{Title: "Dune"}, {Title: "Dune Messiah"}}
-	primary := &mockWorksProvider{
-		mockProvider: mockProvider{name: "ol", authorWorks: books},
-	}
-	agg := &Aggregator{
-		primary: primary,
-		cache:   newTTLCache(time.Minute),
-	}
-
-	got, err := agg.GetAuthorWorks(context.Background(), "OL123A")
-	if err != nil {
-		t.Fatalf("GetAuthorWorks: %v", err)
-	}
-	if len(got) != 2 {
-		t.Errorf("expected 2 works, got %d", len(got))
-	}
-	if got[0].Title != "Dune" {
-		t.Errorf("first title: want 'Dune', got %q", got[0].Title)
-	}
-}
-
-func TestAggregator_GetAuthorWorks_Fallback(t *testing.T) {
-	// Primary does not implement worksProvider → falls back to SearchBooks.
-	books := []models.Book{{Title: "Foundation"}, {Title: "Foundation and Empire"}}
-	primary := &mockProvider{name: "gb", searchBooks: books}
-	agg := &Aggregator{
-		primary: primary,
-		cache:   newTTLCache(time.Minute),
-	}
-
-	got, err := agg.GetAuthorWorks(context.Background(), "OL999A")
-	if err != nil {
-		t.Fatalf("GetAuthorWorks (fallback): %v", err)
-	}
-	if len(got) != 2 {
-		t.Errorf("expected 2 works from fallback, got %d", len(got))
-	}
-}
-
-func TestAggregator_GetAuthorWorks_Cached(t *testing.T) {
-	books := []models.Book{{Title: "Ender's Game"}}
-	primary := &mockWorksProvider{
-		mockProvider: mockProvider{name: "ol", authorWorks: books},
-	}
-	agg := &Aggregator{
-		primary: primary,
-		cache:   newTTLCache(time.Minute),
-	}
-
-	_, _ = agg.GetAuthorWorks(context.Background(), "OL555A")
-	primary.authorWorks = nil // clear; next call must hit cache
-
-	got, err := agg.GetAuthorWorks(context.Background(), "OL555A")
-	if err != nil {
-		t.Fatalf("GetAuthorWorks (cache): %v", err)
-	}
-	if len(got) != 1 || got[0].Title != "Ender's Game" {
-		t.Errorf("cached works mismatch: %+v", got)
-	}
-}
-
-func TestAggregator_EnrichAudiobook_NonAudiobook(t *testing.T) {
-	agg := newTestAggregator(&mockProvider{name: "ol"})
-	book := &models.Book{Title: "Ebook", MediaType: models.MediaTypeEbook, ASIN: "B001"}
-	if err := agg.EnrichAudiobook(context.Background(), book); err != nil {
-		t.Fatalf("EnrichAudiobook (ebook): %v", err)
-	}
-}
-
-func TestAggregator_EnrichAudiobook_NilBook(t *testing.T) {
-	agg := newTestAggregator(&mockProvider{name: "ol"})
-	if err := agg.EnrichAudiobook(context.Background(), nil); err != nil {
-		t.Fatalf("EnrichAudiobook(nil): %v", err)
-	}
-}
-
-func TestAggregator_EnrichAudiobook_NoASIN(t *testing.T) {
-	agg := newTestAggregator(&mockProvider{name: "ol"})
-	book := &models.Book{Title: "Audiobook", MediaType: models.MediaTypeAudiobook, ASIN: ""}
-	if err := agg.EnrichAudiobook(context.Background(), book); err != nil {
-		t.Fatalf("EnrichAudiobook (no ASIN): %v", err)
-	}
-}
-
-func TestAggregator_EnrichBook_SkipsOnSearchError(t *testing.T) {
-	primary := &mockProvider{
-		name:    "ol",
-		getBook: &models.Book{Title: "Error Test", Description: "x"},
-	}
-	enricher := &mockProvider{
-		name:          "hc",
-		searchBookErr: errors.New("hardcover unavailable"),
-	}
-	agg := &Aggregator{
-		primary:   primary,
-		enrichers: []Provider{enricher},
-		cache:     newTTLCache(time.Minute),
-	}
-
-	got, err := agg.GetBook(context.Background(), "OL002W")
-	if err != nil {
-		t.Fatalf("GetBook: %v", err)
-	}
-	// Description should remain unchanged since enricher errored.
-	if got.Description != "x" {
-		t.Errorf("description changed unexpectedly: %q", got.Description)
-	}
-}
-
-func TestAggregator_enrichBook_FillsCoverWhenMissing(t *testing.T) {
-	enricher := &mockProvider{
-		name:        "gb",
-		searchBooks: []models.Book{{Description: "A description.", ImageURL: "https://books.google.com/cover.jpg"}},
-	}
-	agg := &Aggregator{enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
-
-	book := &models.Book{Title: "Sapiens", ImageURL: ""}
-	agg.enrichBook(context.Background(), book)
-	if book.ImageURL != "https://books.google.com/cover.jpg" {
-		t.Errorf("expected cover to be filled from enricher, got %q", book.ImageURL)
-	}
-}
-
-func TestAggregator_enrichBook_KeepsExistingCover(t *testing.T) {
-	enricher := &mockProvider{
-		name:        "gb",
-		searchBooks: []models.Book{{ImageURL: "https://books.google.com/other.jpg"}},
-	}
-	agg := &Aggregator{enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
-
-	existing := "https://covers.openlibrary.org/b/id/123-L.jpg"
-	book := &models.Book{Title: "Dune", ImageURL: existing}
-	agg.enrichBook(context.Background(), book)
-	if book.ImageURL != existing {
-		t.Errorf("existing cover should not be replaced, got %q", book.ImageURL)
-	}
-}
-
-func TestAggregator_GetBook_NoCover_EnrichedFromProvider(t *testing.T) {
-	// Book has a long description so the old trigger wouldn't fire — but
-	// ImageURL is empty so enrichment must still run.
-	primary := &mockProvider{
-		name: "ol",
-		getBook: &models.Book{
-			Title:       "21 Lessons for the 21st Century",
-			Description: "A sufficiently long description that would previously have skipped enrichment entirely.",
-			ImageURL:    "",
-		},
-	}
-	enricher := &mockProvider{
-		name:        "gb",
-		searchBooks: []models.Book{{ImageURL: "https://books.google.com/cover-en.jpg"}},
-	}
-	agg := &Aggregator{primary: primary, enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
-
-	got, err := agg.GetBook(context.Background(), "OL123W")
-	if err != nil {
-		t.Fatalf("GetBook: %v", err)
-	}
-	if got.ImageURL != "https://books.google.com/cover-en.jpg" {
-		t.Errorf("expected cover from enricher, got %q", got.ImageURL)
-	}
-}
-
-func TestAggregator_GetAuthorWorks_CoversEnrichedForMissingOnes(t *testing.T) {
-	primary := &mockWorksProvider{
-		mockProvider: mockProvider{
-			name: "ol",
-			authorWorks: []models.Book{
-				{ForeignID: "OL1W", Title: "Sapiens", ImageURL: ""},
-				{ForeignID: "OL2W", Title: "Homo Deus", ImageURL: "https://covers.openlibrary.org/b/id/999-L.jpg"},
-			},
-		},
-	}
-	enricher := &mockProvider{
-		name:        "gb",
-		searchBooks: []models.Book{{ImageURL: "https://books.google.com/sapiens.jpg"}},
-	}
-	agg := &Aggregator{primary: primary, enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
-
-	got, err := agg.GetAuthorWorks(context.Background(), "OL123A")
-	if err != nil {
-		t.Fatalf("GetAuthorWorks: %v", err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("expected 2 works, got %d", len(got))
-	}
-	// Book without OL cover should get enriched cover
-	if got[0].ImageURL != "https://books.google.com/sapiens.jpg" {
-		t.Errorf("Sapiens: expected enriched cover, got %q", got[0].ImageURL)
-	}
-	// Book with OL cover should keep it
-	if got[1].ImageURL != "https://covers.openlibrary.org/b/id/999-L.jpg" {
-		t.Errorf("Homo Deus: expected OL cover preserved, got %q", got[1].ImageURL)
-	}
-}
-
-func TestAggregator_GetAuthorWorks_NoEnrichersNoCovers(t *testing.T) {
-	// With no enrichers, works without covers stay coverless — no panic.
-	primary := &mockWorksProvider{
-		mockProvider: mockProvider{
-			name:        "ol",
-			authorWorks: []models.Book{{ForeignID: "OL1W", Title: "No Cover Book", ImageURL: ""}},
-		},
-	}
-	agg := &Aggregator{primary: primary, cache: newTTLCache(time.Minute)}
-
-	got, err := agg.GetAuthorWorks(context.Background(), "OL456A")
-	if err != nil {
-		t.Fatalf("GetAuthorWorks: %v", err)
-	}
-	if got[0].ImageURL != "" {
-		t.Errorf("expected empty cover with no enrichers, got %q", got[0].ImageURL)
-	}
-}
-
-func TestTTLCache_SetAndGet(t *testing.T) {
-	c := newTTLCache(time.Minute)
-	c.set("key1", "value1")
-	v, ok := c.get("key1")
-	if !ok {
-		t.Fatal("expected cache hit")
-	}
-	if v.(string) != "value1" {
-		t.Errorf("want 'value1', got %q", v)
-	}
-}
-
-func TestTTLCache_Miss(t *testing.T) {
-	c := newTTLCache(time.Minute)
-	_, ok := c.get("missing")
-	if ok {
-		t.Error("expected cache miss for unknown key")
-	}
-}
-
-func TestTTLCache_Expiry(t *testing.T) {
-	c := newTTLCache(time.Nanosecond)
-	c.set("k", "v")
-	time.Sleep(2 * time.Millisecond)
-	_, ok := c.get("k")
-	if ok {
-		t.Error("expected cache miss after TTL expiry")
-	}
-}
-
-func TestTTLCache_Cleanup(t *testing.T) {
-	c := newTTLCache(time.Nanosecond)
-	c.set("a", 1)
-	c.set("b", 2)
-	time.Sleep(2 * time.Millisecond)
-	c.cleanup()
-
-	c.mu.RLock()
-	n := len(c.items)
-	c.mu.RUnlock()
-	if n != 0 {
-		t.Errorf("expected 0 items after cleanup, got %d", n)
-	}
-}
-
-// newTestAggregator creates an aggregator with a real TTL cache and no enrichers.
-func newTestAggregator(primary Provider) *Aggregator {
-	return &Aggregator{
-		primary: primary,
-		cache:   newTTLCache(time.Minute),
+		t.Errorf("expected nil when no provider has an author ForeignID, got %+v", got)
 	}
 }

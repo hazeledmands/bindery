@@ -2,13 +2,14 @@ package scheduler
 
 import (
 	"context"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/robfig/cron/v3"
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/indexer"
-	"github.com/vavallee/bindery/internal/indexer/newznab"
 	"github.com/vavallee/bindery/internal/metadata"
 	"github.com/vavallee/bindery/internal/models"
 )
@@ -151,6 +152,41 @@ func TestSearchWanted_EmptyDB(t *testing.T) {
 	s.searchWanted()
 }
 
+func TestRunBoundedBookTasks_LimitsConcurrency(t *testing.T) {
+	books := make([]models.Book, 6)
+	for i := range books {
+		books[i] = models.Book{Title: "Book " + strconv.Itoa(i)}
+	}
+
+	var mu sync.Mutex
+	var calls, active, maxActive int
+	runBoundedBookTasks(context.Background(), books, 2, func(_ context.Context, _ models.Book) {
+		mu.Lock()
+		calls++
+		active++
+		if active > maxActive {
+			maxActive = active
+		}
+		mu.Unlock()
+
+		time.Sleep(20 * time.Millisecond)
+
+		mu.Lock()
+		active--
+		mu.Unlock()
+	})
+
+	if calls != len(books) {
+		t.Fatalf("calls = %d, want %d", calls, len(books))
+	}
+	if maxActive > 2 {
+		t.Fatalf("maxActive = %d, want <= 2", maxActive)
+	}
+	if maxActive < 2 {
+		t.Fatalf("expected parallel execution, maxActive = %d", maxActive)
+	}
+}
+
 // TestSearchWanted_ErrorPath exercises the error-return when the books repo
 // is in a broken state. We use a nil pointer to trigger a panic, so instead
 // we call the method on a scheduler with a valid (but empty) books repo that
@@ -218,84 +254,6 @@ func TestRefreshMetadata_UnmonitoredAuthor(t *testing.T) {
 		meta:    nil,
 	}
 	s.refreshMetadata() // must not panic: skips unmonitored author
-}
-
-// TestFilterBlocklisted_WithRealRepo exercises the non-nil repo path of
-// filterBlocklisted, covering the loop body and IsBlocked call.
-func TestFilterBlocklisted_WithRealRepo(t *testing.T) {
-	database, err := db.OpenMemory()
-	if err != nil {
-		t.Fatalf("OpenMemory: %v", err)
-	}
-	defer database.Close()
-
-	ctx := context.Background()
-	repo := db.NewBlocklistRepo(database)
-
-	results := []newznab.SearchResult{
-		{GUID: "good-guid", Title: "Good Release"},
-		{GUID: "blocked-guid", Title: "Blocked Release"},
-	}
-
-	// Block one GUID.
-	_ = repo.Create(ctx, &models.BlocklistEntry{
-		GUID:  "blocked-guid",
-		Title: "Blocked Release",
-	})
-
-	out := filterBlocklisted(ctx, repo, results)
-	if len(out) != 1 {
-		t.Fatalf("expected 1 result, got %d", len(out))
-	}
-	if out[0].GUID != "good-guid" {
-		t.Errorf("expected 'good-guid' to pass, got %q", out[0].GUID)
-	}
-}
-
-// TestFilterBlocklisted_AllBlocked verifies that an all-blocked result set
-// returns an empty (not nil) slice.
-func TestFilterBlocklisted_AllBlocked(t *testing.T) {
-	database, err := db.OpenMemory()
-	if err != nil {
-		t.Fatalf("OpenMemory: %v", err)
-	}
-	defer database.Close()
-
-	ctx := context.Background()
-	repo := db.NewBlocklistRepo(database)
-
-	_ = repo.Create(ctx, &models.BlocklistEntry{GUID: "a", Title: "A"})
-	_ = repo.Create(ctx, &models.BlocklistEntry{GUID: "b", Title: "B"})
-
-	results := []newznab.SearchResult{{GUID: "a"}, {GUID: "b"}}
-	out := filterBlocklisted(ctx, repo, results)
-	if len(out) != 0 {
-		t.Errorf("expected 0 results, got %d", len(out))
-	}
-}
-
-// TestFilterBlocklisted_NilRepo_ReturnsAll verifies the production nil-repo guard.
-func TestFilterBlocklisted_NilRepo_ReturnsAll(t *testing.T) {
-	results := []newznab.SearchResult{
-		{GUID: "x"}, {GUID: "y"}, {GUID: "z"},
-	}
-	out := filterBlocklisted(context.Background(), nil, results)
-	if len(out) != 3 {
-		t.Errorf("nil BlocklistRepo: expected 3 results, got %d", len(out))
-	}
-}
-
-// TestFilterBlocklisted_EmptyInput confirms nil/empty input → empty output with nil repo.
-func TestFilterBlocklisted_EmptyInput(t *testing.T) {
-	ctx := context.Background()
-	out := filterBlocklisted(ctx, nil, nil)
-	if len(out) != 0 {
-		t.Errorf("nil input: expected 0, got %d", len(out))
-	}
-	out2 := filterBlocklisted(ctx, nil, []newznab.SearchResult{})
-	if len(out2) != 0 {
-		t.Errorf("empty slice: expected 0, got %d", len(out2))
-	}
 }
 
 // TestSearchAndGrabBook_NoIndexers exercises SearchAndGrabBook through the

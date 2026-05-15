@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -11,48 +12,90 @@ import (
 )
 
 type BookRepo struct {
-	db *sql.DB
+	db    *sql.DB
+	files *BookFileRepo
 }
 
 func NewBookRepo(db *sql.DB) *BookRepo {
-	return &BookRepo{db: db}
+	return &BookRepo{db: db, files: NewBookFileRepo(db)}
 }
 
-const bookColumns = `id, foreign_id, author_id, title, sort_title, original_title, description,
+// bookCTE is a WITH clause that materialises the first book_files row per
+// format for every book. Using CTEs + LEFT JOINs avoids the correlated
+// subqueries that previously fired 2 N extra SQLite queries per book list.
+const bookCTE = `WITH first_ebook AS (
+	SELECT book_id, path FROM book_files
+	WHERE format = 'ebook'
+	GROUP BY book_id HAVING id = MIN(id)
+),
+first_audiobook AS (
+	SELECT book_id, path FROM book_files
+	WHERE format = 'audiobook'
+	GROUP BY book_id HAVING id = MIN(id)
+)`
+
+// bookColumns is the canonical column list for book SELECT queries.
+// ebook_file_path and audiobook_file_path are derived from book_files first
+// (so multi-file books see the first registered path), with the legacy column
+// as a fallback for rows that pre-date the migration and have not yet been
+// re-imported via AddBookFile.
+const bookColumns = `books.id, foreign_id, author_id, title, sort_title, original_title, description,
 	image_url, release_date, genres, average_rating, ratings_count, monitored, status,
 	any_edition_ok, selected_edition_id, file_path, language, media_type, narrator, duration_seconds, asin,
 	calibre_id, metadata_provider, last_metadata_refresh_at, created_at, updated_at,
-	ebook_file_path, audiobook_file_path, excluded`
+	COALESCE(fe.path, COALESCE(books.ebook_file_path, '')),
+	COALESCE(fa.path, COALESCE(books.audiobook_file_path, '')),
+	excluded`
+
+// bookJoins are the LEFT JOINs that attach the first_ebook and first_audiobook
+// CTE results to the books table. Must follow the FROM books clause.
+const bookJoins = `LEFT JOIN first_ebook    fe ON fe.book_id = books.id
+LEFT JOIN first_audiobook fa ON fa.book_id = books.id`
 
 func (r *BookRepo) List(ctx context.Context) ([]models.Book, error) {
-	return r.query(ctx, "SELECT "+bookColumns+" FROM books WHERE excluded = 0 ORDER BY sort_title", nil)
+	return r.query(ctx, bookCTE+" SELECT "+bookColumns+" FROM books "+bookJoins+" WHERE excluded = 0 ORDER BY sort_title", nil)
+}
+
+func (r *BookRepo) ListByUser(ctx context.Context, userID int64) ([]models.Book, error) {
+	where, args := QueryScope("WHERE excluded = 0", userID)
+	return r.query(ctx, bookCTE+" SELECT "+bookColumns+" FROM books "+bookJoins+" "+where+" ORDER BY sort_title", args)
 }
 
 // ListIncludingExcluded returns all books regardless of their excluded flag.
 func (r *BookRepo) ListIncludingExcluded(ctx context.Context) ([]models.Book, error) {
-	return r.query(ctx, "SELECT "+bookColumns+" FROM books ORDER BY sort_title", nil)
+	return r.query(ctx, bookCTE+" SELECT "+bookColumns+" FROM books "+bookJoins+" ORDER BY sort_title", nil)
 }
 
 func (r *BookRepo) ListByAuthor(ctx context.Context, authorID int64) ([]models.Book, error) {
-	return r.query(ctx, "SELECT "+bookColumns+" FROM books WHERE author_id = ? AND excluded = 0 ORDER BY release_date", []any{authorID})
+	return r.query(ctx, bookCTE+" SELECT "+bookColumns+" FROM books "+bookJoins+" WHERE author_id = ? AND excluded = 0 ORDER BY release_date", []any{authorID})
+}
+
+func (r *BookRepo) ListByAuthorAndUser(ctx context.Context, authorID, userID int64) ([]models.Book, error) {
+	where, args := QueryScope("WHERE author_id = ? AND excluded = 0", userID, authorID)
+	return r.query(ctx, bookCTE+" SELECT "+bookColumns+" FROM books "+bookJoins+" "+where+" ORDER BY release_date", args)
 }
 
 // ListByAuthorIncludingExcluded returns all books for an author regardless of excluded flag.
 func (r *BookRepo) ListByAuthorIncludingExcluded(ctx context.Context, authorID int64) ([]models.Book, error) {
-	return r.query(ctx, "SELECT "+bookColumns+" FROM books WHERE author_id = ? ORDER BY release_date", []any{authorID})
+	return r.query(ctx, bookCTE+" SELECT "+bookColumns+" FROM books "+bookJoins+" WHERE author_id = ? ORDER BY release_date", []any{authorID})
 }
 
 func (r *BookRepo) ListByStatus(ctx context.Context, status string) ([]models.Book, error) {
-	return r.query(ctx, "SELECT "+bookColumns+" FROM books WHERE status = ? AND monitored = 1 AND excluded = 0 ORDER BY sort_title", []any{status})
+	return r.query(ctx, bookCTE+" SELECT "+bookColumns+" FROM books "+bookJoins+" WHERE status = ? AND monitored = 1 AND excluded = 0 ORDER BY sort_title", []any{status})
+}
+
+func (r *BookRepo) ListByStatusAndUser(ctx context.Context, status string, userID int64) ([]models.Book, error) {
+	where, args := QueryScope("WHERE status = ? AND monitored = 1 AND excluded = 0", userID, status)
+	return r.query(ctx, bookCTE+" SELECT "+bookColumns+" FROM books "+bookJoins+" "+where+" ORDER BY sort_title", args)
 }
 
 // ListByStatusIncludingExcluded returns books with the given status regardless of excluded flag.
 func (r *BookRepo) ListByStatusIncludingExcluded(ctx context.Context, status string) ([]models.Book, error) {
-	return r.query(ctx, "SELECT "+bookColumns+" FROM books WHERE status = ? AND monitored = 1 ORDER BY sort_title", []any{status})
+	return r.query(ctx, bookCTE+" SELECT "+bookColumns+" FROM books "+bookJoins+" WHERE status = ? AND monitored = 1 ORDER BY sort_title", []any{status})
 }
 
 func (r *BookRepo) GetByID(ctx context.Context, id int64) (*models.Book, error) {
-	books, err := r.query(ctx, "SELECT "+bookColumns+" FROM books WHERE id = ?", []any{id})
+	books, err := r.query(ctx, bookCTE+" SELECT "+bookColumns+" FROM books "+bookJoins+" WHERE books.id = ?", []any{id})
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +106,7 @@ func (r *BookRepo) GetByID(ctx context.Context, id int64) (*models.Book, error) 
 }
 
 func (r *BookRepo) GetByForeignID(ctx context.Context, foreignID string) (*models.Book, error) {
-	books, err := r.query(ctx, "SELECT "+bookColumns+" FROM books WHERE foreign_id = ?", []any{foreignID})
+	books, err := r.query(ctx, bookCTE+" SELECT "+bookColumns+" FROM books "+bookJoins+" WHERE foreign_id = ?", []any{foreignID})
 	if err != nil {
 		return nil, err
 	}
@@ -124,14 +167,14 @@ func (r *BookRepo) Update(ctx context.Context, b *models.Book) error {
 	}
 
 	_, err = r.db.ExecContext(ctx, `
-		UPDATE books SET title=?, sort_title=?, original_title=?, description=?, image_url=?,
+		UPDATE books SET foreign_id=?, author_id=?, title=?, sort_title=?, original_title=?, description=?, image_url=?,
 		                 release_date=?, genres=?, average_rating=?, ratings_count=?,
 		                 monitored=?, status=?, any_edition_ok=?, selected_edition_id=?,
 		                 file_path=?, language=?, media_type=?, narrator=?, duration_seconds=?, asin=?,
 		                 metadata_provider=?, last_metadata_refresh_at=?, updated_at=?,
 		                 ebook_file_path=?, audiobook_file_path=?
 		WHERE id=?`,
-		b.Title, b.SortTitle, b.OriginalTitle, b.Description, b.ImageURL,
+		b.ForeignID, b.AuthorID, b.Title, b.SortTitle, b.OriginalTitle, b.Description, b.ImageURL,
 		b.ReleaseDate, string(genresJSON), b.AverageRating, b.RatingsCount,
 		b.Monitored, b.Status, b.AnyEditionOK, b.SelectedEditionID,
 		b.FilePath, b.Language, mediaType, b.Narrator, b.DurationSeconds, b.ASIN,
@@ -144,35 +187,119 @@ func (r *BookRepo) Update(ctx context.Context, b *models.Book) error {
 	return nil
 }
 
-// SetFormatFilePath records the on-disk path for a specific format ('ebook'
-// or 'audiobook') and recomputes the book's aggregate status:
-//   - status = 'imported' when all formats the book wants are now on disk.
-//   - status unchanged otherwise (typically 'wanted' or 'downloading').
-//
-// The legacy file_path column is kept in sync with the most-recently-set
-// format path for Calibre integration compatibility.
-func (r *BookRepo) SetFormatFilePath(ctx context.Context, id int64, mediaType, filePath string) error {
-	b, err := r.GetByID(ctx, id)
+// MarkWantedMonitored updates only the fields needed to queue a book for
+// searching, preserving metadata that may not be present on sparse callers.
+func (r *BookRepo) MarkWantedMonitored(ctx context.Context, id int64) error {
+	now := time.Now().UTC()
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE books SET status = ?, monitored = 1, updated_at = ? WHERE id = ?`,
+		models.BookStatusWanted, now, id)
 	if err != nil {
-		return fmt.Errorf("SetFormatFilePath: load book %d: %w", id, err)
+		return fmt.Errorf("mark book %d wanted: %w", id, err)
+	}
+	return nil
+}
+
+// AddBookFile records a new on-disk file in book_files and refreshes the
+// book's aggregate status. Multiple files for the same format are all tracked
+// (e.g. epub + mobi + pdf from a multi-file download).
+func (r *BookRepo) AddBookFile(ctx context.Context, bookID int64, format, path string) error {
+	if err := r.files.Add(ctx, bookID, format, path); err != nil {
+		return err
+	}
+	return r.refreshBookStatus(ctx, bookID)
+}
+
+// ListFiles returns all book_files rows for the given book.
+func (r *BookRepo) ListFiles(ctx context.Context, bookID int64) ([]models.BookFile, error) {
+	return r.files.ListByBook(ctx, bookID)
+}
+
+// RemoveBookFile deletes the book_files row for the given on-disk path and
+// refreshes the book's aggregate status. Returns the updated book, or nil if
+// the path was not in book_files.
+func (r *BookRepo) RemoveBookFile(ctx context.Context, path string) (*models.Book, error) {
+	bookID, err := r.files.DeleteByPath(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if bookID == 0 {
+		return nil, nil // not tracked
+	}
+	b, err := r.GetByID(ctx, bookID)
+	if err != nil || b == nil {
+		return nil, err
+	}
+	if err := r.refreshBookStatus(ctx, bookID); err != nil {
+		return nil, err
+	}
+	return r.GetByID(ctx, bookID)
+}
+
+// ListAllBookFilePaths returns every path in book_files.
+// Used by ScanLibrary to build the set of already-tracked files efficiently.
+func (r *BookRepo) ListAllBookFilePaths(ctx context.Context) ([]string, error) {
+	return r.files.ListAllPaths(ctx)
+}
+
+// refreshBookStatus recomputes the aggregate status for a book from its
+// current book_files rows and updates both the status and legacy columns.
+// It queries book_files directly so the result is always authoritative,
+// bypassing the legacy-column fallback in bookColumns.
+func (r *BookRepo) refreshBookStatus(ctx context.Context, bookID int64) error {
+	b, err := r.GetByID(ctx, bookID)
+	if err != nil {
+		return fmt.Errorf("refreshBookStatus: load book: %w", err)
 	}
 	if b == nil {
-		return fmt.Errorf("SetFormatFilePath: book %d not found", id)
+		return nil
 	}
 
-	switch mediaType {
-	case models.MediaTypeAudiobook:
-		b.AudiobookFilePath = filePath
-	default: // 'ebook' or any legacy value
-		b.EbookFilePath = filePath
+	// Query book_files directly to get the true first path per format.
+	// This bypasses the COALESCE legacy-column fallback in bookColumns so
+	// removing the last book_files entry correctly clears the field.
+	var ebookPath, audiobookPath string
+	if err := r.db.QueryRowContext(ctx,
+		`SELECT COALESCE(path,'') FROM book_files WHERE book_id=? AND format='ebook' ORDER BY id LIMIT 1`,
+		bookID).Scan(&ebookPath); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("refreshBookStatus: read ebook path: %w", err)
 	}
-	b.FilePath = filePath // keep legacy column in sync
+	if err := r.db.QueryRowContext(ctx,
+		`SELECT COALESCE(path,'') FROM book_files WHERE book_id=? AND format='audiobook' ORDER BY id LIMIT 1`,
+		bookID).Scan(&audiobookPath); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("refreshBookStatus: read audiobook path: %w", err)
+	}
 
+	b.EbookFilePath = ebookPath
+	b.AudiobookFilePath = audiobookPath
+
+	// Derive status from which formats still need files.
 	if !b.NeedsEbook() && !b.NeedsAudiobook() {
 		b.Status = models.BookStatusImported
+	} else if b.Status == models.BookStatusImported {
+		b.Status = models.BookStatusWanted
+	}
+
+	// Keep legacy file_path column in sync with the first available file path.
+	if ebookPath != "" {
+		b.FilePath = ebookPath
+	} else if audiobookPath != "" {
+		b.FilePath = audiobookPath
+	} else {
+		b.FilePath = ""
 	}
 
 	return r.Update(ctx, b)
+}
+
+// SetFormatFilePath records the on-disk path for a specific format and
+// recomputes the book's aggregate status. It now writes to book_files
+// (allowing multiple files per format) rather than overwriting a single column.
+// Callers processing multiple files should call AddBookFile for each file.
+// SetFormatFilePath is retained for single-canonical-path callers (e.g.
+// audiobook folder imports, rescan).
+func (r *BookRepo) SetFormatFilePath(ctx context.Context, id int64, mediaType, filePath string) error {
+	return r.AddBookFile(ctx, id, mediaType, filePath)
 }
 
 // SetFilePath is a backward-compatible wrapper around SetFormatFilePath that
@@ -216,7 +343,7 @@ func (r *BookRepo) ListImportedMissingCalibreID(ctx context.Context) ([]models.B
 // as its primary idempotency key — a second import pass sees the existing
 // row and updates in place instead of duplicating.
 func (r *BookRepo) GetByCalibreID(ctx context.Context, calibreID int64) (*models.Book, error) {
-	books, err := r.query(ctx, "SELECT "+bookColumns+" FROM books WHERE calibre_id = ?", []any{calibreID})
+	books, err := r.query(ctx, bookCTE+" SELECT "+bookColumns+" FROM books "+bookJoins+" WHERE calibre_id = ?", []any{calibreID})
 	if err != nil {
 		return nil, err
 	}
@@ -234,7 +361,7 @@ func (r *BookRepo) GetByCalibreID(ctx context.Context, calibreID int64) (*models
 // duplicate.
 func (r *BookRepo) FindByAuthorAndTitle(ctx context.Context, authorID int64, title string) (*models.Book, error) {
 	books, err := r.query(ctx,
-		"SELECT "+bookColumns+" FROM books WHERE author_id = ? AND LOWER(title) = LOWER(?)",
+		bookCTE+" SELECT "+bookColumns+" FROM books "+bookJoins+" WHERE author_id = ? AND LOWER(title) = LOWER(?)",
 		[]any{authorID, title})
 	if err != nil {
 		return nil, err
@@ -256,6 +383,7 @@ func (r *BookRepo) SetExcluded(ctx context.Context, id int64, excluded bool) err
 }
 
 func (r *BookRepo) Delete(ctx context.Context, id int64) error {
+	// book_files rows are removed via ON DELETE CASCADE on the FK.
 	_, err := r.db.ExecContext(ctx, "DELETE FROM books WHERE id=?", id)
 	return err
 }

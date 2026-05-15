@@ -4,26 +4,69 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
+	"sync"
 
 	"github.com/vavallee/bindery/internal/db"
+	"github.com/vavallee/bindery/internal/decision"
 	"github.com/vavallee/bindery/internal/httpsec"
 	"github.com/vavallee/bindery/internal/indexer"
 	"github.com/vavallee/bindery/internal/indexer/newznab"
 	"github.com/vavallee/bindery/internal/models"
 )
 
+// lastDebugStore holds the audit trail from the most recent SearchBook run.
+// Only the single latest entry is kept — the debug panel surfaces "what
+// happened on the last search", not a history. Handler calls come from
+// different goroutines, so access is mutex-guarded.
+type lastDebugStore struct {
+	mu  sync.RWMutex
+	dbg *indexer.SearchDebug
+}
+
+func (s *lastDebugStore) set(d *indexer.SearchDebug) {
+	s.mu.Lock()
+	s.dbg = d
+	s.mu.Unlock()
+}
+
+func (s *lastDebugStore) get() *indexer.SearchDebug {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.dbg
+}
+
+// indexerSearcher is the subset of indexer.Searcher used by IndexerHandler.
+// It is an interface so tests can inject a mock.
+type indexerSearcher interface {
+	SearchBookWithDebug(ctx context.Context, indexers []models.Indexer, c indexer.MatchCriteria) ([]newznab.SearchResult, *indexer.SearchDebug)
+	SearchQuery(ctx context.Context, indexers []models.Indexer, query string) []newznab.SearchResult
+}
+
 type IndexerHandler struct {
 	indexers  *db.IndexerRepo
 	books     *db.BookRepo
 	authors   *db.AuthorRepo
+	aliases   *db.AuthorAliasRepo
 	profiles  *db.MetadataProfileRepo
-	searcher  *indexer.Searcher
+	searcher  indexerSearcher
 	settings  *db.SettingsRepo
 	blocklist *db.BlocklistRepo
+	lastDebug *lastDebugStore
 }
 
-func NewIndexerHandler(indexers *db.IndexerRepo, books *db.BookRepo, authors *db.AuthorRepo, profiles *db.MetadataProfileRepo, searcher *indexer.Searcher, settings *db.SettingsRepo, blocklist *db.BlocklistRepo) *IndexerHandler {
-	return &IndexerHandler{indexers: indexers, books: books, authors: authors, profiles: profiles, searcher: searcher, settings: settings, blocklist: blocklist}
+func NewIndexerHandler(indexers *db.IndexerRepo, books *db.BookRepo, authors *db.AuthorRepo, profiles *db.MetadataProfileRepo, searcher indexerSearcher, settings *db.SettingsRepo, blocklist *db.BlocklistRepo) *IndexerHandler {
+	return &IndexerHandler{
+		indexers: indexers, books: books, authors: authors, profiles: profiles,
+		searcher: searcher, settings: settings, blocklist: blocklist,
+		lastDebug: &lastDebugStore{},
+	}
+}
+
+// WithAliases attaches the author alias repo used to populate AuthorAliases in MatchCriteria.
+func (h *IndexerHandler) WithAliases(aliases *db.AuthorAliasRepo) *IndexerHandler {
+	h.aliases = aliases
+	return h
 }
 
 func (h *IndexerHandler) List(w http.ResponseWriter, r *http.Request) {
@@ -132,6 +175,22 @@ func (h *IndexerHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// IndexerTestResponse summarizes a connectivity and search probe. The
+// handler always returns HTTP 200 on a reachable-but-failed probe (e.g. 401
+// from the upstream indexer) so the UI can render the specific error inline
+// instead of a generic "request failed" toast.
+type IndexerTestResponse struct {
+	OK            bool   `json:"ok"`
+	Status        int    `json:"status"`
+	Categories    int    `json:"categories"`
+	BookSearch    bool   `json:"bookSearch"`
+	LatencyMs     int64  `json:"latencyMs"`
+	SearchResults int    `json:"searchResults"`
+	SearchError   string `json:"searchError,omitempty"`
+	Message       string `json:"message,omitempty"`
+	Error         string `json:"error,omitempty"`
+}
+
 func (h *IndexerHandler) Test(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseID(w, r)
 	if !ok {
@@ -144,11 +203,23 @@ func (h *IndexerHandler) Test(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := newznab.New(idx.URL, idx.APIKey)
-	if err := client.Test(r.Context()); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	probe := client.Probe(r.Context())
+	resp := IndexerTestResponse{
+		Status:        probe.Status,
+		Categories:    probe.Categories,
+		BookSearch:    probe.BookSearch,
+		LatencyMs:     probe.LatencyMs,
+		SearchResults: probe.SearchResults,
+		SearchError:   probe.SearchError,
+	}
+	if probe.Error != "" {
+		resp.Error = probe.Error
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"message": "ok"})
+	resp.OK = true
+	resp.Message = "ok"
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // SearchBook searches all enabled indexers for a specific book.
@@ -169,12 +240,20 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve author name and metadata profile for better search results.
+	// Resolve author name, metadata profile and aliases for better search results.
 	authorName := ""
 	var allowedLangs []string
+	var authorAliases []string
 	if author, err := h.authors.GetByID(r.Context(), book.AuthorID); err == nil && author != nil {
 		authorName = author.Name
 		allowedLangs = h.resolveAllowedLanguages(r.Context(), author)
+		if h.aliases != nil {
+			if aliases, err := h.aliases.ListByAuthor(r.Context(), author.ID); err == nil {
+				for _, a := range aliases {
+					authorAliases = append(authorAliases, a.Name)
+				}
+			}
+		}
 	}
 
 	crit := indexer.MatchCriteria{
@@ -183,35 +262,149 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 		MediaType:        book.MediaType,
 		ASIN:             book.ASIN,
 		AllowedLanguages: allowedLangs,
+		AuthorAliases:    authorAliases,
 	}
 	if book.ReleaseDate != nil {
 		crit.Year = book.ReleaseDate.Year()
 	}
 
-	results := h.searcher.SearchBook(r.Context(), idxs, crit)
+	// For dual-format books (media_type='both'), run one search per format so
+	// each uses its own category tree (7xxx for ebooks, 3xxx for audiobooks).
+	// A single "both" search falls through to the ebook branch in
+	// filterCategoriesForMedia, silently dropping all audiobook results.
+	var results []newznab.SearchResult
+	var dbg *indexer.SearchDebug
+	if book.MediaType == models.MediaTypeBoth {
+		ebookCrit := crit
+		ebookCrit.MediaType = models.MediaTypeEbook
+		audioCrit := crit
+		audioCrit.MediaType = models.MediaTypeAudiobook
 
-	// Apply language filter using the author's metadata-profile allowed languages.
-	// Fall back to the global search.preferredLanguage setting when no profile is found.
+		type searchOut struct {
+			results []newznab.SearchResult
+			dbg     *indexer.SearchDebug
+		}
+		ctx := r.Context()
+		ebookCh := make(chan searchOut, 1)
+		audioCh := make(chan searchOut, 1)
+		go func() {
+			res, d := h.searcher.SearchBookWithDebug(ctx, idxs, ebookCrit)
+			for i := range res {
+				res[i].MediaType = "ebook"
+			}
+			ebookCh <- searchOut{res, d}
+		}()
+		go func() {
+			res, d := h.searcher.SearchBookWithDebug(ctx, idxs, audioCrit)
+			for i := range res {
+				res[i].MediaType = "audiobook"
+			}
+			audioCh <- searchOut{res, d}
+		}()
+		ebookOut := <-ebookCh
+		audioOut := <-audioCh
+		ebookResults, ebookDbg := ebookOut.results, ebookOut.dbg
+		audioResults, audioDbg := audioOut.results, audioOut.dbg
+		results = append(ebookResults, audioResults...)
+		results = indexer.DedupeResults(results)
+		// Merge debug info from both searches.
+		if ebookDbg != nil && audioDbg != nil {
+			merged := *ebookDbg
+			merged.Indexers = append(merged.Indexers, audioDbg.Indexers...)
+			merged.Filters = append(merged.Filters, audioDbg.Filters...)
+			merged.Pipeline.RawCount += audioDbg.Pipeline.RawCount
+			merged.DurationMs += audioDbg.DurationMs
+			dbg = &merged
+		} else if audioDbg != nil {
+			dbg = audioDbg
+		} else {
+			dbg = ebookDbg
+		}
+	} else {
+		results, dbg = h.searcher.SearchBookWithDebug(r.Context(), idxs, crit)
+	}
+
+	// Build decision specs.
+	var specs []decision.Specification
+
+	// Language filter: author profile takes precedence, fall back to global setting.
 	lang := langFilterFromAllowed(allowedLangs)
 	if lang == "" {
 		if s, _ := h.settings.Get(r.Context(), "search.preferredLanguage"); s != nil {
 			lang = s.Value
 		}
 	}
+	beforeLang := len(results)
 	results = indexer.FilterByLanguage(results, lang)
-
-	// Filter out blocklisted GUIDs so they never surface again.
-	if h.blocklist != nil {
-		filtered := make([]newznab.SearchResult, 0, len(results))
-		for _, res := range results {
-			if blocked, _ := h.blocklist.IsBlocked(r.Context(), res.GUID); !blocked {
-				filtered = append(filtered, res)
-			}
-		}
-		results = filtered
+	if dbg != nil && beforeLang != len(results) {
+		dbg.Filters = append(dbg.Filters, indexer.FilterDebug{
+			Stage:  "language",
+			Reason: "release name matched a foreign-language tag (filter=" + lang + ")",
+			Title:  "(" + strconv.Itoa(beforeLang-len(results)) + " result(s) dropped)",
+		})
 	}
 
-	writeJSON(w, http.StatusOK, results)
+	// Blocklist spec.
+	if h.blocklist != nil {
+		entries, _ := h.blocklist.List(r.Context())
+		specs = append(specs, decision.NewBlocklistedSpec(entries))
+	}
+
+	// Already-imported spec.
+	specs = append(specs, decision.AlreadyImportedSpec{})
+
+	dm := decision.New(specs...)
+	releases := make([]decision.Release, len(results))
+	for i, res := range results {
+		releases[i] = decision.ReleaseFromSearchResult(res)
+	}
+
+	decisions := dm.Evaluate(releases, *book)
+
+	type searchDecision struct {
+		newznab.SearchResult
+		Approved  bool   `json:"approved"`
+		Rejection string `json:"rejection,omitempty"`
+	}
+	out := make([]searchDecision, len(decisions))
+	for i, d := range decisions {
+		out[i] = searchDecision{
+			SearchResult: results[i],
+			Approved:     d.Approved,
+			Rejection:    d.Rejection,
+		}
+		if !d.Approved && dbg != nil {
+			dbg.Filters = append(dbg.Filters, indexer.FilterDebug{
+				Title:       results[i].Title,
+				IndexerName: results[i].IndexerName,
+				Stage:       "decision",
+				Reason:      d.Rejection,
+			})
+		}
+	}
+
+	// Remember the most recent debug payload so the UI can re-fetch it
+	// (e.g. after a page reload) without having to re-run the search.
+	if dbg != nil {
+		h.lastDebug.set(dbg)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"results": out,
+		"debug":   dbg,
+	})
+}
+
+// LastSearchDebug returns the audit trail captured during the most recent
+// SearchBook invocation on this bindery instance, or 404 if no search has
+// run yet.
+func (h *IndexerHandler) LastSearchDebug(w http.ResponseWriter, r *http.Request) {
+	dbg := h.lastDebug.get()
+	if dbg == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no search has run yet"})
+		return
+	}
+	writeJSON(w, http.StatusOK, dbg)
 }
 
 // resolveAllowedLanguages returns the parsed allowed-language list for an

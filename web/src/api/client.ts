@@ -1,20 +1,63 @@
-const BASE = '/api/v1'
+// Path prefix injected by the backend at serve time (empty for root-mounted
+// deploys). Read once at module load so all API calls and redirects use a
+// consistent value throughout the session.
+const BINDERY_BASE: string = (window as unknown as { __BINDERY_BASE__?: string }).__BINDERY_BASE__ ?? ''
+const BASE = `${BINDERY_BASE}/api/v1`
 
 // Pages that render before the user is authenticated — reaching /auth/status
 // will 401 in enabled mode before setup, which is expected, and we must not
 // try to redirect to /login from the login/setup pages themselves.
-const PUBLIC_PATHS = new Set(['/login', '/setup'])
+const PUBLIC_PATHS = new Set([`${BINDERY_BASE}/login`, `${BINDERY_BASE}/setup`])
+
+// CSRF double-submit token, fetched once on init and refreshed after login.
+let csrfToken = ''
+
+// Read from the bindery_csrf cookie (set by GET /auth/csrf).
+function readCSRFCookie(): string {
+  const m = document.cookie.match(/(?:^|;\s*)bindery_csrf=([^;]+)/)
+  return m ? decodeURIComponent(m[1]) : ''
+}
+
+export async function initCSRF(): Promise<void> {
+  try {
+    const res = await fetch(`${BASE}/auth/csrf`, {
+      credentials: 'include',
+      headers: { 'X-Requested-With': 'bindery-ui' },
+    })
+    if (res.ok) {
+      const data = await res.json()
+      csrfToken = data.csrfToken || readCSRFCookie()
+    }
+  } catch {
+    // Non-fatal — mutations will fail with 403 if still missing.
+  }
+}
+
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  // Merge caller-supplied headers on top of the defaults so we can't lose
+  // the CSRF header if a caller passes their own `headers`.
+  const headers = new Headers({
+    'Content-Type': 'application/json',
+    'X-Requested-With': 'bindery-ui',
+  })
+  const method = (options?.method ?? 'GET').toUpperCase()
+  if (!SAFE_METHODS.has(method) && csrfToken) {
+    headers.set('X-CSRF-Token', csrfToken)
+  }
+  if (options?.headers) {
+    new Headers(options.headers).forEach((v, k) => headers.set(k, v))
+  }
   const res = await fetch(`${BASE}${path}`, {
     credentials: 'include', // send + accept the session cookie
-    headers: { 'Content-Type': 'application/json' },
     ...options,
+    headers,
   })
   if (res.status === 401 && !PUBLIC_PATHS.has(window.location.pathname)) {
     // Session expired or missing — punt to login. The router there will
     // bounce to /setup if no user exists yet.
-    window.location.href = '/login'
+    window.location.href = `${BINDERY_BASE}/login`
     throw new Error('unauthorized')
   }
   if (!res.ok) {
@@ -29,7 +72,28 @@ export interface AuthStatus {
   authenticated: boolean
   setupRequired: boolean
   username?: string
-  mode: 'enabled' | 'local-only' | 'disabled'
+  role?: string
+  mode: 'enabled' | 'local-only' | 'disabled' | 'proxy'
+  localAuthEnabled: boolean
+}
+
+export interface ManagedUser {
+  id: number
+  username: string
+  role: string
+  email?: string
+  displayName?: string
+  createdAt: string
+}
+
+export interface SystemStatus {
+  version: string
+  commit: string
+  buildDate: string
+  imageCacheBytes?: number
+  enhancedHardcoverApi: boolean
+  hardcoverTokenConfigured: boolean
+  enhancedHardcoverDisabledReason?: 'env_disabled' | 'missing_token' | 'admin_disabled' | string
 }
 
 export interface AuthConfig {
@@ -38,27 +102,92 @@ export interface AuthConfig {
   username: string
 }
 
+export interface OidcProviderStatus {
+  state: 'ok' | 'failed'
+  last_error?: string
+  last_attempt?: string
+}
+
+export interface OidcProvider {
+  id: string
+  name: string
+  // Optional runtime status. Present on responses from a backend that
+  // tracks failed-discovery state; absent for older backends.
+  status?: OidcProviderStatus
+}
+
+export interface OidcProviderConfig {
+  id: string
+  name: string
+  issuer: string
+  client_id: string
+  client_secret: string
+  scopes: string[]
+}
+
 export const api = {
   // System
   health: () => request<{ status: string; version: string }>('/health'),
-  status: () => request<{ version: string; commit: string; buildDate: string }>('/system/status'),
-  getLogs: (level?: string, limit?: number) =>
-    request<LogEntry[]>(`/system/logs${level || limit ? '?' + new URLSearchParams({
-      ...(level ? { level } : {}),
-      ...(limit ? { limit: String(limit) } : {}),
-    }) : ''}`),
+  status: () => request<SystemStatus>('/system/status'),
+  getLogs: (params?: { level?: string; component?: string; from?: string; to?: string; q?: string; limit?: number; offset?: number }) => {
+    const p: Record<string, string> = {}
+    if (params?.level) p.level = params.level
+    if (params?.component) p.component = params.component
+    if (params?.from) p.from = params.from
+    if (params?.to) p.to = params.to
+    if (params?.q) p.q = params.q
+    if (params?.limit) p.limit = String(params.limit)
+    if (params?.offset) p.offset = String(params.offset)
+    const qs = new URLSearchParams(p).toString()
+    return request<LogEntry[]>(`/system/logs${qs ? '?' + qs : ''}`)
+  },
   getLogLevel: () => request<{ level: string }>('/system/loglevel'),
   setLogLevel: (level: string) =>
     request<{ level: string }>('/system/loglevel', { method: 'PUT', body: JSON.stringify({ level }) }),
+  getStorage: () =>
+    request<{ downloadDir: string; audiobookDownloadDir: string; libraryDir: string; audiobookDir: string }>('/system/storage'),
 
   // Auth
   authStatus: () => request<AuthStatus>('/auth/status'),
-  authLogin: (username: string, password: string, rememberMe: boolean) =>
-    request<{ ok: boolean; username: string }>('/auth/login', {
+  oidcProviders: () => request<OidcProvider[]>('/auth/oidc/providers'),
+  oidcSetProviders: (providers: OidcProviderConfig[]) =>
+    request<void>('/auth/oidc/providers', { method: 'PUT', body: JSON.stringify(providers) }),
+  // Returns the public base URL Bindery will use as the prefix for OIDC
+  // callback URLs (resolved from the current request) plus the path template
+  // with `{id}` placeholder. The settings UI uses these to live-render the
+  // redirect URI as the admin types the provider id.
+  oidcRedirectBase: () => request<{ base: string; callback_path: string; configured: boolean }>('/auth/oidc/redirect-base'),
+  // Probes <issuer>/.well-known/openid-configuration server-side. ok=false
+  // means the IdP is unreachable / wrong / not OIDC; the error string is
+  // safe to render directly. issuer_mismatch=true is the silent killer for
+  // Authentik per-provider mode and Keycloak realms.
+  oidcTestDiscovery: (issuer: string) =>
+    request<{
+      ok: boolean
+      error?: string
+      issuer_mismatch?: boolean
+      discovered?: {
+        issuer: string
+        authorization_endpoint: string
+        token_endpoint: string
+        userinfo_endpoint?: string
+        jwks_uri?: string
+        scopes_supported?: string[]
+      }
+    }>('/auth/oidc/test-discovery', { method: 'POST', body: JSON.stringify({ issuer }) }),
+  authLogin: async (username: string, password: string, rememberMe: boolean) => {
+    const res = await request<{ ok: boolean; username: string }>('/auth/login', {
       method: 'POST',
       body: JSON.stringify({ username, password, rememberMe }),
-    }),
-  authLogout: () => request<{ ok: boolean }>('/auth/logout', { method: 'POST' }),
+    })
+    await initCSRF()
+    return res
+  },
+  authLogout: async () => {
+    const res = await request<{ ok: boolean }>('/auth/logout', { method: 'POST' })
+    csrfToken = ''
+    return res
+  },
   authSetup: (username: string, password: string) =>
     request<{ ok: boolean }>('/auth/setup', {
       method: 'POST',
@@ -77,6 +206,14 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ mode }),
     }),
+  listUsers: () => request<ManagedUser[]>('/auth/users'),
+  createUser: (username: string, password: string, role: string) =>
+    request<ManagedUser>('/auth/users', { method: 'POST', body: JSON.stringify({ username, password, role }) }),
+  deleteUser: (id: number) => request<{ ok: boolean }>(`/auth/users/${id}`, { method: 'DELETE' }),
+  setUserRole: (id: number, role: string) =>
+    request<{ ok: boolean }>(`/auth/users/${id}/role`, { method: 'PUT', body: JSON.stringify({ role }) }),
+  resetUserPassword: (id: number, password: string) =>
+    request<{ ok: boolean }>(`/auth/users/${id}/reset-password`, { method: 'PUT', body: JSON.stringify({ password }) }),
 
   // Metadata search
   searchAuthors: (term: string) => request<Author[]>(`/search/author?term=${encodeURIComponent(term)}`),
@@ -95,6 +232,7 @@ export const api = {
   deleteAuthor: (id: number, deleteFiles = false) =>
     request<void>(`/author/${id}${deleteFiles ? '?deleteFiles=true' : ''}`, { method: 'DELETE' }),
   refreshAuthor: (id: number) => request<void>(`/author/${id}/refresh`, { method: 'POST' }),
+  relinkAuthorUpstream: (id: number) => request<Author>(`/author/${id}/relink-upstream`, { method: 'POST' }),
   listAuthorAliases: (id: number) => request<AuthorAlias[]>(`/author/${id}/aliases`),
   mergeAuthors: (targetId: number, sourceId: number, overwriteDefaults = true) =>
     request<MergeAuthorsResult>(`/author/${targetId}/merge`, {
@@ -116,9 +254,12 @@ export const api = {
   deleteBook: (id: number, deleteFiles = false) =>
     request<void>(`/book/${id}${deleteFiles ? '?deleteFiles=true' : ''}`, { method: 'DELETE' }),
   deleteBookFile: (id: number, queryParams = '') => request<Book>(`/book/${id}/file${queryParams}`, { method: 'DELETE' }),
-  searchBook: (id: number) => request<SearchResult[]>(`/book/${id}/search`, { method: 'POST' }),
+  searchBook: (id: number) => request<SearchBookResponse>(`/book/${id}/search`, { method: 'POST' }),
+  getLastSearchDebug: () => request<SearchDebug>(`/search/last-debug`),
   enrichAudiobook: (id: number) => request<Book>(`/book/${id}/enrich-audiobook`, { method: 'POST' }),
   toggleExcluded: (id: number) => request<Book>(`/book/${id}/exclude`, { method: 'PUT' }),
+  rebindBook: (id: number, provider: 'openlibrary' | 'hardcover', foreignId: string, force = false) =>
+    request<Book>(`/book/${id}/rebind`, { method: 'POST', body: JSON.stringify({ provider, foreign_id: foreignId, force }) }),
 
   // Wanted
   listWanted: (opts?: { includeExcluded?: boolean }) => {
@@ -127,8 +268,10 @@ export const api = {
   },
 
   // Bulk actions
-  bulkActionAuthors: (ids: number[], action: AuthorBulkAction) =>
-    request<BulkResult>('/author/bulk', { method: 'POST', body: JSON.stringify({ ids, action }) }),
+  bulkActionAuthors: (ids: number[], action: AuthorBulkAction, mediaType?: MediaType) =>
+    request<BulkResult>('/author/bulk', { method: 'POST', body: JSON.stringify({ ids, action, ...(mediaType ? { mediaType } : {}) }) }),
+  searchAuthorWanted: (id: number) =>
+    request<BulkResult>('/author/bulk', { method: 'POST', body: JSON.stringify({ ids: [id], action: 'search' }) }),
   bulkActionBooks: (ids: number[], action: BookBulkAction, mediaType?: MediaType) =>
     request<BulkResult>('/book/bulk', { method: 'POST', body: JSON.stringify({ ids, action, ...(mediaType ? { mediaType } : {}) }) }),
   bulkActionWanted: (ids: number[], action: WantedBulkAction) =>
@@ -139,7 +282,7 @@ export const api = {
   addIndexer: (data: Partial<Indexer>) => request<Indexer>('/indexer', { method: 'POST', body: JSON.stringify(data) }),
   updateIndexer: (id: number, data: Partial<Indexer>) => request<Indexer>(`/indexer/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteIndexer: (id: number) => request<void>(`/indexer/${id}`, { method: 'DELETE' }),
-  testIndexer: (id: number) => request<{ message: string }>(`/indexer/${id}/test`, { method: 'POST' }),
+  testIndexer: (id: number) => request<IndexerTestResult>(`/indexer/${id}/test`, { method: 'POST' }),
 
   // Prowlarr indexer sync
   listProwlarr: () => request<ProwlarrInstance[]>('/prowlarr'),
@@ -159,12 +302,24 @@ export const api = {
 
   // Library
   triggerLibraryScan: () => request<{ message: string }>('/library/scan', { method: 'POST' }),
-  libraryScanStatus: () => request<{ ran_at: string; files_found: number; reconciled: number; unmatched: number }>('/library/scan/status'),
+  libraryScanStatus: () => request<{
+    ran_at: string
+    files_found: number
+    reconciled: number
+    unmatched: number
+    tag_read_failed?: number
+    unmatched_files?: Array<{ path: string; parsed_title: string; parsed_author: string }>
+  }>('/library/scan/status'),
 
   // Queue
   listQueue: () => request<QueueItem[]>('/queue'),
   grab: (data: GrabRequest) => request<Download>('/queue/grab', { method: 'POST', body: JSON.stringify(data) }),
   deleteFromQueue: (id: number) => request<void>(`/queue/${id}`, { method: 'DELETE' }),
+
+  // Pending releases
+  listPending: () => request<PendingRelease[]>('/pending'),
+  dismissPending: (id: number) => request<void>(`/pending/${id}`, { method: 'DELETE' }),
+  grabPending: (id: number) => request<Download>(`/pending/${id}/grab`, { method: 'POST' }),
 
   // History
   listHistory: (params?: { bookId?: number; eventType?: string }) => {
@@ -194,7 +349,30 @@ export const api = {
 
   // Series
   listSeries: () => request<Series[]>('/series'),
+  createSeries: (data: { title: string }) => request<Series>('/series', { method: 'POST', body: JSON.stringify(data) }),
   getSeries: (id: number) => request<Series>(`/series/${id}`),
+  updateSeries: (id: number, data: { title: string }) => request<Series>(`/series/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  monitorSeries: (id: number, monitored: boolean) => request<{ monitored: boolean }>(`/series/${id}`, { method: 'PATCH', body: JSON.stringify({ monitored }) }),
+  deleteSeries: (id: number) => request<void>(`/series/${id}`, { method: 'DELETE' }),
+  linkBookToSeries: (id: number, data: { bookId: number; positionInSeries: string; primarySeries: boolean }) =>
+    request<Series>(`/series/${id}/books`, { method: 'POST', body: JSON.stringify(data) }),
+  fillSeries: (id: number, book?: SeriesFillBookRequest) =>
+    request<{ queued: number }>(`/series/${id}/fill`, {
+      method: 'POST',
+      ...(book ? { body: JSON.stringify(book) } : {}),
+    }),
+  searchHardcoverSeries: (term: string, limit = 10) =>
+    request<SeriesHardcoverSearchResult[]>(`/series/hardcover/search?term=${encodeURIComponent(term)}&limit=${limit}`),
+  getSeriesHardcoverLink: (id: number) => request<SeriesHardcoverLink>(`/series/${id}/hardcover-link`),
+  autoLinkSeriesHardcover: (id: number) =>
+    request<SeriesHardcoverAutoResponse>(`/series/${id}/hardcover-link/auto`, { method: 'POST' }),
+  linkSeriesHardcover: (id: number, result: SeriesHardcoverSearchResult) =>
+    request<SeriesHardcoverLink>(`/series/${id}/hardcover-link`, {
+      method: 'PUT',
+      body: JSON.stringify(result),
+    }),
+  unlinkSeriesHardcover: (id: number) => request<{ success: boolean }>(`/series/${id}/hardcover-link`, { method: 'DELETE' }),
+  getSeriesHardcoverDiff: (id: number) => request<SeriesHardcoverDiff>(`/series/${id}/hardcover-diff`),
 
   // Tags
   listTags: () => request<Tag[]>('/tag'),
@@ -205,23 +383,73 @@ export const api = {
   listSettings: () => request<Array<{ key: string; value: string }>>('/setting'),
   getSetting: (key: string) => request<{ key: string; value: string }>(`/setting/${key}`),
   setSetting: (key: string, value: string) => request<void>(`/setting/${key}`, { method: 'PUT', body: JSON.stringify({ value }) }),
+  testHardcover: () => request<HardcoverTestResult>('/hardcover/test', { method: 'POST' }),
 
   // Backup
-  listBackups: () => request<string[]>('/backup'),
-  createBackup: () => request<{ filename: string }>('/backup', { method: 'POST' }),
+  listBackups: () => request<Array<{ name: string; size: number; modTime: string }>>('/backup'),
+  createBackup: () => request<{ name: string; size: number; modTime: string }>('/backup', { method: 'POST' }),
+  deleteBackup: (filename: string) => request<void>(`/backup/${encodeURIComponent(filename)}`, { method: 'DELETE' }),
 
   // Calibre
   testCalibre: () => request<CalibreTestResult>('/calibre/test', { method: 'POST' }),
   calibreTestPaths: () => request<{ ok: string; message: string }>('/calibre/test-paths', { method: 'POST' }),
   calibreImportStart: () => request<CalibreImportProgress>('/calibre/import', { method: 'POST' }),
   calibreImportStatus: () => request<CalibreImportProgress>('/calibre/import/status'),
+  calibreSyncStart: () => request<CalibreSyncProgress>('/calibre/sync', { method: 'POST' }),
+  calibreSyncStatus: () => request<CalibreSyncProgress>('/calibre/sync/status'),
+
+  // Grimmory
+  grimmoryConfig: () => request<GrimmoryConfig>('/grimmory/config'),
+  grimmorySetConfig: (data: { enabled?: boolean; baseUrl?: string; apiKey?: string }) =>
+    request<GrimmoryConfig>('/grimmory/config', { method: 'PUT', body: JSON.stringify(data) }),
+  grimmoryTest: (data?: { baseUrl?: string; apiKey?: string }) =>
+    request<GrimmoryTestResult>('/grimmory/test', { method: 'POST', body: JSON.stringify(data ?? {}) }),
+
+  // Audiobookshelf
+  absConfig: () => request<ABSConfig>('/abs/config'),
+  absSetConfig: (data: { baseUrl: string; label: string; enabled: boolean; libraryId: string; pathRemap: string; apiKey?: string }) =>
+    request<ABSConfig>('/abs/config', { method: 'PUT', body: JSON.stringify(data) }),
+  absTest: (data?: { baseUrl?: string; apiKey?: string }) =>
+    request<ABSTestResult>('/abs/test', { method: 'POST', body: JSON.stringify(data ?? {}) }),
+  absLibraries: (data?: { baseUrl?: string; apiKey?: string }) =>
+    request<ABSLibrary[]>('/abs/libraries', { method: 'POST', body: JSON.stringify(data ?? {}) }),
+  absImportStart: (data?: { dryRun?: boolean }) =>
+    request<ABSImportProgress>('/abs/import', { method: 'POST', body: JSON.stringify(data ?? {}) }),
+  absImportStatus: () => request<ABSImportProgress>('/abs/import/status'),
+  absImportRuns: () => request<ABSImportRun[]>('/abs/import/runs'),
+  absImportRollbackPreview: (runId: number) => request<ABSRollbackResult>(`/abs/import/runs/${runId}/rollback/preview`, { method: 'POST' }),
+  absImportRollback: (runId: number) => request<ABSRollbackResult>(`/abs/import/runs/${runId}/rollback`, { method: 'POST' }),
+  absReviewItems: (params?: { limit?: number; offset?: number }) => {
+    const q = new URLSearchParams()
+    if (params?.limit) q.set('limit', String(params.limit))
+    if (params?.offset) q.set('offset', String(params.offset))
+    return request<PaginatedResponse<ABSReviewItem>>(`/abs/review${q.toString() ? `?${q.toString()}` : ''}`)
+  },
+  approveAbsReviewItem: (id: number) => request<ABSReviewItem>(`/abs/review/${id}/approve`, { method: 'POST' }),
+  resolveAbsReviewAuthor: (id: number, data: { foreignAuthorId: string; authorName: string; applyTo?: 'same_author' }) =>
+    request<{ updated: number }>(`/abs/review/${id}/resolve-author`, { method: 'POST', body: JSON.stringify(data) }),
+  resolveAbsReviewBook: (id: number, data: { foreignBookId: string; title: string; editedTitle?: string }) =>
+    request<ABSReviewItem>(`/abs/review/${id}/resolve-book`, { method: 'POST', body: JSON.stringify(data) }),
+  dismissAbsReviewItem: (id: number) => request<ABSReviewItem>(`/abs/review/${id}/dismiss`, { method: 'POST' }),
+  absConflicts: (params?: { limit?: number; offset?: number }) => {
+    const q = new URLSearchParams()
+    if (params?.limit) q.set('limit', String(params.limit))
+    if (params?.offset) q.set('offset', String(params.offset))
+    return request<PaginatedResponse<ABSMetadataConflict>>(`/abs/conflicts${q.toString() ? `?${q.toString()}` : ''}`)
+  },
+  resolveAbsConflict: (id: number, source: 'abs' | 'upstream') =>
+    request<ABSMetadataConflict>(`/abs/conflicts/${id}/resolve`, { method: 'POST', body: JSON.stringify({ source }) }),
 
   // Import lists
   listImportLists: () => request<ImportList[]>('/importlist'),
   addImportList: (data: Partial<ImportList>) => request<ImportList>('/importlist', { method: 'POST', body: JSON.stringify(data) }),
   updateImportList: (id: number, data: Partial<ImportList>) => request<ImportList>(`/importlist/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteImportList: (id: number) => request<void>(`/importlist/${id}`, { method: 'DELETE' }),
-  hardcoverLists: (token: string) => request<HardcoverList[]>(`/importlist/hardcover/lists?token=${encodeURIComponent(token)}`),
+  syncImportList: (id: number) => request<{ status: string }>(`/importlist/${id}/sync`, { method: 'POST' }),
+  hardcoverLists: (token: string) =>
+    request<HardcoverList[]>('/importlist/hardcover/lists', {
+      headers: { Authorization: `Bearer ${token}` },
+    }),
 
   // Metadata Profiles
   listMetadataProfiles: () => request<MetadataProfile[]>('/metadataprofile'),
@@ -299,6 +527,15 @@ export interface MergeAuthorsResult {
 
 export type MediaType = 'ebook' | 'audiobook' | 'both'
 
+export interface BookFile {
+  id: number
+  bookId: number
+  format: 'ebook' | 'audiobook'
+  path: string
+  sizeBytes: number
+  createdAt: string
+}
+
 export interface Book {
   id: number
   foreignBookId: string
@@ -315,6 +552,8 @@ export interface Book {
   // Per-format file paths for dual-format books (mediaType='both').
   ebookFilePath: string
   audiobookFilePath: string
+  // All on-disk files tracked in book_files (populated on single-book GET).
+  bookFiles?: BookFile[]
   excluded: boolean
   narrator?: string
   durationSeconds?: number
@@ -368,6 +607,258 @@ export interface CalibreImportProgress {
   stats?: CalibreImportStats
 }
 
+// CalibreSyncError is one failed push entry returned by /calibre/sync/status.
+export interface CalibreSyncError {
+  bookId: number
+  title: string
+  path?: string
+  reason: string
+}
+
+// CalibreSyncStats summarises one bulk-push run. Pushed = newly added;
+// alreadyInCalibre = 409 Conflict (treated as success for idempotency);
+// failed = everything else.
+export interface CalibreSyncStats {
+  total: number
+  processed: number
+  pushed: number
+  alreadyInCalibre: number
+  failed: number
+}
+
+// CalibreSyncProgress is the polled shape for /calibre/sync/status.
+export interface CalibreSyncProgress {
+  running: boolean
+  startedAt?: string
+  finishedAt?: string
+  message?: string
+  error?: string
+  stats: CalibreSyncStats
+  errors: CalibreSyncError[]
+}
+
+export interface GrimmoryConfig {
+  enabled: boolean
+  baseUrl: string
+  apiKeyConfigured: boolean
+}
+
+export interface GrimmoryTestResult {
+  ok: boolean
+  message: string
+  version?: string
+}
+
+export interface ABSConfig {
+  featureEnabled: boolean
+  baseUrl: string
+  label: string
+  enabled: boolean
+  libraryId: string
+  pathRemap: string
+  apiKeyConfigured: boolean
+}
+
+export interface ABSLibraryFolder {
+  id: string
+  fullPath: string
+}
+
+export interface ABSLibrary {
+  id: string
+  name: string
+  mediaType: string
+  icon: string
+  provider: string
+  folders: ABSLibraryFolder[]
+}
+
+export interface ABSTestResult {
+  message: string
+  username: string
+  userType: string
+  defaultLibraryId: string
+  serverVersion: string
+  source: string
+}
+
+export interface ABSImportStats {
+  librariesScanned: number
+  pagesScanned: number
+  itemsSeen: number
+  itemsNormalized: number
+  itemsDetailFetched: number
+  authorsCreated: number
+  authorsLinked: number
+  booksCreated: number
+  booksLinked: number
+  booksUpdated: number
+  seriesCreated: number
+  seriesLinked: number
+  editionsAdded: number
+  ownedMarked: number
+  pendingManual: number
+  reviewQueued: number
+  metadataMatched: number
+  metadataRelinked: number
+  metadataConflicts: number
+  metadataAutoResolved: number
+  skipped: number
+  failed: number
+}
+
+export interface ABSImportItemResult {
+  itemId: string
+  title: string
+  outcome: string
+  message?: string
+  matchedBy?: string
+  authorId?: number
+  bookId?: number
+  seriesCount?: number
+}
+
+export interface ABSImportProgress {
+  running: boolean
+  runId?: number
+  dryRun?: boolean
+  startedAt?: string
+  finishedAt?: string
+  processed: number
+  message?: string
+  error?: string
+  resumedFromCheckpoint?: boolean
+  checkpoint?: {
+    libraryId: string
+    page: number
+    lastItemId?: string
+    pageSize: number
+    updatedAt: string
+  }
+  stats?: ABSImportStats
+  results?: ABSImportItemResult[]
+}
+
+export interface ABSImportRunSummary {
+  dryRun: boolean
+  resumedFromCheckpoint: boolean
+  checkpoint?: {
+    libraryId: string
+    page: number
+    lastItemId?: string
+    pageSize: number
+    updatedAt: string
+  }
+  stats: ABSImportStats
+  error?: string
+}
+
+export interface ABSImportRun {
+  id: number
+  sourceId: string
+  sourceLabel: string
+  baseUrl: string
+  libraryId: string
+  status: string
+  dryRun: boolean
+  startedAt: string
+  finishedAt?: string
+  source: {
+    sourceId: string
+    label: string
+    baseUrl: string
+    libraryId: string
+    pathRemap?: string
+    enabled: boolean
+    dryRun: boolean
+  }
+  checkpoint?: {
+    libraryId: string
+    page: number
+    lastItemId?: string
+    pageSize: number
+    updatedAt: string
+  }
+  summary: ABSImportRunSummary
+}
+
+export interface ABSRollbackAction {
+  entityType: string
+  externalId: string
+  displayName?: string
+  localId: number
+  outcome: string
+  action: string
+  reason?: string
+}
+
+export interface ABSRollbackResult {
+  runId: number
+  preview: boolean
+  dryRun: boolean
+  status: string
+  stats: {
+    actionsPlanned: number
+    entitiesDeleted: number
+    provenanceUnlinked: number
+    skipped: number
+    failed: number
+  }
+  actions: ABSRollbackAction[]
+  finishedAt: string
+}
+
+export interface ABSReviewItem {
+  id: number
+  sourceId: string
+  libraryId: string
+  itemId: string
+  title: string
+  primaryAuthor: string
+  asin: string
+  mediaType: string
+  reviewReason: 'unmatched_author' | 'ambiguous_author' | 'unmatched_book' | 'ambiguous_book'
+  payloadJson: string
+  resolvedAuthorForeignId?: string
+  resolvedAuthorName?: string
+  resolvedBookForeignId?: string
+  resolvedBookTitle?: string
+  editedTitle?: string
+  fileMappingFound: boolean
+  fileMappingMessage?: string
+  latestRunId?: number | null
+  status: 'pending' | 'approved' | 'dismissed'
+  createdAt: string
+  updatedAt: string
+}
+
+export interface PaginatedResponse<T> {
+  items: T[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface ABSMetadataConflict {
+  id: number
+  sourceId: string
+  libraryId: string
+  itemId: string
+  entityType: string
+  localId: number
+  entityName: string
+  fieldName: string
+  fieldLabel: string
+  absValue: string
+  upstreamValue: string
+  appliedSource: 'abs' | 'upstream' | ''
+  appliedValue: string
+  preferredSource: 'abs' | 'upstream' | ''
+  authorRelinkEligible: boolean
+  resolutionStatus: 'unresolved' | 'resolved'
+  updatedAt: string
+}
+
 export interface Indexer {
   id: number
   name: string
@@ -377,6 +868,34 @@ export interface Indexer {
   categories: number[]
   enabled: boolean
   prowlarrInstanceId?: number
+}
+
+export interface IndexerTestResult {
+  ok: boolean
+  status: number
+  categories: number
+  bookSearch: boolean
+  latencyMs: number
+  searchResults: number
+  searchError?: string
+  message?: string
+  error?: string
+}
+
+export interface PendingRelease {
+  id: number
+  bookId: number
+  title: string
+  indexerId?: number
+  guid: string
+  protocol: string
+  size: number
+  ageMinutes: number
+  quality?: string
+  customScore: number
+  reason: string
+  firstSeen: string
+  releaseJson: string
 }
 
 export interface ProwlarrInstance {
@@ -399,6 +918,7 @@ export interface DownloadClient {
   username: string
   password: string
   useSsl: boolean
+  urlBase: string
   category: string
   enabled: boolean
 }
@@ -411,6 +931,10 @@ export interface Download {
   size: number
   protocol: string
   errorMessage: string
+  addedAt: string
+  grabbedAt?: string
+  completedAt?: string
+  importedAt?: string
 }
 
 export interface QueueItem extends Download {
@@ -426,9 +950,62 @@ export interface SearchResult {
   nzbUrl: string
   grabs: number
   pubDate: string
-  protocol: string  // "usenet" or "torrent"
+  protocol: string   // "usenet" or "torrent"
   language?: string  // ISO 639-1 from newznab:attr language (when present)
-  mediaType?: string // "ebook" or "audiobook" — present when the book mediaType is specific
+  mediaType?: string // "ebook" or "audiobook"; set for dual-format book searches
+  approved?: boolean
+  rejection?: string
+}
+
+export interface SearchQueryDebug {
+  title?: string
+  author?: string
+  year?: number
+  isbn?: string
+  asin?: string
+  mediaType?: string
+  allowedLanguages?: string[]
+  freeText?: string
+}
+
+export interface IndexerDebug {
+  indexerId: number
+  indexerName: string
+  enabled: boolean
+  skipped?: boolean
+  skipReason?: string
+  categories?: number[]
+  resultCount: number
+  durationMs: number
+  error?: string
+}
+
+export interface PipelineDebug {
+  rawCount: number
+  afterDedupe: number
+  afterUsenetJunk: number
+  afterRelevance: number
+}
+
+export interface FilterDebug {
+  title: string
+  indexerName?: string
+  stage: string
+  reason: string
+}
+
+export interface SearchDebug {
+  query: SearchQueryDebug
+  indexers: IndexerDebug[]
+  pipeline: PipelineDebug
+  filters: FilterDebug[]
+  startedAt: string
+  durationMs: number
+}
+
+export interface SearchBookResponse {
+  results: SearchResult[]
+  debug: SearchDebug | null
 }
 
 export interface AddAuthorRequest {
@@ -439,6 +1016,7 @@ export interface AddAuthorRequest {
   metadataProfileId?: number | null
   qualityProfileId?: number | null
   rootFolderId?: number | null
+  mediaType?: MediaType
 }
 
 export interface GrabRequest {
@@ -494,17 +1072,98 @@ export interface QualityProfile {
   items: Array<{ quality: string; allowed: boolean }>
 }
 
+export interface SeriesHardcoverLink {
+  id: number
+  seriesId: number
+  hardcoverSeriesId: string
+  hardcoverProviderId: string
+  hardcoverTitle: string
+  hardcoverAuthorName: string
+  hardcoverBookCount: number
+  confidence: number
+  linkedBy: 'auto' | 'manual' | string
+  linkedAt: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface HardcoverTestResult {
+  ok: boolean
+  tokenConfigured: boolean
+  searchResults: number
+  sampleSeriesId?: string
+  sampleTitle?: string
+  catalogOk: boolean
+  catalogBookCount?: number
+  message?: string
+  error?: string
+}
+
+export interface SeriesHardcoverSearchResult {
+  foreignId: string
+  providerId: string
+  title: string
+  authorName: string
+  bookCount: number
+  readersCount: number
+  books: string[]
+  confidence?: number
+}
+
+export interface SeriesHardcoverAutoResponse {
+  linked: boolean
+  link?: SeriesHardcoverLink
+  candidates: SeriesHardcoverSearchResult[]
+  reason?: string
+}
+
+export interface SeriesFillBookRequest {
+  foreignBookId?: string
+  providerId?: string
+  position?: string
+}
+
+export interface SeriesHardcoverDiffBook {
+  foreignBookId: string
+  providerId: string
+  title: string
+  subtitle?: string
+  position: string
+  imageUrl?: string
+  authorName?: string
+  releaseDate?: string
+  usersCount?: number
+  localBookId?: number
+  localTitle?: string
+  localStatus?: string
+  matchConfidence?: number
+}
+
+export interface SeriesHardcoverDiff {
+  seriesId: number
+  link: SeriesHardcoverLink
+  present: SeriesHardcoverDiffBook[]
+  missing: SeriesHardcoverDiffBook[]
+  localOnly: SeriesHardcoverDiffBook[]
+  uncertain: SeriesHardcoverDiffBook[]
+  presentCount: number
+  missingCount: number
+}
+
 export interface Series {
   id: number
   foreignSeriesId: string
   title: string
   description: string
+  monitored: boolean
   books?: Array<{
     seriesId: number
     bookId: number
     positionInSeries: string
+    primarySeries?: boolean
     book?: Book
   }>
+  hardcoverLink?: SeriesHardcoverLink
 }
 
 export interface Tag {
@@ -521,6 +1180,7 @@ export interface MetadataProfile {
   skipMissingIsbn: boolean
   skipPartBooks: boolean
   allowedLanguages: string
+  unknownLanguageBehavior: 'pass' | 'fail'
 }
 
 export interface DelayProfile {
@@ -575,10 +1235,17 @@ export interface HardcoverList {
 }
 
 export interface LogEntry {
-  time: string
-  level: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR'
-  msg: string
+  // Ring buffer shape
+  time?: string
+  msg?: string
   attrs?: Record<string, string>
+  // DB shape
+  id?: number
+  ts?: string
+  level: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR'
+  component?: string
+  message?: string
+  fields?: Record<string, string>
 }
 
 export interface Recommendation {
@@ -606,7 +1273,7 @@ export interface Recommendation {
   createdAt: string
 }
 
-export type AuthorBulkAction = 'monitor' | 'unmonitor' | 'delete' | 'search'
+export type AuthorBulkAction = 'monitor' | 'unmonitor' | 'delete' | 'search' | 'set_media_type'
 export type BookBulkAction = 'monitor' | 'unmonitor' | 'delete' | 'search' | 'set_media_type'
 export type WantedBulkAction = 'search' | 'blocklist' | 'unmonitor'
 

@@ -27,14 +27,16 @@ const (
 	SettingCalibrePluginAPIKey  = "calibre.plugin_api_key"
 )
 
-// calibreAdder is the narrow interface CalibreHandler uses to push a book.
-// Satisfied by *calibre.Client and *calibre.PluginClient.
-type calibreAdder interface {
-	Add(ctx context.Context, path string) (int64, error)
-}
+// SettingCWAIngestPath is the directory bindery copies finished ebook
+// imports into so a sibling Calibre-Web-Automated container can pick them
+// up via its own auto-ingest watcher. Empty disables the integration.
+// CWA reference: https://github.com/crocodilestick/Calibre-Web-Automated
+const SettingCWAIngestPath = "cwa.ingest_path"
 
-// CalibreHandler exposes the "test connection" and "sync book" endpoints for
-// the Calibre settings UI.
+// CalibreHandler exposes the "test connection" endpoint for the Calibre
+// settings UI. Read/write of the calibre.* keys themselves go through the
+// generic /setting endpoints so the UI can reuse its existing plumbing;
+// this handler just validates and probes.
 type CalibreHandler struct {
 	settings *db.SettingsRepo
 	books    *db.BookRepo

@@ -3,10 +3,13 @@ package hardcover
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/vavallee/bindery/internal/metadata"
 )
 
 // testTransport routes all HTTP calls through a handler function.
@@ -16,6 +19,27 @@ type testTransport struct {
 
 func (t *testTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return t.handler(r)
+}
+
+type countingBodyReader struct {
+	remaining int64
+	read      int64
+}
+
+func (r *countingBodyReader) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > r.remaining {
+		p = p[:int(r.remaining)]
+	}
+	for i := range p {
+		p[i] = 'x'
+	}
+	n := len(p)
+	r.remaining -= int64(n)
+	r.read += int64(n)
+	return n, nil
 }
 
 // gqlResponse builds a GraphQL-style HTTP response with the given data payload.
@@ -50,6 +74,82 @@ func TestName(t *testing.T) {
 	c := New()
 	if c.Name() != "hardcover" {
 		t.Errorf("Name: want 'hardcover', got %q", c.Name())
+	}
+}
+
+func TestNormalizeAPIToken(t *testing.T) {
+	cases := map[string]string{
+		"hc-secret":                         "hc-secret",
+		"Bearer hc-secret":                  "hc-secret",
+		"bearer hc-secret":                  "hc-secret",
+		"Bearer Bearer hc-secret":           "hc-secret",
+		" \n Bearer hc-secret \n\t":         "hc-secret",
+		`"Bearer hc-secret"`:                "hc-secret",
+		"Authorization: Bearer hc-secret":   "hc-secret",
+		"authorization: hc-secret":          "hc-secret",
+		"Authorization=Bearer Bearer token": "token",
+		"Bearer":                            "",
+		"Authorization: Bearer":             "",
+	}
+	for input, want := range cases {
+		if got := NormalizeAPIToken(input); got != want {
+			t.Errorf("NormalizeAPIToken(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestQuery_UsesNormalizedAuthorizationHeader(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		client *Client
+	}{
+		{name: "token", client: newMockClient(nil).WithToken("Bearer Bearer hc-secret")},
+		{name: "source", client: newMockClient(nil).WithTokenSource(func(context.Context) string { return "bearer hc-secret" })},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.client.http.Transport = &testTransport{handler: func(r *http.Request) (*http.Response, error) {
+				if got := r.Header.Get("Authorization"); got != "Bearer hc-secret" {
+					t.Fatalf("Authorization = %q, want Bearer hc-secret", got)
+				}
+				return gqlResponse(t, http.StatusOK, map[string]interface{}{"authors": []interface{}{}}), nil
+			}}
+			if _, err := tt.client.SearchAuthors(context.Background(), "nobody"); err != nil {
+				t.Fatalf("SearchAuthors: %v", err)
+			}
+		})
+	}
+}
+
+func TestQuery_GraphQLErrorsReturnError(t *testing.T) {
+	c := newMockClient(func(r *http.Request) (*http.Response, error) {
+		return gqlResponse(t, http.StatusOK, `{"errors":[{"message":"Malformed Authorization header","extensions":{"code":"invalid-headers"}}]}`), nil
+	})
+	_, err := c.SearchAuthors(context.Background(), "Sanderson")
+	if err == nil {
+		t.Fatal("expected GraphQL error")
+	}
+	if !strings.Contains(err.Error(), "Malformed Authorization header") || !strings.Contains(err.Error(), "invalid-headers") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestQuery_SuccessResponseBodyReadIsBounded(t *testing.T) {
+	body := &countingBodyReader{remaining: hardcoverSuccessResponseBodyLimit + 1}
+	c := newMockClient(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(body),
+			Header:     make(http.Header),
+		}, nil
+	})
+
+	var out struct{}
+	err := c.query(context.Background(), "query Test { __typename }", nil, &out)
+	if err == nil {
+		t.Fatal("expected truncated invalid JSON error")
+	}
+	if body.read != hardcoverSuccessResponseBodyLimit {
+		t.Fatalf("read bytes = %d, want %d", body.read, hardcoverSuccessResponseBodyLimit)
 	}
 }
 
@@ -181,6 +281,87 @@ func TestSearchBooks_HTTPError(t *testing.T) {
 	_, err := c.SearchBooks(context.Background(), "anything")
 	if err == nil {
 		t.Fatal("expected error on 503")
+	}
+}
+
+func TestGetAuthorWorksByName_WithToken(t *testing.T) {
+	var gotVars map[string]any
+	var gotAuth string
+	c := newMockClient(func(r *http.Request) (*http.Response, error) {
+		gotAuth = r.Header.Get("Authorization")
+		body, _ := io.ReadAll(r.Body)
+		var req gqlRequest
+		_ = json.Unmarshal(body, &req)
+		gotVars = req.Variables
+		data := map[string]interface{}{
+			"books": []map[string]interface{}{
+				{
+					"id":            10,
+					"title":         "Dune",
+					"slug":          "dune",
+					"description":   "A desert planet.",
+					"image":         map[string]interface{}{"url": "https://img/dune.jpg"},
+					"release_year":  1965,
+					"ratings_count": 1000,
+					"rating":        4.5,
+					"users_count":   2000,
+					"genres":        []string{"Science Fiction"},
+					"has_audiobook": true,
+					"has_ebook":     false,
+					"audio_seconds": 7200,
+					"contributions": []map[string]interface{}{
+						{"author": map[string]interface{}{"id": 1, "name": "Frank Herbert", "slug": "frank-herbert"}},
+					},
+				},
+			},
+		}
+		return gqlResponse(t, http.StatusOK, data), nil
+	}).WithToken("hc-secret")
+
+	books, err := c.GetAuthorWorksByName(context.Background(), "Frank Herbert")
+	if err != nil {
+		t.Fatalf("GetAuthorWorksByName: %v", err)
+	}
+	if gotAuth != "Bearer hc-secret" {
+		t.Fatalf("Authorization = %q, want Bearer token", gotAuth)
+	}
+	if gotVars["author"] != "Frank Herbert" {
+		t.Fatalf("author variable = %v", gotVars["author"])
+	}
+	if len(books) != 1 {
+		t.Fatalf("books len = %d, want 1", len(books))
+	}
+	book := books[0]
+	if book.ForeignID != "hc:dune" || book.Title != "Dune" || book.ImageURL == "" {
+		t.Fatalf("unexpected book: %+v", book)
+	}
+	if book.DurationSeconds != 7200 {
+		t.Fatalf("DurationSeconds = %d, want 7200", book.DurationSeconds)
+	}
+	if len(book.Genres) != 1 || book.Genres[0] != "Science Fiction" {
+		t.Fatalf("Genres = %+v", book.Genres)
+	}
+	if book.MediaType != "" {
+		t.Fatalf("MediaType = %q, want empty author import default", book.MediaType)
+	}
+}
+
+func TestGetAuthorWorksByName_NoTokenSkipsRequest(t *testing.T) {
+	called := false
+	c := newMockClient(func(r *http.Request) (*http.Response, error) {
+		called = true
+		return gqlResponse(t, http.StatusOK, map[string]interface{}{}), nil
+	})
+
+	books, err := c.GetAuthorWorksByName(context.Background(), "Frank Herbert")
+	if !errors.Is(err, metadata.ErrProviderNotConfigured) {
+		t.Fatalf("GetAuthorWorksByName error = %v, want ErrProviderNotConfigured", err)
+	}
+	if called {
+		t.Fatal("expected no HTTP request without token")
+	}
+	if books != nil {
+		t.Fatalf("books = %+v, want nil", books)
 	}
 }
 
@@ -411,6 +592,185 @@ func TestGetBookByISBN_HTTPError(t *testing.T) {
 	}
 }
 
+func TestSearchSeries_ParsesResults(t *testing.T) {
+	var gotVars map[string]any
+	c := newMockClient(func(r *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(r.Body)
+		var req gqlRequest
+		_ = json.Unmarshal(body, &req)
+		gotVars = req.Variables
+		data := map[string]interface{}{
+			"search": map[string]interface{}{
+				"ids": []interface{}{123},
+				"results": map[string]interface{}{
+					"found": 1,
+					"hits": []map[string]interface{}{
+						{
+							"document": map[string]interface{}{
+								"id":                  123,
+								"name":                "Foundation",
+								"author_name":         "Isaac Asimov",
+								"primary_books_count": 7,
+								"readers_count":       1000,
+								"books":               []string{"Foundation", "Foundation and Empire"},
+							},
+						},
+					},
+				},
+			},
+		}
+		return gqlResponse(t, http.StatusOK, data), nil
+	})
+
+	results, err := c.SearchSeries(context.Background(), "Foundation", 5)
+	if err != nil {
+		t.Fatalf("SearchSeries: %v", err)
+	}
+	if gotVars["queryType"] != "Series" {
+		t.Fatalf("queryType = %v, want Series", gotVars["queryType"])
+	}
+	if len(results) != 1 {
+		t.Fatalf("results len = %d, want 1", len(results))
+	}
+	got := results[0]
+	if got.ForeignID != "hc-series:123" || got.ProviderID != "123" {
+		t.Fatalf("ids = %q/%q, want hc-series:123/123", got.ForeignID, got.ProviderID)
+	}
+	if got.Title != "Foundation" || got.AuthorName != "Isaac Asimov" || got.BookCount != 7 || got.ReadersCount != 1000 {
+		t.Fatalf("unexpected result: %+v", got)
+	}
+}
+
+func TestSearchSeries_ErrorsWhenMatchesCannotBeMapped(t *testing.T) {
+	c := newMockClient(func(r *http.Request) (*http.Response, error) {
+		return gqlResponse(t, http.StatusOK, map[string]interface{}{
+			"search": map[string]interface{}{
+				"ids": []interface{}{123},
+				"results": map[string]interface{}{
+					"found": 1,
+					"hits": []map[string]interface{}{
+						{"document": map[string]interface{}{"name": "Dune"}},
+					},
+				},
+			},
+		}), nil
+	})
+	_, err := c.SearchSeries(context.Background(), "Dune", 5)
+	if err == nil {
+		t.Fatal("expected unmappable search response error")
+	}
+	if !strings.Contains(err.Error(), "no mappable series documents") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSearchSeries_ParsesStringResults(t *testing.T) {
+	encoded := `{"found":1,"hits":[{"document":{"id":"42","name":"Murderbot Diaries","books_count":6}}]}`
+	c := newMockClient(func(r *http.Request) (*http.Response, error) {
+		return gqlResponse(t, http.StatusOK, map[string]interface{}{
+			"search": map[string]interface{}{"results": encoded},
+		}), nil
+	})
+
+	results, err := c.SearchSeries(context.Background(), "Murderbot", 10)
+	if err != nil {
+		t.Fatalf("SearchSeries: %v", err)
+	}
+	if len(results) != 1 || results[0].ForeignID != "hc-series:42" || results[0].BookCount != 6 {
+		t.Fatalf("unexpected results: %+v", results)
+	}
+}
+
+func TestSearchSeries_HTTPError(t *testing.T) {
+	c := newMockClient(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusBadGateway,
+			Body:       io.NopCloser(strings.NewReader("bad gateway")),
+			Header:     make(http.Header),
+		}, nil
+	})
+	if _, err := c.SearchSeries(context.Background(), "anything", 10); err == nil {
+		t.Fatal("expected error on 502")
+	}
+}
+
+func TestGetSeriesCatalog_ParsesAndDedupesBooks(t *testing.T) {
+	c := newMockClient(func(r *http.Request) (*http.Response, error) {
+		data := map[string]interface{}{
+			"series_by_pk": map[string]interface{}{
+				"id":          123,
+				"name":        "Foundation",
+				"books_count": 3,
+				"author":      map[string]interface{}{"name": "Isaac Asimov"},
+				"book_series": []map[string]interface{}{
+					{
+						"position": 2,
+						"book": map[string]interface{}{
+							"id":          202,
+							"title":       "Foundation",
+							"slug":        "foundation-later",
+							"users_count": 10,
+						},
+					},
+					{
+						"position": 1,
+						"book": map[string]interface{}{
+							"id":          201,
+							"title":       "Foundation",
+							"subtitle":    "The First Book",
+							"slug":        "foundation",
+							"users_count": 100,
+						},
+					},
+					{
+						"position": 2,
+						"book": map[string]interface{}{
+							"id":    203,
+							"title": "Foundation and Empire",
+							"slug":  "foundation-and-empire",
+						},
+					},
+				},
+			},
+		}
+		return gqlResponse(t, http.StatusOK, data), nil
+	})
+
+	catalog, err := c.GetSeriesCatalog(context.Background(), "hc-series:123")
+	if err != nil {
+		t.Fatalf("GetSeriesCatalog: %v", err)
+	}
+	if catalog == nil {
+		t.Fatal("expected catalog")
+	}
+	if catalog.ForeignID != "hc-series:123" || catalog.Title != "Foundation" || catalog.AuthorName != "Isaac Asimov" {
+		t.Fatalf("unexpected catalog: %+v", catalog)
+	}
+	if len(catalog.Books) != 2 {
+		t.Fatalf("books len = %d, want 2: %+v", len(catalog.Books), catalog.Books)
+	}
+	if catalog.Books[0].ForeignID != "hc:foundation" || catalog.Books[0].Position != "1" {
+		t.Fatalf("first book = %+v, want deduped lower position Foundation", catalog.Books[0])
+	}
+	if catalog.Books[1].ForeignID != "hc:foundation-and-empire" || catalog.Books[1].Position != "2" {
+		t.Fatalf("second book = %+v", catalog.Books[1])
+	}
+}
+
+func TestGetSeriesCatalog_NotFound(t *testing.T) {
+	c := newMockClient(func(r *http.Request) (*http.Response, error) {
+		return gqlResponse(t, http.StatusOK, map[string]interface{}{"series_by_pk": nil}), nil
+	})
+
+	catalog, err := c.GetSeriesCatalog(context.Background(), "hc-series:999")
+	if err != nil {
+		t.Fatalf("GetSeriesCatalog: %v", err)
+	}
+	if catalog != nil {
+		t.Fatalf("expected nil catalog, got %+v", catalog)
+	}
+}
+
 func TestToAuthor_NoSlug_UsesID(t *testing.T) {
 	c := New()
 	a := c.toAuthor(hcAuthor{ID: 42, Name: "Unknown Author", Slug: ""})
@@ -509,28 +869,30 @@ func TestGetUserWishlist_Success(t *testing.T) {
 	c := newMockClient(func(r *http.Request) (*http.Response, error) {
 		gotAuth = r.Header.Get("Authorization")
 		data := map[string]interface{}{
-			"me": map[string]interface{}{
-				"user_books": []map[string]interface{}{
-					{
-						"book": map[string]interface{}{
-							"id":            101,
-							"title":         "Project Hail Mary",
-							"slug":          "project-hail-mary",
-							"description":   "An astronaut wakes up alone.",
-							"release_year":  year,
-							"rating":        4.7,
-							"ratings_count": 50000,
-							"image":         map[string]interface{}{"url": "https://img.example.com/phm.jpg"},
-							"contributions": []map[string]interface{}{
-								{"author": map[string]interface{}{"id": 7, "name": "Andy Weir", "slug": "andy-weir"}},
+			"me": []map[string]interface{}{
+				{
+					"user_books": []map[string]interface{}{
+						{
+							"book": map[string]interface{}{
+								"id":            101,
+								"title":         "Project Hail Mary",
+								"slug":          "project-hail-mary",
+								"description":   "An astronaut wakes up alone.",
+								"release_year":  year,
+								"rating":        4.7,
+								"ratings_count": 50000,
+								"image":         map[string]interface{}{"url": "https://img.example.com/phm.jpg"},
+								"contributions": []map[string]interface{}{
+									{"author": map[string]interface{}{"id": 7, "name": "Andy Weir", "slug": "andy-weir"}},
+								},
 							},
 						},
-					},
-					{
-						"book": map[string]interface{}{
-							"id":    102,
-							"title": "Dune",
-							"slug":  "dune",
+						{
+							"book": map[string]interface{}{
+								"id":    102,
+								"title": "Dune",
+								"slug":  "dune",
+							},
 						},
 					},
 				},
@@ -596,7 +958,7 @@ func TestGetUserWishlist_DefaultLimit(t *testing.T) {
 		_ = json.Unmarshal(body, &req)
 		gotVars = req.Variables
 		return gqlResponse(t, http.StatusOK, map[string]interface{}{
-			"me": map[string]interface{}{"user_books": []interface{}{}},
+			"me": []map[string]interface{}{{"user_books": []interface{}{}}},
 		}), nil
 	})
 	c = c.WithToken("t")
@@ -614,7 +976,7 @@ func TestGetUserWishlist_DefaultLimit(t *testing.T) {
 func TestGetUserWishlist_Empty(t *testing.T) {
 	c := newMockClient(func(r *http.Request) (*http.Response, error) {
 		return gqlResponse(t, http.StatusOK, map[string]interface{}{
-			"me": map[string]interface{}{"user_books": []interface{}{}},
+			"me": []map[string]interface{}{{"user_books": []interface{}{}}},
 		}), nil
 	}).WithToken("t")
 
@@ -639,6 +1001,133 @@ func TestGetUserWishlist_HTTPError(t *testing.T) {
 	_, err := c.GetUserWishlist(context.Background(), 10)
 	if err == nil {
 		t.Fatal("expected error on 401")
+	}
+}
+
+func TestGetUserLists_IncludesBuiltinShelves(t *testing.T) {
+	// When me.lists returns an empty array (user has no custom lists),
+	// GetUserLists must still return the 4 built-in shelf entries.
+	c := newMockClient(func(r *http.Request) (*http.Response, error) {
+		body := `{"data":{"me":[{"lists":[]}]}}`
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	c = c.WithToken("hc-token")
+
+	lists, err := c.GetUserLists(context.Background())
+	if err != nil {
+		t.Fatalf("GetUserLists: %v", err)
+	}
+	if len(lists) != len(hcBuiltinShelves) {
+		t.Fatalf("want %d lists (built-ins only), got %d", len(hcBuiltinShelves), len(lists))
+	}
+	if lists[0].ID != -1 || lists[0].Name != "Want to Read" {
+		t.Errorf("first list = %+v, want {ID:-1, Name:Want to Read}", lists[0])
+	}
+}
+
+func TestGetUserLists_CustomListsAppendedAfterShelves(t *testing.T) {
+	c := newMockClient(func(r *http.Request) (*http.Response, error) {
+		body := `{"data":{"me":[{"lists":[{"id":42,"name":"Favorites","slug":"favorites","books_count":7}]}]}}`
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	c = c.WithToken("hc-token")
+
+	lists, err := c.GetUserLists(context.Background())
+	if err != nil {
+		t.Fatalf("GetUserLists: %v", err)
+	}
+	want := len(hcBuiltinShelves) + 1
+	if len(lists) != want {
+		t.Fatalf("want %d lists, got %d", want, len(lists))
+	}
+	last := lists[len(lists)-1]
+	if last.ID != 42 || last.Name != "Favorites" || last.BooksCount != 7 {
+		t.Errorf("custom list = %+v, want {ID:42, Name:Favorites, BooksCount:7}", last)
+	}
+}
+
+func TestGetListBooks_BuiltinShelfRoutesToUserBooks(t *testing.T) {
+	var gotVars map[string]any
+	c := newMockClient(func(r *http.Request) (*http.Response, error) {
+		var req gqlRequest
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &req)
+		gotVars = req.Variables
+		resp := `{"data":{"me":[{"user_books":[{"book":{"id":99,"title":"Dune","slug":"dune","contributions":[{"author":{"id":1,"name":"Frank Herbert","slug":"frank-herbert"}}]}}]}]}}`
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(resp)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	c = c.WithToken("hc-token")
+
+	books, err := c.GetListBooks(context.Background(), -1) // Want to Read
+	if err != nil {
+		t.Fatalf("GetListBooks shelf: %v", err)
+	}
+	if len(books) != 1 || books[0].Title != "Dune" {
+		t.Errorf("books = %+v, want [{Title:Dune}]", books)
+	}
+	if gotVars["statusID"] != float64(1) {
+		t.Errorf("statusID var = %v, want 1", gotVars["statusID"])
+	}
+}
+
+func TestGetListBooks_PositiveID(t *testing.T) {
+	var gotVars map[string]any
+	var gotQuery string
+	c := newMockClient(func(r *http.Request) (*http.Response, error) {
+		var req gqlRequest
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &req)
+		gotVars = req.Variables
+		gotQuery = req.Query
+		resp := `{"data":{"lists":[{"id":42,"name":"Favorites","slug":"favorites","list_books":[{"book":{"id":99,"title":"Dune","slug":"dune","contributions":[{"author":{"id":1,"name":"Frank Herbert","slug":"frank-herbert"}}]}}]}]}}`
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(resp)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	c = c.WithToken("hc-token")
+
+	books, err := c.GetListBooks(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("GetListBooks: %v", err)
+	}
+	if len(books) != 1 || books[0].Title != "Dune" {
+		t.Errorf("books = %+v, want [{Title:Dune}]", books)
+	}
+	if gotVars["id"] != float64(42) {
+		t.Errorf("id var = %v, want 42", gotVars["id"])
+	}
+	if !strings.Contains(gotQuery, "lists(where:") {
+		t.Errorf("query should use plural lists(where:) field, got: %q", gotQuery)
+	}
+}
+
+func TestHcShelfStatusID(t *testing.T) {
+	cases := []struct{ id, want int }{{-1, 1}, {-2, 2}, {-3, 3}, {-4, 4}}
+	for _, tc := range cases {
+		got, ok := hcShelfStatusID(tc.id)
+		if !ok || got != tc.want {
+			t.Errorf("hcShelfStatusID(%d) = %d,%v, want %d,true", tc.id, got, ok, tc.want)
+		}
+	}
+	if _, ok := hcShelfStatusID(0); ok {
+		t.Error("hcShelfStatusID(0) should return false")
+	}
+	if _, ok := hcShelfStatusID(42); ok {
+		t.Error("hcShelfStatusID(42) should return false")
 	}
 }
 

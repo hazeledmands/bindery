@@ -5,17 +5,25 @@ package openlibrary
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vavallee/bindery/internal/models"
 )
+
+// ErrNotFound signals a 404 from OpenLibrary. Callers use errors.Is to
+// distinguish "this ISBN/work doesn't exist in the catalog" from genuine
+// upstream failures so the UI can show a friendly message.
+var ErrNotFound = errors.New("not found")
 
 const (
 	baseURL   = "https://openlibrary.org"
@@ -65,6 +73,10 @@ func (c *Client) SearchAuthors(ctx context.Context, query string) ([]models.Auth
 }
 
 func (c *Client) SearchBooks(ctx context.Context, query string) ([]models.Book, error) {
+	// OpenLibrary's JSON search API is /search.json (now backed by FastAPI).
+	// /search (without .json) is the HTML web-UI path (Solr-backed) and
+	// returns HTTP 500 "DEPRECATED ENDPOINT ACCESSED" for API consumers
+	// since their FastAPI rollout completed (see issue #462, follow-up to #408).
 	u := fmt.Sprintf("%s/search.json?q=%s&fields=key,title,author_name,author_key,first_publish_year,cover_i,isbn,subject&limit=20",
 		baseURL, url.QueryEscape(query))
 	var resp searchResponse
@@ -132,6 +144,8 @@ func (c *Client) GetAuthor(ctx context.Context, foreignID string) (*models.Autho
 		a.ImageURL = fmt.Sprintf("%s/a/id/%d-L.jpg", coverURL, resp.Photos[0])
 	}
 
+	a.AlternateNames = resp.AlternateNames
+
 	return a, nil
 }
 
@@ -182,87 +196,288 @@ func (c *Client) GetBook(ctx context.Context, foreignID string) (*models.Book, e
 	return b, nil
 }
 
-// GetAuthorWorks fetches all works by an author using the dedicated author works endpoint.
-// This is much more reliable than searching by author name.
+// GetAuthorWorks fetches all works by an author. It merges two OpenLibrary
+// endpoints: the /authors/{id}/works endpoint is the primary source because it
+// includes series membership data — critical for series reconciliation — and is
+// the stable, non-deprecated API; the /search endpoint (new FastAPI version,
+// formerly /search.json) is a secondary source that enriches books with
+// language, cover image, and first-publish-year metadata not available from the
+// works list.
+//
+// Previously the search index was primary and /authors/{id}/works was a
+// backfill. This was reversed when OpenLibrary deprecated /search.json (HTTP
+// 500 "DEPRECATED ENDPOINT ACCESSED"), which broke series reconciliation for
+// all users (issue #408). The works endpoint now leads; the search endpoint
+// enriches when available.
+//
+// Noise (study guides, screenplay companions, film adaptations, etc.) is
+// filtered at this layer so the authors-ingestion pipeline never sees it.
+// Both upstream calls are best-effort: as long as one returns, we proceed —
+// the other's failure is logged.
 func (c *Client) GetAuthorWorks(ctx context.Context, authorForeignID string) ([]models.Book, error) {
-	u := fmt.Sprintf("%s/authors/%s/works.json?limit=100", baseURL, authorForeignID)
-	var resp authorWorksResponse
-	if err := c.getJSON(ctx, u, &resp); err != nil {
-		return nil, fmt.Errorf("get author works %s: %w", authorForeignID, err)
+	var (
+		primary    []authorWorkEntry
+		primaryErr error
+		enrichment []models.Book
+		enrichErr  error
+		wg         sync.WaitGroup
+	)
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		primary, primaryErr = c.authorWorksBackfill(ctx, authorForeignID)
+	}()
+	go func() {
+		defer wg.Done()
+		enrichment, enrichErr = c.searchAuthorWorks(ctx, authorForeignID)
+	}()
+	wg.Wait()
+
+	if primaryErr != nil {
+		slog.Warn("openlibrary: author works endpoint failed", "author", authorForeignID, "error", primaryErr)
+	}
+	if enrichErr != nil {
+		slog.Debug("openlibrary: author search enrichment failed", "author", authorForeignID, "error", enrichErr)
+	}
+	if primaryErr != nil && enrichErr != nil {
+		return nil, fmt.Errorf("get author works %s: primary=%w enrichment=%w", authorForeignID, primaryErr, enrichErr)
 	}
 
-	// Supplement with language data from the search index (best-effort; don't fail on error)
-	langMap := c.authorWorkLanguages(ctx, authorForeignID)
+	// Build enrichment index: workID → search result for fast lookup.
+	enrichIndex := make(map[string]int, len(enrichment))
+	for i, b := range enrichment {
+		enrichIndex[b.ForeignID] = i
+	}
 
-	books := make([]models.Book, 0, len(resp.Entries))
-	for _, entry := range resp.Entries {
+	// index maps workID → position in `books`.
+	index := make(map[string]int, len(primary))
+	books := make([]models.Book, 0, len(primary)+len(enrichment))
+
+	for _, entry := range primary {
 		workID := strings.TrimPrefix(entry.Key, "/works/")
+		if workID == "" || entry.Title == "" {
+			continue
+		}
+		if shouldFilterOLNoise(entry.Title, entry.Subjects) {
+			continue
+		}
 		b := models.Book{
 			ForeignID:        workID,
 			Title:            entry.Title,
 			SortTitle:        entry.Title,
 			Description:      extractText(entry.Description),
 			Genres:           truncateSlice(entry.Subjects, 10),
-			Language:         langMap[workID],
+			SeriesRefs:       seriesRefsFrom(entry.Series),
 			MetadataProvider: "openlibrary",
 			Monitored:        true,
 			Status:           models.BookStatusWanted,
+			Author: &models.Author{
+				ForeignID:        authorForeignID,
+				MetadataProvider: "openlibrary",
+			},
 		}
 		if len(entry.Covers) > 0 && entry.Covers[0] > 0 {
 			b.ImageURL = fmt.Sprintf("%s/b/id/%d-L.jpg", coverURL, entry.Covers[0])
 		}
-		// Set author reference
-		b.Author = &models.Author{
+		// Enrich with data the search endpoint carries that works endpoint omits.
+		if i, ok := enrichIndex[workID]; ok {
+			e := enrichment[i]
+			if b.ImageURL == "" && e.ImageURL != "" {
+				b.ImageURL = e.ImageURL
+			}
+			if e.Language != "" {
+				b.Language = e.Language
+			}
+			if b.ReleaseDate == nil {
+				b.ReleaseDate = e.ReleaseDate
+			}
+			if e.RatingsCount > 0 {
+				b.RatingsCount = e.RatingsCount
+				b.AverageRating = e.AverageRating
+			}
+		}
+		index[workID] = len(books)
+		books = append(books, b)
+	}
+
+	// Append enrichment-only entries: works in the search index that the
+	// /authors/{id}/works endpoint hasn't returned (can happen when the works
+	// API is paginated or temporarily behind).
+	for _, e := range enrichment {
+		if _, ok := index[e.ForeignID]; ok {
+			continue // already handled above
+		}
+		if shouldFilterOLNoise(e.Title, e.Genres) {
+			continue
+		}
+		e.Author = &models.Author{
 			ForeignID:        authorForeignID,
 			MetadataProvider: "openlibrary",
 		}
-		// Parse series membership from the OL series strings.
-		for i, s := range entry.Series {
-			if s == "" {
-				continue
-			}
-			ref := parseSeriesRef(s)
-			ref.Primary = i == 0
-			b.SeriesRefs = append(b.SeriesRefs, ref)
+		index[e.ForeignID] = len(books)
+		books = append(books, e)
+	}
+
+	return books, nil
+}
+
+// searchAuthorWorks queries the OL search endpoint for all works by the given
+// author. It returns one Book per indexed work, pre-populated with the fields
+// the search index exposes (title, language, subjects, cover, first year).
+// Series membership is not in the search response — callers get it from
+// authorWorksBackfill (the /authors/{id}/works endpoint).
+//
+// Uses /search.json (FastAPI-backed JSON API). /search without .json is the
+// HTML web-UI path still served by Solr, which returns HTTP 500
+// "DEPRECATED ENDPOINT ACCESSED" for API consumers (issue #462).
+func (c *Client) searchAuthorWorks(ctx context.Context, authorForeignID string) ([]models.Book, error) {
+	u := fmt.Sprintf("%s/search.json?author_key=%s&fields=key,title,language,edition_count,first_publish_year,cover_i,subject,ratings_count,ratings_average&limit=200",
+		baseURL, authorForeignID)
+	var resp struct {
+		Docs []struct {
+			Key              string   `json:"key"`
+			Title            string   `json:"title"`
+			Language         []string `json:"language"`
+			EditionCount     int      `json:"edition_count"`
+			FirstPublishYear int      `json:"first_publish_year"`
+			CoverI           *int     `json:"cover_i"`
+			Subject          []string `json:"subject"`
+			RatingsCount     int      `json:"ratings_count"`
+			RatingsAverage   float64  `json:"ratings_average"`
+		} `json:"docs"`
+	}
+	if err := c.getJSON(ctx, u, &resp); err != nil {
+		return nil, err
+	}
+	books := make([]models.Book, 0, len(resp.Docs))
+	for _, doc := range resp.Docs {
+		workID := strings.TrimPrefix(doc.Key, "/works/")
+		if workID == "" || doc.Title == "" {
+			continue
+		}
+		b := models.Book{
+			ForeignID:        workID,
+			Title:            doc.Title,
+			SortTitle:        doc.Title,
+			Genres:           truncateSlice(doc.Subject, 10),
+			Language:         pickPreferredLanguage(doc.Language),
+			RatingsCount:     doc.RatingsCount,
+			AverageRating:    doc.RatingsAverage,
+			MetadataProvider: "openlibrary",
+			Monitored:        true,
+			Status:           models.BookStatusWanted,
+		}
+		if doc.CoverI != nil && *doc.CoverI > 0 {
+			b.ImageURL = fmt.Sprintf("%s/b/id/%d-L.jpg", coverURL, *doc.CoverI)
+		}
+		if doc.FirstPublishYear > 0 {
+			t := time.Date(doc.FirstPublishYear, 1, 1, 0, 0, 0, 0, time.UTC)
+			b.ReleaseDate = &t
 		}
 		books = append(books, b)
 	}
 	return books, nil
 }
 
-// authorWorkLanguages calls the OL search index to get the primary language for each
-// work by this author. Returns a map of workID (e.g. "OL123W") → language code (e.g. "eng").
-// Errors are silently swallowed — language data is best-effort.
-func (c *Client) authorWorkLanguages(ctx context.Context, authorForeignID string) map[string]string {
-	u := fmt.Sprintf("%s/search.json?author_key=%s&fields=key,language&limit=200", baseURL, authorForeignID)
-	var resp struct {
-		Docs []struct {
-			Key      string   `json:"key"`
-			Language []string `json:"language"`
-		} `json:"docs"`
-	}
+// authorWorksBackfill fetches the author's works list from OpenLibrary's
+// /authors/{id}/works endpoint. The raw entries are returned so the caller
+// can decide how to merge them with the primary search-index results.
+func (c *Client) authorWorksBackfill(ctx context.Context, authorForeignID string) ([]authorWorkEntry, error) {
+	u := fmt.Sprintf("%s/authors/%s/works.json?limit=100", baseURL, authorForeignID)
+	var resp authorWorksResponse
 	if err := c.getJSON(ctx, u, &resp); err != nil {
-		slog.Debug("could not fetch language data for author works", "author", authorForeignID, "error", err)
+		return nil, err
+	}
+	return resp.Entries, nil
+}
+
+// pickPreferredLanguage returns "eng" if present in the list, otherwise the
+// first entry. Empty list returns "". Books with an empty language still pass
+// through the profile language filter via the unknown-language fallback.
+func pickPreferredLanguage(langs []string) string {
+	if len(langs) == 0 {
+		return ""
+	}
+	if slices.Contains(langs, "eng") {
+		return "eng"
+	}
+	return langs[0]
+}
+
+// seriesRefsFrom parses the OL series strings attached to a works-endpoint
+// entry into SeriesRefs with the first entry flagged Primary.
+func seriesRefsFrom(series []string) []models.SeriesRef {
+	if len(series) == 0 {
 		return nil
 	}
-
-	m := make(map[string]string, len(resp.Docs))
-	for _, doc := range resp.Docs {
-		if len(doc.Language) == 0 {
+	refs := make([]models.SeriesRef, 0, len(series))
+	for i, s := range series {
+		if s == "" {
 			continue
 		}
-		workID := strings.TrimPrefix(doc.Key, "/works/")
-		// Prefer "eng" if present among the languages, otherwise use the first entry.
-		lang := doc.Language[0]
-		for _, l := range doc.Language {
-			if l == "eng" {
-				lang = "eng"
-				break
+		ref := parseSeriesRef(s)
+		ref.Primary = i == 0
+		refs = append(refs, ref)
+	}
+	return refs
+}
+
+// olNoiseSubjects are case-insensitive substrings in an OL work's subjects
+// array that signal companion material, criticism, or adaptations rather
+// than a primary authored work.
+var olNoiseSubjects = []string{
+	"study guides",
+	"study and teaching",
+	"literary criticism",
+	"criticism and interpretation",
+	"cliffsnotes",
+	"sparknotes",
+	"motion picture adaptations",
+	"film adaptations",
+	"television adaptations",
+	"screenplays",
+}
+
+// olNoiseTitleFragments are case-insensitive substrings in a work title that
+// flag summaries, study guides, or audio-only physical editions that OL
+// sometimes represents as separate Works rather than editions.
+var olNoiseTitleFragments = []string{
+	"summary and analysis",
+	"summary & analysis",
+	"summary of",
+	"study guide",
+	"reader's guide",
+	"reading guide",
+	"teacher's guide",
+	"cliffsnotes",
+	"sparknotes",
+	"supersummary",
+	"instaread",
+	"workbook",
+	"audio cd",
+}
+
+// shouldFilterOLNoise returns true when an OpenLibrary work looks like
+// companion material (study guide, summary, adaptation, audio-CD edition)
+// rather than a real authored work. The goal is to keep an author's
+// catalogue clean without being aggressive enough to drop legitimate works.
+func shouldFilterOLNoise(title string, subjects []string) bool {
+	lt := strings.ToLower(title)
+	for _, f := range olNoiseTitleFragments {
+		if strings.Contains(lt, f) {
+			return true
+		}
+	}
+	for _, s := range subjects {
+		ls := strings.ToLower(s)
+		for _, n := range olNoiseSubjects {
+			if strings.Contains(ls, n) {
+				return true
 			}
 		}
-		m[workID] = lang
 	}
-	return m
+	return false
 }
 
 func (c *Client) GetEditions(ctx context.Context, bookForeignID string) ([]models.Edition, error) {
@@ -343,6 +558,11 @@ func (c *Client) GetBookByISBN(ctx context.Context, isbn string) (*models.Book, 
 	u := fmt.Sprintf("%s/isbn/%s.json", baseURL, isbn)
 	var resp isbnResponse
 	if err := c.getJSON(ctx, u, &resp); err != nil {
+		// Treat 404 as "no such ISBN" rather than an upstream error so the
+		// API layer can respond with a friendly message (issue #284).
+		if errors.Is(err, ErrNotFound) {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("isbn lookup %s: %w", isbn, err)
 	}
 
@@ -381,6 +601,9 @@ func (c *Client) getJSON(ctx context.Context, rawURL string, target interface{})
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotFound {
+		return ErrNotFound
+	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))

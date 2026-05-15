@@ -25,6 +25,8 @@ type Book struct {
 	Genres                []string   `json:"genres"`
 	AverageRating         float64    `json:"averageRating"`
 	RatingsCount          int        `json:"ratingsCount"`
+	EditionCount          int        `json:"-"`
+	ISBNs                 []string   `json:"-"`
 	Monitored             bool       `json:"monitored"`
 	Status                string     `json:"status"`
 	AnyEditionOK          bool       `json:"anyEditionOk"`
@@ -43,14 +45,16 @@ type Book struct {
 
 	Excluded bool `json:"excluded"`
 
-	// Per-format file paths for dual-format support (media_type = 'both').
-	// Single-format books populate only the relevant column; the other stays "".
+	// EbookFilePath and AudiobookFilePath are computed views over the book_files
+	// table (first path per format), kept for API backwards compatibility.
+	// Do not write to them directly; use BookRepo.AddBookFile instead.
 	EbookFilePath     string `json:"ebookFilePath"`
 	AudiobookFilePath string `json:"audiobookFilePath"`
 
 	// Joined data
-	Author   *Author   `json:"author,omitempty"`
-	Editions []Edition `json:"editions,omitempty"`
+	Author    *Author    `json:"author,omitempty"`
+	Editions  []Edition  `json:"editions,omitempty"`
+	BookFiles []BookFile `json:"bookFiles,omitempty"`
 
 	// Transport-only: series data from the metadata provider, used during
 	// ingestion to populate series/series_books. Never stored in books table.

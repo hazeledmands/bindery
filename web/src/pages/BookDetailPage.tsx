@@ -1,7 +1,9 @@
 import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { api, Book, HistoryEvent, SearchResult } from '../api/client'
+import { api, Book, HistoryEvent, SearchResult, SearchDebug } from '../api/client'
+import SearchDebugPanel from '../components/SearchDebugPanel'
 import MediaBadge from '../components/MediaBadge'
+import RebindModal from '../components/RebindModal'
 
 function formatSize(n: number): string {
   if (!n || n <= 0) return ''
@@ -26,6 +28,75 @@ const statusColors: Record<string, string> = {
   skipped: 'bg-slate-300 dark:bg-zinc-700 text-slate-600 dark:text-zinc-400',
 }
 
+const resultRowCls = (approved?: boolean) =>
+  `flex items-center justify-between p-2 border rounded text-xs ${
+    approved === false
+      ? 'bg-slate-50 dark:bg-zinc-950 border-slate-200 dark:border-zinc-800 opacity-60'
+      : 'bg-slate-100 dark:bg-zinc-900 border-slate-200 dark:border-zinc-800'
+  }`
+
+export function SearchResultsSection({
+  results,
+  bookMediaType,
+  grabbing,
+  onGrab,
+}: {
+  results: SearchResult[]
+  bookMediaType?: string
+  grabbing: string | null
+  onGrab: (r: SearchResult) => void
+}) {
+  const renderRow = (r: SearchResult, fmt?: 'ebook' | 'audiobook') => (
+    <div key={r.guid} className={resultRowCls(r.approved)}>
+      <div className="min-w-0 mr-3">
+        <div className="flex items-center gap-1.5 flex-wrap mb-0.5">
+          {fmt && <MediaBadge type={fmt} />}
+          <span className="truncate text-slate-800 dark:text-zinc-200">{r.title}</span>
+        </div>
+        <span className="text-slate-500 dark:text-zinc-500 truncate block">
+          {r.indexerName} · {formatSize(r.size)} · {r.grabs} grabs
+          {r.rejection && <span className="ml-2 text-amber-600 dark:text-amber-400">· {r.rejection}</span>}
+        </span>
+      </div>
+      <button
+        onClick={() => onGrab(r)}
+        disabled={grabbing !== null}
+        className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded text-[11px] font-medium flex-shrink-0"
+      >
+        {grabbing === r.guid ? 'Grabbing…' : 'Grab'}
+      </button>
+    </div>
+  )
+
+  if (bookMediaType === 'both') {
+    const ebooks = results.filter(r => r.mediaType === 'ebook')
+    const audiobooks = results.filter(r => r.mediaType === 'audiobook')
+    return (
+      <>
+        {ebooks.length > 0 && (
+          <section className="mb-4">
+            <h3 className="text-sm font-semibold mb-2 text-slate-800 dark:text-zinc-200">Ebooks ({ebooks.length})</h3>
+            <div className="space-y-1">{ebooks.slice(0, 20).map(r => renderRow(r, 'ebook'))}</div>
+          </section>
+        )}
+        {audiobooks.length > 0 && (
+          <section className="mb-4">
+            <h3 className="text-sm font-semibold mb-2 text-slate-800 dark:text-zinc-200">Audiobooks ({audiobooks.length})</h3>
+            <div className="space-y-1">{audiobooks.slice(0, 20).map(r => renderRow(r, 'audiobook'))}</div>
+          </section>
+        )}
+      </>
+    )
+  }
+
+  return (
+    <section className="mb-6">
+      <h3 className="text-sm font-semibold mb-2 text-slate-800 dark:text-zinc-200">Results ({results.length})</h3>
+      <div className="space-y-1">{results.slice(0, 20).map(r => renderRow(r))}</div>
+    </section>
+  )
+}
+
 export default function BookDetailPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
@@ -37,6 +108,7 @@ export default function BookDetailPage() {
   const [saving, setSaving] = useState(false)
   const [searching, setSearching] = useState(false)
   const [results, setResults] = useState<SearchResult[] | null>(null)
+  const [searchDebug, setSearchDebug] = useState<SearchDebug | null>(null)
   const [hasIndexers, setHasIndexers] = useState<boolean | null>(null)
   const [grabbing, setGrabbing] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -45,6 +117,7 @@ export default function BookDetailPage() {
   const [deletingFile, setDeletingFile] = useState(false)
   const [deletingBook, setDeletingBook] = useState(false)
   const [togglingExclude, setTogglingExclude] = useState(false)
+  const [showRebind, setShowRebind] = useState(false)
 
   useEffect(() => {
     if (book?.title) {
@@ -84,6 +157,7 @@ export default function BookDetailPage() {
     if (!book) return
     setSearching(true)
     setResults(null)
+    setSearchDebug(null)
     setError(null)
     try {
       const [r, indexers] = await Promise.all([
@@ -91,7 +165,8 @@ export default function BookDetailPage() {
         api.listIndexers(),
       ])
       setHasIndexers(indexers.length > 0)
-      setResults(r)
+      setResults(r.results)
+      setSearchDebug(r.debug ?? null)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Search failed')
     } finally {
@@ -135,17 +210,23 @@ export default function BookDetailPage() {
     const hasLegacy = !!book.filePath && !hasEbook && !hasAudiobook
     if (!hasEbook && !hasAudiobook && !hasLegacy) return
 
+    // Count files being deleted from book_files for accurate dialog copy.
+    const relevantFiles = book.bookFiles?.filter(f => !format || f.format === format) ?? []
+    const fileCount = relevantFiles.length
+
     let label: string
-    let path: string
+    let pathSummary: string
     if (format === 'ebook' && hasEbook) {
-      label = 'the ebook file'; path = book.ebookFilePath
+      label = fileCount > 1 ? `${fileCount} ebook files` : 'the ebook file'
+      pathSummary = relevantFiles.map(f => f.path).join('\n') || book.ebookFilePath
     } else if (format === 'audiobook' && hasAudiobook) {
-      label = 'the audiobook folder'; path = book.audiobookFilePath
+      label = 'the audiobook folder'
+      pathSummary = book.audiobookFilePath
     } else {
       label = book.mediaType === 'audiobook' ? 'the audiobook folder' : 'this file'
-      path = book.filePath
+      pathSummary = book.filePath
     }
-    if (!window.confirm(`Permanently delete ${label} from disk?\n\n${path}\n\nThe book record stays; it will flip back to "wanted".`)) return
+    if (!window.confirm(`Permanently delete ${label} from disk?\n\n${pathSummary}\n\nAny sibling files with the same name (different format) will also be removed.\n\nThe book record stays; it will flip back to "wanted".`)) return
     setDeletingFile(true)
     setError(null)
     try {
@@ -163,10 +244,12 @@ export default function BookDetailPage() {
 
   const deleteBook = async () => {
     if (!book) return
-    const hasFiles = !!(book.filePath || book.ebookFilePath || book.audiobookFilePath)
-    const fileSummary = [book.ebookFilePath, book.audiobookFilePath].filter(Boolean).join('\n') || book.filePath
+    const hasFiles = !!(book.filePath || book.ebookFilePath || book.audiobookFilePath || (book.bookFiles && book.bookFiles.length > 0))
+    const fileSummary = book.bookFiles && book.bookFiles.length > 0
+      ? book.bookFiles.map(f => f.path).join('\n')
+      : [book.ebookFilePath, book.audiobookFilePath].filter(Boolean).join('\n') || book.filePath
     const msg = hasFiles
-      ? `Delete "${book.title}" AND all its files on disk?\n\n${fileSummary}\n\nAll format variants in the same folder will also be removed.\n\nThis cannot be undone.`
+      ? `Delete "${book.title}" AND its files on disk?\n\n${fileSummary}\n\nSibling files with the same name (different format) will also be removed. Download history will be cleared.\n\nThis cannot be undone.`
       : `Delete "${book.title}"?\n\nThis cannot be undone.`
     if (!window.confirm(msg)) return
     setDeletingBook(true)
@@ -211,12 +294,6 @@ export default function BookDetailPage() {
   if (!book) return <div className="text-slate-600 dark:text-zinc-500">Book not found</div>
 
   const mt = book.mediaType || 'ebook'
-  const typeBtn = (type: 'ebook' | 'audiobook' | 'both') =>
-    `px-3 py-1.5 rounded text-sm font-medium transition-colors ${
-      mt === type
-        ? 'bg-emerald-600 text-white'
-        : 'bg-slate-200 dark:bg-zinc-800 text-slate-700 dark:text-zinc-300 hover:bg-slate-300 dark:hover:bg-zinc-700'
-    }`
 
   return (
     <div className="max-w-4xl">
@@ -255,8 +332,15 @@ export default function BookDetailPage() {
                 {new Date(book.releaseDate).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' })}
               </span>
             )}
-            {book.language && (
+            {book.language ? (
               <span className="text-slate-600 dark:text-zinc-500">{book.language}</span>
+            ) : (
+              <span
+                className="inline-block px-2 py-0.5 rounded font-medium bg-amber-500/20 text-amber-700 dark:text-amber-400"
+                title="Metadata source did not report a language for this book. It bypassed the language filter."
+              >
+                Language unknown
+              </span>
             )}
             {book.narrator && (
               <span className="text-slate-600 dark:text-zinc-500">Narrated by {book.narrator}</span>
@@ -285,7 +369,7 @@ export default function BookDetailPage() {
                 </div>
               )}
             </div>
-          ) : book.filePath ? (
+          ) : (book.filePath || book.ebookFilePath) ? (
             <div className="mt-3 flex items-center gap-4 text-sm">
               <a href={`/api/v1/book/${book.id}/file`} className="text-emerald-500 hover:text-emerald-400">
                 Download file
@@ -298,10 +382,10 @@ export default function BookDetailPage() {
               >
                 {deletingFile ? 'Deleting…' : 'Delete file'}
               </button>
-              <span className="text-xs text-slate-500 dark:text-zinc-500 break-all">{book.filePath}</span>
+              <span className="text-xs text-slate-500 dark:text-zinc-500 break-all">{book.filePath || book.ebookFilePath}</span>
             </div>
           ) : null}
-          <div className="mt-3 flex items-center gap-3">
+          <div className="mt-3 flex items-center gap-3 flex-wrap">
             <button
               onClick={toggleExclude}
               disabled={togglingExclude}
@@ -317,6 +401,13 @@ export default function BookDetailPage() {
             {book.excluded && (
               <span className="text-xs text-amber-600 dark:text-amber-400 font-medium">Excluded from searches</span>
             )}
+            <button
+              onClick={() => setShowRebind(true)}
+              className="text-xs font-medium px-3 py-1.5 rounded bg-slate-200 dark:bg-zinc-800 text-slate-700 dark:text-zinc-300 hover:bg-slate-300 dark:hover:bg-zinc-700"
+              title="Point this book at a different upstream metadata record"
+            >
+              Re-bind
+            </button>
             <button
               onClick={deleteBook}
               disabled={deletingBook || deletingFile}
@@ -336,10 +427,20 @@ export default function BookDetailPage() {
 
       <section className="mb-6 p-4 border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900">
         <h3 className="text-sm font-semibold mb-3 text-slate-800 dark:text-zinc-200">Format</h3>
-        <div className="flex gap-2 mb-4">
-          <button onClick={() => saveField({ mediaType: 'ebook' })} disabled={saving} className={typeBtn('ebook')}>📖 Ebook</button>
-          <button onClick={() => saveField({ mediaType: 'audiobook' })} disabled={saving} className={typeBtn('audiobook')}>🎧 Audiobook</button>
-          <button onClick={() => saveField({ mediaType: 'both' })} disabled={saving} className={typeBtn('both')}>📖🎧 Both</button>
+        <div className="flex items-center gap-2 mb-4">
+          <label htmlFor="book-media-type" className="text-xs text-slate-600 dark:text-zinc-400">Format:</label>
+          <select
+            id="book-media-type"
+            value={mt}
+            onChange={e => saveField({ mediaType: e.target.value as 'ebook' | 'audiobook' | 'both' })}
+            disabled={saving}
+            className="bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-2 py-1 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600 disabled:opacity-50"
+            title="Change media type"
+          >
+            <option value="ebook">📖 Ebook</option>
+            <option value="audiobook">🎧 Audiobook</option>
+            <option value="both">📖🎧 Both</option>
+          </select>
         </div>
 
         {mt === 'both' && (
@@ -403,60 +504,26 @@ export default function BookDetailPage() {
         <div className="mb-6 text-center py-6 text-sm text-slate-600 dark:text-zinc-500 border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900">
           {hasIndexers === false
             ? <>No indexers configured — add one in <Link to="/settings" className="underline">Settings</Link>.</>
-            : 'No results on any indexer.'}
+            : 'No results on any indexer — expand Search details below to see why.'}
         </div>
       )}
 
-      {results !== null && results.length > 0 && (() => {
-        const ebooks = results.filter(r => r.mediaType === 'ebook')
-        const audiobooks = results.filter(r => r.mediaType === 'audiobook')
-        const hasBothTypes = ebooks.length > 0 && audiobooks.length > 0
+      {searchDebug && (
+        <SearchDebugPanel
+          debug={searchDebug}
+          resultCount={results?.length ?? 0}
+          defaultOpen={results !== null && results.length === 0}
+        />
+      )}
 
-        const renderRow = (r: SearchResult) => (
-          <div key={r.guid} className="flex items-center justify-between p-2 bg-slate-100 dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 rounded text-xs">
-            <div className="min-w-0 mr-3">
-              <div className="flex items-center gap-1.5 mb-0.5">
-                {!hasBothTypes && r.mediaType && (
-                  <MediaBadge type={r.mediaType as 'ebook' | 'audiobook'} />
-                )}
-                <span className="truncate text-slate-800 dark:text-zinc-200">{r.title}</span>
-              </div>
-              <span className="text-slate-500 dark:text-zinc-500 truncate block">
-                {r.indexerName} · {formatSize(r.size)} · {r.grabs} grabs
-              </span>
-            </div>
-            <button
-              onClick={() => grab(r)}
-              disabled={grabbing !== null}
-              className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded text-[11px] font-medium flex-shrink-0"
-            >
-              {grabbing === r.guid ? 'Grabbing…' : 'Grab'}
-            </button>
-          </div>
-        )
-
-        if (hasBothTypes) {
-          return (
-            <div className="mb-6 space-y-4">
-              <section>
-                <h3 className="text-sm font-semibold mb-2 text-slate-800 dark:text-zinc-200">📖 Ebook results ({ebooks.length})</h3>
-                <div className="space-y-1">{ebooks.slice(0, 20).map(renderRow)}</div>
-              </section>
-              <section>
-                <h3 className="text-sm font-semibold mb-2 text-slate-800 dark:text-zinc-200">🎧 Audiobook results ({audiobooks.length})</h3>
-                <div className="space-y-1">{audiobooks.slice(0, 20).map(renderRow)}</div>
-              </section>
-            </div>
-          )
-        }
-
-        return (
-          <section className="mb-6">
-            <h3 className="text-sm font-semibold mb-2 text-slate-800 dark:text-zinc-200">Results ({results.length})</h3>
-            <div className="space-y-1">{results.slice(0, 20).map(renderRow)}</div>
-          </section>
-        )
-      })()}
+      {results !== null && results.length > 0 && (
+        <SearchResultsSection
+          results={results}
+          bookMediaType={book.mediaType}
+          grabbing={grabbing}
+          onGrab={grab}
+        />
+      )}
 
       {events.length > 0 && (
         <section>
@@ -475,6 +542,17 @@ export default function BookDetailPage() {
             ))}
           </div>
         </section>
+      )}
+
+      {showRebind && (
+        <RebindModal
+          book={book}
+          onClose={() => setShowRebind(false)}
+          onSuccess={updated => {
+            setBook(updated)
+            setShowRebind(false)
+          }}
+        />
       )}
     </div>
   )

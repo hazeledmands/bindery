@@ -3,20 +3,53 @@
 package qbittorrent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/vavallee/bindery/internal/downloader/nethint"
+	"github.com/vavallee/bindery/internal/downloader/urlbase"
 )
 
-const addTorrentTimeout = 30 * time.Second
+// AuthError signals that qBittorrent responded but rejected the login.
+// Test() inspects this type via errors.As so it can avoid wrapping auth
+// failures with the misleading "could not reach + use container name"
+// hint that only applies to actual transport failures.
+type AuthError struct {
+	Status int
+	Body   string
+}
+
+func (e *AuthError) Error() string {
+	switch {
+	case e.Status == http.StatusForbidden && e.Body == "":
+		return "qBittorrent auth failed (HTTP 403, empty body): your IP is most likely banned after repeated failed logins. " +
+			"Clear it in qBit (Tools → Options → Web UI → IP filtering, or the banlist in qBittorrent.conf — restart of qBit may not clear it because the banlist is persisted)."
+	case e.Status == http.StatusOK && e.Body == "Fails.":
+		return "qBittorrent auth failed: credentials rejected (check the WebUI username/password matches what's saved in bindery)."
+	case e.Status == http.StatusForbidden:
+		return fmt.Sprintf("qBittorrent auth failed (HTTP 403): %s — host-header validation may be rejecting bindery; disable it in Tools → Options → Web UI, or whitelist the bindery container's hostname.", e.Body)
+	case e.Status != http.StatusOK:
+		return fmt.Sprintf("qBittorrent auth failed (HTTP %d): %s", e.Status, e.Body)
+	default:
+		return fmt.Sprintf("qBittorrent auth failed: %s", e.Body)
+	}
+}
+
+// hashPollTimeout is the maximum time to wait for a newly-added torrent's hash
+// to appear in the unfiltered torrent list.
+var hashPollTimeout = 30 * time.Second
 
 // Client interacts with the qBittorrent WebUI API v2.
 // Authentication is cookie-based: Login() obtains a SID cookie which is
@@ -25,20 +58,22 @@ const addTorrentTimeout = 30 * time.Second
 //
 // Field mapping for DownloadClient storage:
 //   - APIKey  → password  (qBittorrent uses username/password, not an API key)
-//   - URLBase → username  (reused since qBittorrent ignores URL base)
+//   - URLBase → reverse-proxy subpath, appended to baseURL (#369)
 type Client struct {
-	baseURL  string
-	username string
-	password string
-	http     *http.Client
-	mu       sync.Mutex
-	loggedIn bool
+	baseURL   string
+	username  string
+	password  string
+	http      *http.Client
+	fetchHTTP *http.Client // fetches .torrent file content on behalf of qBittorrent
+	mu        sync.Mutex   // guards loggedIn
+	addMu     sync.Mutex   // serialises AddTorrent: keeps before/after hash diff atomic
+	loggedIn  bool
 }
 
-// New creates a qBittorrent client.
-// username and password map to the DownloadClient's URLBase and APIKey fields
-// respectively (see comment on the Client struct).
-func New(host string, port int, username, password string, useSSL bool) *Client {
+// New creates a qBittorrent client. urlBase is the optional reverse-proxy
+// subpath (e.g. "/qbit") that will be appended between the host:port and
+// the standard /api/v2 endpoints; leave it empty for a direct connection.
+func New(host string, port int, username, password, urlBase string, useSSL bool) *Client {
 	scheme := "http"
 	if useSSL {
 		scheme = "https"
@@ -46,10 +81,11 @@ func New(host string, port int, username, password string, useSSL bool) *Client 
 
 	jar, _ := cookiejar.New(nil)
 	return &Client{
-		baseURL:  fmt.Sprintf("%s://%s:%d", scheme, host, port),
-		username: username,
-		password: password,
-		http:     &http.Client{Timeout: 15 * time.Second, Jar: jar},
+		fetchHTTP: &http.Client{Timeout: 60 * time.Second},
+		baseURL:   fmt.Sprintf("%s://%s:%d%s", scheme, host, port, urlbase.Normalize(urlBase)),
+		username:  username,
+		password:  password,
+		http:      &http.Client{Timeout: 15 * time.Second, Jar: jar},
 	}
 }
 
@@ -67,6 +103,12 @@ func (c *Client) Login(ctx context.Context) error {
 		return fmt.Errorf("build login request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	// qBittorrent v5.x enforces CSRF protection on /auth/login and rejects
+	// requests without matching Origin and Referer headers (often silently —
+	// the empty-body 403 that motivated AuthError above). v4.x ignores these
+	// headers, so setting them is safe across versions.
+	req.Header.Set("Origin", c.baseURL)
+	req.Header.Set("Referer", c.baseURL)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -77,8 +119,17 @@ func (c *Client) Login(ctx context.Context) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 	text := strings.TrimSpace(string(body))
 
+	// qBittorrent v4.x returns `200 OK` + body "Ok." on a successful login;
+	// v5.x returns `204 No Content` with an empty body. Accept both.
+	if resp.StatusCode == http.StatusNoContent {
+		c.mu.Lock()
+		c.loggedIn = true
+		c.mu.Unlock()
+		return nil
+	}
+
 	if resp.StatusCode != http.StatusOK || text == "Fails." {
-		return fmt.Errorf("qBittorrent login failed: %s", text)
+		return &AuthError{Status: resp.StatusCode, Body: text}
 	}
 
 	c.mu.Lock()
@@ -87,10 +138,18 @@ func (c *Client) Login(ctx context.Context) error {
 	return nil
 }
 
-// Test verifies connectivity by fetching the application version.
+// Test verifies connectivity by fetching the application version. The error
+// wording adapts to the failure mode: auth/config issues (the server
+// responded but rejected us) get a targeted hint; transport failures (the
+// server didn't respond at all) get a hint based on the error class.
 func (c *Client) Test(ctx context.Context) error {
 	if _, err := c.get(ctx, "/api/v2/app/version"); err != nil {
-		return fmt.Errorf("could not reach qBittorrent at %s — %w (in Docker use the service/container name, not localhost)", c.baseURL, err)
+		var authErr *AuthError
+		if errors.As(err, &authErr) {
+			// Server responded — this is an auth/config issue, not unreachable.
+			return fmt.Errorf("connected to qBittorrent at %s but %w", c.baseURL, err)
+		}
+		return fmt.Errorf("could not reach qBittorrent at %s — %w%s", c.baseURL, err, nethint.ForErr(err))
 	}
 	return nil
 }
@@ -98,8 +157,22 @@ func (c *Client) Test(ctx context.Context) error {
 // AddTorrent submits a magnet link or torrent URL to qBittorrent for download
 // and returns the torrent hash when it can be determined.
 func (c *Client) AddTorrent(ctx context.Context, magnetOrURL, category, savePath string) (string, error) {
-	// Snapshot existing hashes so we can detect newly-added items when the
-	// source URL is not a magnet with an explicit btih.
+	// Serialise concurrent AddTorrent calls so that each goroutine's
+	// before-snapshot → submit → poll sequence is atomic. Without this, two
+	// concurrent calls both snapshot an identical beforeSet, both submit their
+	// torrents, and then both resolve to the same "newest" torrent hash — the
+	// root cause of Bug 2.
+	c.addMu.Lock()
+	defer c.addMu.Unlock()
+
+	// Snapshot all existing hashes (unfiltered) so we can detect newly-added
+	// items regardless of which category qBittorrent assigns them initially.
+	// For indirect URLs (e.g. Prowlarr Torznab redirects), qBittorrent must
+	// follow the redirect and fetch the remote .torrent file before it assigns
+	// metadata and category. Polling with a category filter during this window
+	// returns nothing; the detection deadline expires and the hash is lost
+	// (#418). The before/after hash-set diff already uniquely identifies the
+	// new torrent, so the category filter is omitted from both polling calls.
 	beforeSet := map[string]struct{}{}
 	if before, err := c.GetTorrents(ctx, ""); err == nil {
 		for _, t := range before {
@@ -107,25 +180,62 @@ func (c *Client) AddTorrent(ctx context.Context, magnetOrURL, category, savePath
 		}
 	}
 
-	form := url.Values{"urls": {magnetOrURL}}
-	if category != "" {
-		form.Set("category", category)
-	}
-	if savePath != "" {
-		form.Set("savepath", savePath)
-	}
-
 	if err := c.ensureLoggedIn(ctx); err != nil {
 		return "", err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.baseURL+"/api/v2/torrents/add",
-		strings.NewReader(form.Encode()))
-	if err != nil {
-		return "", fmt.Errorf("build add request: %w", err)
+	var req *http.Request
+	if strings.HasPrefix(magnetOrURL, "http://") || strings.HasPrefix(magnetOrURL, "https://") {
+		// Fetch the .torrent content in Bindery so qBittorrent never needs to
+		// reach the indexer URL directly (which may be a Docker-only hostname
+		// like prowlarr:9696 that qBittorrent can't resolve from its network).
+		content, err := c.fetchTorrentContent(magnetOrURL)
+		if err != nil {
+			return "", fmt.Errorf("fetch torrent content: %w", err)
+		}
+
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		fw, err := mw.CreateFormFile("torrents", "upload.torrent")
+		if err != nil {
+			return "", fmt.Errorf("build multipart: %w", err)
+		}
+		if _, err := fw.Write(content); err != nil {
+			return "", fmt.Errorf("write torrent content: %w", err)
+		}
+		if category != "" {
+			_ = mw.WriteField("category", category)
+		}
+		if savePath != "" {
+			_ = mw.WriteField("savepath", savePath)
+		}
+		if err := mw.Close(); err != nil {
+			return "", fmt.Errorf("close multipart writer: %w", err)
+		}
+
+		req, err = http.NewRequestWithContext(ctx, http.MethodPost,
+			c.baseURL+"/api/v2/torrents/add", &buf)
+		if err != nil {
+			return "", fmt.Errorf("build add request: %w", err)
+		}
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+	} else {
+		form := url.Values{"urls": {magnetOrURL}}
+		if category != "" {
+			form.Set("category", category)
+		}
+		if savePath != "" {
+			form.Set("savepath", savePath)
+		}
+		var err error
+		req, err = http.NewRequestWithContext(ctx, http.MethodPost,
+			c.baseURL+"/api/v2/torrents/add",
+			strings.NewReader(form.Encode()))
+		if err != nil {
+			return "", fmt.Errorf("build add request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -147,24 +257,23 @@ func (c *Client) AddTorrent(ctx context.Context, magnetOrURL, category, savePath
 		return infoHash, nil
 	}
 
-	// Poll until the new torrent appears — qBittorrent must fetch and parse
-	// the .torrent file before the hash is visible, which can take a second
-	// or two for remote URLs (e.g. Prowlarr Torznab redirects).
-	// Poll the full unfiltered list so we find the torrent even if qBittorrent
-	// assigns a different category than requested before our rename lands.
-	deadline := time.Now().Add(addTorrentTimeout)
-	var afterHashes []string
+	// Poll the unfiltered torrent list until the new torrent appears — qBittorrent
+	// must fetch and parse the .torrent file before the hash is visible, which can
+	// take a few seconds for remote URLs (e.g. Prowlarr Torznab redirects).
+	// We poll unfiltered so we find the torrent regardless of which category
+	// qBittorrent has assigned at the moment it first appears.
+	deadline := time.Now().Add(hashPollTimeout)
+	var lastAfter []Torrent
 	for {
 		after, err := c.GetTorrents(ctx, "")
 		if err != nil {
 			return "", fmt.Errorf("add torrent accepted but hash lookup failed: %w", err)
 		}
-		afterHashes = afterHashes[:0]
+		lastAfter = after
 		var newest *Torrent
 		for i := range after {
 			t := &after[i]
 			h := strings.ToLower(t.Hash)
-			afterHashes = append(afterHashes, h)
 			if _, seen := beforeSet[h]; seen {
 				continue
 			}
@@ -173,7 +282,11 @@ func (c *Client) AddTorrent(ctx context.Context, magnetOrURL, category, savePath
 			}
 		}
 		if newest != nil {
-			return strings.ToLower(newest.Hash), nil
+			hash := strings.ToLower(newest.Hash)
+			if category != "" {
+				_ = c.setCategory(ctx, hash, category)
+			}
+			return hash, nil
 		}
 		if time.Now().After(deadline) {
 			break
@@ -184,14 +297,19 @@ func (c *Client) AddTorrent(ctx context.Context, magnetOrURL, category, savePath
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
-	beforeHashes := make([]string, 0, len(beforeSet))
+	beforeKeys := make([]string, 0, len(beforeSet))
 	for h := range beforeSet {
-		beforeHashes = append(beforeHashes, h)
+		beforeKeys = append(beforeKeys, h)
 	}
-	slog.Error("add torrent: hash resolution timed out",
-		"before_hashes", beforeHashes,
-		"after_hashes", afterHashes,
-		"category", category)
+	afterKeys := make([]string, 0, len(lastAfter))
+	for i := range lastAfter {
+		afterKeys = append(afterKeys, strings.ToLower(lastAfter[i].Hash))
+	}
+	slog.Error("add torrent hash lookup timed out",
+		"category", category,
+		"before_hashes", beforeKeys,
+		"after_hashes", afterKeys,
+	)
 	return "", fmt.Errorf("add torrent accepted but hash could not be determined")
 }
 
@@ -209,6 +327,20 @@ func infoHashFromMagnet(raw string) string {
 		return ""
 	}
 	return strings.ToLower(h)
+}
+
+// fetchTorrentContent downloads a .torrent file URL and returns its raw bytes.
+// It limits the response to 50 MiB to guard against runaway reads.
+func (c *Client) fetchTorrentContent(rawURL string) ([]byte, error) {
+	resp, err := c.fetchHTTP.Get(rawURL) //nolint:noctx
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("indexer returned HTTP %d", resp.StatusCode)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, 50<<20))
 }
 
 // GetTorrents returns all torrents in the given category (empty = all).
@@ -264,6 +396,31 @@ func (c *Client) DeleteTorrent(ctx context.Context, hash string, deleteFiles boo
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("delete torrent HTTP %d", resp.StatusCode)
 	}
+	return nil
+}
+
+// setCategory assigns a category to a torrent by hash.
+func (c *Client) setCategory(ctx context.Context, hash, category string) error {
+	form := url.Values{
+		"hashes":   {hash},
+		"category": {category},
+	}
+	if err := c.ensureLoggedIn(ctx); err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.baseURL+"/api/v2/torrents/setCategory",
+		strings.NewReader(form.Encode()))
+	if err != nil {
+		return fmt.Errorf("build setCategory request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("setCategory: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
 }
 

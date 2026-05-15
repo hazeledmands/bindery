@@ -23,9 +23,27 @@ const authorSelectCols = `id, foreign_id, name, sort_name, description, image_ur
 	       metadata_provider, last_metadata_refresh_at, created_at, updated_at`
 
 func (r *AuthorRepo) List(ctx context.Context) ([]models.Author, error) {
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT `+authorSelectCols+`
-		FROM authors ORDER BY sort_name`)
+	return r.ListByUser(ctx, 0)
+}
+
+const (
+	listAuthorsAll = "SELECT " + authorSelectCols + " FROM authors ORDER BY sort_name"
+	// Include rows with NULL owner_user_id — these are authors created before the
+	// multi-user migration ran its backfill (migration 025) or imported without a
+	// user context. Excluding them causes the list to silently drop visible authors.
+	listAuthorsByUser = "SELECT " + authorSelectCols + " FROM authors WHERE owner_user_id = ? OR owner_user_id IS NULL ORDER BY sort_name"
+)
+
+func (r *AuthorRepo) ListByUser(ctx context.Context, userID int64) ([]models.Author, error) {
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if userID == 0 {
+		rows, err = r.db.QueryContext(ctx, listAuthorsAll)
+	} else {
+		rows, err = r.db.QueryContext(ctx, listAuthorsByUser, userID)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("list authors: %w", err)
 	}
@@ -72,16 +90,45 @@ func (r *AuthorRepo) GetByForeignID(ctx context.Context, foreignID string) (*mod
 	return &a, nil
 }
 
+// GetByForeignIDForUser returns the author with the given foreign_id that is
+// visible to userID — i.e. owned by that user or with a NULL owner. When
+// userID is 0 the search is global (same as GetByForeignID).
+func (r *AuthorRepo) GetByForeignIDForUser(ctx context.Context, foreignID string, userID int64) (*models.Author, error) {
+	if userID == 0 {
+		return r.GetByForeignID(ctx, foreignID)
+	}
+	row := r.db.QueryRowContext(ctx, `
+		SELECT `+authorSelectCols+`
+		FROM authors WHERE foreign_id = ? AND (owner_user_id = ? OR owner_user_id IS NULL)`, foreignID, userID)
+
+	a, err := scanAuthorRow(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get author by foreign_id %s: %w", foreignID, err)
+	}
+	return &a, nil
+}
+
 func (r *AuthorRepo) Create(ctx context.Context, a *models.Author) error {
+	return r.CreateForUser(ctx, a, 0)
+}
+
+func (r *AuthorRepo) CreateForUser(ctx context.Context, a *models.Author, ownerUserID int64) error {
 	now := time.Now().UTC()
+	var ownerArg any
+	if ownerUserID != 0 {
+		ownerArg = ownerUserID
+	}
 	result, err := r.db.ExecContext(ctx, `
 		INSERT INTO authors (foreign_id, name, sort_name, description, image_url, disambiguation,
 		                     ratings_count, average_rating, monitored, quality_profile_id, metadata_profile_id, root_folder_id,
-		                     metadata_provider, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		                     metadata_provider, owner_user_id, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.ForeignID, a.Name, a.SortName, a.Description, a.ImageURL, a.Disambiguation,
 		a.RatingsCount, a.AverageRating, a.Monitored, a.QualityProfileID, a.MetadataProfileID, a.RootFolderID,
-		a.MetadataProvider, now, now)
+		a.MetadataProvider, ownerArg, now, now)
 	if err != nil {
 		return fmt.Errorf("create author: %w", err)
 	}
@@ -96,15 +143,94 @@ func (r *AuthorRepo) Create(ctx context.Context, a *models.Author) error {
 	return nil
 }
 
+// GetByDNBSyntheticName returns the synthetic DNB-only author row (one whose
+// foreign_id starts with "dnb:author:") that matches the given sort_name
+// case-insensitively and is visible to userID. Returns (nil, nil) when none
+// exists.
+//
+// This is used by AddBook to detect when a canonical author (OpenLibrary /
+// Hardcover) is being added for a SortName that was previously persisted as
+// a synthetic DNB row — see UpgradeSyntheticDNB.
+//
+// When userID is 0 the lookup is unscoped; in practice multi-user installs
+// always pass the requesting user's ID so they don't migrate another user's
+// row.
+func (r *AuthorRepo) GetByDNBSyntheticName(ctx context.Context, sortName string, userID int64) (*models.Author, error) {
+	if sortName == "" {
+		return nil, nil
+	}
+	var (
+		row *sql.Row
+		q   = `SELECT ` + authorSelectCols + `
+			FROM authors
+			WHERE foreign_id LIKE 'dnb:author:%' AND LOWER(sort_name) = LOWER(?)`
+	)
+	if userID == 0 {
+		row = r.db.QueryRowContext(ctx, q, sortName)
+	} else {
+		q += ` AND (owner_user_id = ? OR owner_user_id IS NULL)`
+		row = r.db.QueryRowContext(ctx, q, sortName, userID)
+	}
+	a, err := scanAuthorRow(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get author by dnb-synthetic sort_name %q: %w", sortName, err)
+	}
+	return &a, nil
+}
+
+// UpgradeSyntheticDNB migrates a synthetic DNB-only author row to a canonical
+// provider identity. The row identified by currentForeignID has its
+// foreign_id, metadata_provider and (when non-empty in target) descriptive
+// fields replaced. Existing relations (books, aliases) keep pointing at the
+// same primary-key row so the user keeps one author record.
+//
+// currentForeignID is matched by exact equality; pass the value previously
+// returned by GetByDNBSyntheticName. target carries the canonical fields.
+// Returns an error only on a SQL failure — a no-op update (e.g. row gone)
+// is silent.
+func (r *AuthorRepo) UpgradeSyntheticDNB(ctx context.Context, currentForeignID string, target *models.Author) error {
+	if currentForeignID == "" || target == nil || target.ForeignID == "" {
+		return fmt.Errorf("upgrade synthetic dnb: missing currentForeignID or target")
+	}
+	now := time.Now().UTC()
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE authors
+		SET foreign_id        = ?,
+		    name              = COALESCE(NULLIF(?, ''), name),
+		    sort_name         = COALESCE(NULLIF(?, ''), sort_name),
+		    description       = CASE WHEN ? != '' THEN ? ELSE description END,
+		    image_url         = CASE WHEN ? != '' THEN ? ELSE image_url END,
+		    disambiguation    = CASE WHEN ? != '' THEN ? ELSE disambiguation END,
+		    metadata_provider = COALESCE(NULLIF(?, ''), metadata_provider),
+		    updated_at        = ?
+		WHERE foreign_id = ?`,
+		target.ForeignID,                       // foreign_id =
+		target.Name,                            // name = COALESCE(NULLIF(?,''), name)
+		target.SortName,                        // sort_name = COALESCE(NULLIF(?,''), sort_name)
+		target.Description, target.Description, // description CASE WHEN ? != '' THEN ?
+		target.ImageURL, target.ImageURL, // image_url
+		target.Disambiguation, target.Disambiguation, // disambiguation
+		target.MetadataProvider, // metadata_provider = COALESCE(NULLIF(?,''), metadata_provider)
+		now,                     // updated_at
+		currentForeignID)        // WHERE foreign_id = ?
+	if err != nil {
+		return fmt.Errorf("upgrade synthetic dnb author %q -> %q: %w", currentForeignID, target.ForeignID, err)
+	}
+	return nil
+}
+
 func (r *AuthorRepo) Update(ctx context.Context, a *models.Author) error {
 	now := time.Now().UTC()
 	_, err := r.db.ExecContext(ctx, `
-		UPDATE authors SET name=?, sort_name=?, description=?, image_url=?, disambiguation=?,
+		UPDATE authors SET foreign_id=?, name=?, sort_name=?, description=?, image_url=?, disambiguation=?,
 		                   ratings_count=?, average_rating=?, monitored=?, quality_profile_id=?,
 		                   metadata_profile_id=?, root_folder_id=?, metadata_provider=?,
 		                   last_metadata_refresh_at=?, updated_at=?
 		WHERE id=?`,
-		a.Name, a.SortName, a.Description, a.ImageURL, a.Disambiguation,
+		a.ForeignID, a.Name, a.SortName, a.Description, a.ImageURL, a.Disambiguation,
 		a.RatingsCount, a.AverageRating, a.Monitored, a.QualityProfileID,
 		a.MetadataProfileID, a.RootFolderID, a.MetadataProvider, a.LastMetadataRefreshAt, now, a.ID)
 	if err != nil {

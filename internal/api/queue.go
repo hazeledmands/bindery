@@ -5,7 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
+	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/downloader"
@@ -40,47 +44,68 @@ type QueueItem struct {
 	Speed      string `json:"speed,omitempty"`
 }
 
-func (h *QueueHandler) List(w http.ResponseWriter, r *http.Request) {
-	downloads, err := h.downloads.List(r.Context())
+type enrichedQueueItem struct {
+	Download   models.Download
+	ClientName string
+	RemoteID   string
+	Live       downloader.LiveStatus
+	HasLive    bool
+	PollFailed bool
+}
+
+type liveStatusResult struct {
+	client        *models.DownloadClient
+	statuses      map[string]downloader.LiveStatus
+	usesTorrentID bool
+	pollFailed    bool
+}
+
+func (h *QueueHandler) enrichedQueueItems(ctx context.Context) ([]enrichedQueueItem, error) {
+	downloads, err := h.downloads.List(ctx)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
+		return nil, err
 	}
 
-	items := make([]QueueItem, len(downloads))
+	items := make([]enrichedQueueItem, len(downloads))
 	for i, d := range downloads {
-		items[i] = QueueItem{Download: d}
-	}
-
-	type liveStatusResult struct {
-		statuses      map[string]downloader.LiveStatus
-		usesTorrentID bool
+		items[i] = enrichedQueueItem{
+			Download: d,
+			RemoteID: storedDownloadID(d),
+		}
 	}
 
 	statusByClientID := make(map[int64]liveStatusResult)
 	for i, item := range items {
-		if item.DownloadClientID == nil {
+		if item.Download.DownloadClientID == nil {
 			continue
 		}
 
-		clientID := *item.DownloadClientID
+		clientID := *item.Download.DownloadClientID
 		result, ok := statusByClientID[clientID]
 		if !ok {
-			client, err := h.clients.GetByID(r.Context(), clientID)
-			if err != nil || client == nil || !client.Enabled {
+			client, err := h.clients.GetByID(ctx, clientID)
+			if err != nil || client == nil {
 				statusByClientID[clientID] = liveStatusResult{}
 				continue
 			}
 
-			statuses, usesTorrentID, err := downloader.GetLiveStatuses(r.Context(), client)
-			if err != nil {
-				statusByClientID[clientID] = liveStatusResult{}
-				continue
+			result.client = client
+			if client.Enabled {
+				statuses, usesTorrentID, err := downloader.GetLiveStatuses(ctx, client)
+				if err != nil {
+					result.pollFailed = true
+				} else {
+					result.statuses = statuses
+					result.usesTorrentID = usesTorrentID
+				}
 			}
-
-			result = liveStatusResult{statuses: statuses, usesTorrentID: usesTorrentID}
 			statusByClientID[clientID] = result
 		}
+
+		if result.client != nil {
+			items[i].ClientName = result.client.Name
+		}
+		items[i].PollFailed = result.pollFailed
 
 		if len(result.statuses) == 0 {
 			continue
@@ -88,38 +113,312 @@ func (h *QueueHandler) List(w http.ResponseWriter, r *http.Request) {
 
 		var remoteID string
 		if result.usesTorrentID {
-			if item.TorrentID == nil {
+			if item.Download.TorrentID == nil {
 				continue
 			}
-			remoteID = *item.TorrentID
+			remoteID = strings.ToLower(*item.Download.TorrentID)
 		} else {
-			if item.SABnzbdNzoID == nil {
+			if item.Download.SABnzbdNzoID == nil {
 				continue
 			}
-			remoteID = *item.SABnzbdNzoID
+			remoteID = *item.Download.SABnzbdNzoID
 		}
 
+		items[i].RemoteID = remoteID
 		if status, ok := result.statuses[remoteID]; ok {
-			items[i].Percentage = status.Percentage
-			items[i].TimeLeft = status.TimeLeft
-			items[i].Speed = status.Speed
+			items[i].Live = status
+			items[i].HasLive = true
+		}
+	}
+
+	return items, nil
+}
+
+func (h *QueueHandler) List(w http.ResponseWriter, r *http.Request) {
+	enriched, err := h.enrichedQueueItems(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	items := make([]QueueItem, len(enriched))
+	for i, item := range enriched {
+		items[i] = QueueItem{Download: item.Download}
+		if item.HasLive {
+			items[i].Percentage = item.Live.Percentage
+			items[i].TimeLeft = item.Live.TimeLeft
+			items[i].Speed = item.Live.Speed
 		}
 	}
 
 	writeJSON(w, http.StatusOK, items)
 }
 
-func (h *QueueHandler) Grab(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		GUID      string `json:"guid"`
-		Title     string `json:"title"`
-		NZBURL    string `json:"nzbUrl"`
-		Size      int64  `json:"size"`
-		BookID    *int64 `json:"bookId"`
-		IndexerID *int64 `json:"indexerId"`
-		Protocol  string `json:"protocol"`
-		MediaType string `json:"mediaType"`
+type arrQueueResponse struct {
+	Page          int              `json:"page,omitempty"`
+	PageSize      int              `json:"pageSize,omitempty"`
+	SortKey       string           `json:"sortKey,omitempty"`
+	SortDirection string           `json:"sortDirection,omitempty"`
+	TotalRecords  int              `json:"totalRecords"`
+	Records       []arrQueueRecord `json:"records"`
+}
+
+type arrQueueRecord struct {
+	ID                    int64  `json:"id"`
+	BookID                int64  `json:"bookId"`
+	Title                 string `json:"title"`
+	Status                string `json:"status"`
+	TrackedDownloadStatus string `json:"trackedDownloadStatus"`
+	Size                  int64  `json:"size"`
+	SizeLeft              int64  `json:"sizeleft"`
+	DownloadClient        string `json:"downloadClient"`
+	DownloadID            string `json:"downloadId"`
+	Protocol              string `json:"protocol"`
+}
+
+// ListArrCompatible exposes a small Sonarr/Radarr-style queue payload for
+// external tools such as Harpoon. The existing /api/v1/queue UI shape remains
+// unchanged.
+func (h *QueueHandler) ListArrCompatible(w http.ResponseWriter, r *http.Request) {
+	enriched, err := h.enrichedQueueItems(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
 	}
+
+	records := make([]arrQueueRecord, 0, len(enriched))
+	for _, item := range enriched {
+		if !includeArrQueueItem(item) {
+			continue
+		}
+		bookID := int64(0)
+		if item.Download.BookID != nil {
+			bookID = *item.Download.BookID
+		}
+		records = append(records, arrQueueRecord{
+			ID:                    item.Download.ID,
+			BookID:                bookID,
+			Title:                 item.Download.Title,
+			Status:                string(item.Download.Status),
+			TrackedDownloadStatus: trackedDownloadStatus(item),
+			Size:                  queueItemSize(item),
+			SizeLeft:              queueItemSizeLeft(item),
+			DownloadClient:        item.ClientName,
+			DownloadID:            item.RemoteID,
+			Protocol:              item.Download.Protocol,
+		})
+	}
+
+	opts := parseArrQueueOptions(r)
+	sortArrQueueRecords(records, opts.sortKey, opts.sortDirection)
+	total := len(records)
+	records = paginateArrQueueRecords(records, opts.page, opts.pageSize)
+
+	resp := arrQueueResponse{
+		TotalRecords: total,
+		Records:      records,
+	}
+	if opts.pageSize > 0 {
+		resp.Page = opts.page
+		resp.PageSize = opts.pageSize
+	}
+	if opts.sortKey != "" {
+		resp.SortKey = opts.sortKey
+		resp.SortDirection = opts.sortDirection
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+type arrQueueOptions struct {
+	page          int
+	pageSize      int
+	sortKey       string
+	sortDirection string
+}
+
+func parseArrQueueOptions(r *http.Request) arrQueueOptions {
+	q := r.URL.Query()
+	opts := arrQueueOptions{
+		page:          1,
+		sortKey:       strings.TrimSpace(q.Get("sortKey")),
+		sortDirection: strings.ToLower(strings.TrimSpace(q.Get("sortDirection"))),
+	}
+	if opts.sortDirection != "descending" && opts.sortDirection != "desc" {
+		opts.sortDirection = "ascending"
+	}
+	if page, err := strconv.Atoi(q.Get("page")); err == nil && page > 0 {
+		opts.page = page
+	}
+	if pageSize, err := strconv.Atoi(q.Get("pageSize")); err == nil && pageSize > 0 {
+		opts.pageSize = pageSize
+	}
+	return opts
+}
+
+func sortArrQueueRecords(records []arrQueueRecord, sortKey, sortDirection string) {
+	sortKey = strings.ToLower(sortKey)
+	if sortKey == "" {
+		return
+	}
+	desc := sortDirection == "descending" || sortDirection == "desc"
+	less := func(i, j int) bool {
+		a, b := records[i], records[j]
+		switch sortKey {
+		case "id":
+			return a.ID < b.ID
+		case "title":
+			return strings.ToLower(a.Title) < strings.ToLower(b.Title)
+		case "status":
+			return a.Status < b.Status
+		case "size":
+			return a.Size < b.Size
+		case "sizeleft":
+			return a.SizeLeft < b.SizeLeft
+		case "downloadclient":
+			return strings.ToLower(a.DownloadClient) < strings.ToLower(b.DownloadClient)
+		case "protocol":
+			return a.Protocol < b.Protocol
+		default:
+			return false
+		}
+	}
+	sort.SliceStable(records, func(i, j int) bool {
+		if desc {
+			return less(j, i)
+		}
+		return less(i, j)
+	})
+}
+
+func paginateArrQueueRecords(records []arrQueueRecord, page, pageSize int) []arrQueueRecord {
+	if pageSize <= 0 {
+		return records
+	}
+	if page <= 0 {
+		page = 1
+	}
+	if len(records) == 0 {
+		return []arrQueueRecord{}
+	}
+	if page > 1 && page-1 > (len(records)-1)/pageSize {
+		return []arrQueueRecord{}
+	}
+	start := (page - 1) * pageSize
+	end := len(records)
+	if pageSize < len(records)-start {
+		end = start + pageSize
+	}
+	return records[start:end]
+}
+
+func storedDownloadID(d models.Download) string {
+	if d.TorrentID != nil && *d.TorrentID != "" {
+		return strings.ToLower(*d.TorrentID)
+	}
+	if d.SABnzbdNzoID != nil && *d.SABnzbdNzoID != "" {
+		return *d.SABnzbdNzoID
+	}
+	return ""
+}
+
+func includeArrQueueItem(item enrichedQueueItem) bool {
+	return item.Download.Status != models.StateImported
+}
+
+func trackedDownloadStatus(item enrichedQueueItem) string {
+	if item.Download.ErrorMessage != "" || liveStatusIsError(item.Live.Status) {
+		return "error"
+	}
+	switch item.Download.Status {
+	case models.StateFailed, models.StateImportFailed, models.StateImportBlocked:
+		return "error"
+	}
+	if item.PollFailed {
+		return "warning"
+	}
+	return "ok"
+}
+
+func liveStatusIsError(status string) bool {
+	status = strings.ToLower(status)
+	return strings.Contains(status, "error") || strings.Contains(status, "fail")
+}
+
+func queueItemSize(item enrichedQueueItem) int64 {
+	if item.HasLive && item.Live.Size > 0 {
+		return item.Live.Size
+	}
+	return item.Download.Size
+}
+
+func queueItemSizeLeft(item enrichedQueueItem) int64 {
+	if item.HasLive {
+		if item.Live.SizeLeft > 0 {
+			return item.Live.SizeLeft
+		}
+		if item.Live.Size > 0 {
+			return 0
+		}
+		if left, ok := sizeLeftFromPercentage(item.Download.Size, item.Live.Percentage); ok {
+			return left
+		}
+	}
+
+	switch item.Download.Status {
+	case models.StateCompleted, models.StateImportPending, models.StateImporting,
+		models.StateImported, models.StateFailed, models.StateImportFailed, models.StateImportBlocked:
+		return 0
+	default:
+		return item.Download.Size
+	}
+}
+
+func sizeLeftFromPercentage(size int64, percentage string) (int64, bool) {
+	if size <= 0 {
+		return 0, false
+	}
+	percentage = strings.TrimSpace(strings.TrimSuffix(percentage, "%"))
+	if percentage == "" {
+		return 0, false
+	}
+	pct, err := strconv.ParseFloat(percentage, 64)
+	if err != nil {
+		return 0, false
+	}
+	if pct <= 0 {
+		return size, true
+	}
+	if pct >= 100 {
+		return 0, true
+	}
+	left := int64(math.Round(float64(size) * (100 - pct) / 100))
+	if left < 0 {
+		return 0, true
+	}
+	if left > size {
+		return size, true
+	}
+	return left, true
+}
+
+// grabRequest is the payload for grab operations (HTTP handler and pending force-grab).
+// BookID and IndexerID are optional: the free-text search UI grabs releases that
+// aren't tied to any local book or indexer, and the downloads table makes these
+// columns nullable to support that flow.
+type grabRequest struct {
+	GUID      string `json:"guid"`
+	Title     string `json:"title"`
+	NZBURL    string `json:"nzbUrl"`
+	Size      int64  `json:"size"`
+	BookID    *int64 `json:"bookId"`
+	IndexerID *int64 `json:"indexerId"`
+	Protocol  string `json:"protocol"`
+	MediaType string `json:"mediaType"`
+}
+
+func (h *QueueHandler) Grab(w http.ResponseWriter, r *http.Request) {
+	var req grabRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
@@ -127,9 +426,6 @@ func (h *QueueHandler) Grab(w http.ResponseWriter, r *http.Request) {
 	if req.GUID == "" || req.NZBURL == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "guid and nzbUrl required"})
 		return
-	}
-	if req.Protocol == "" {
-		req.Protocol = "usenet"
 	}
 
 	existing, err := h.downloads.GetByGUID(r.Context(), req.GUID)
@@ -142,72 +438,17 @@ func (h *QueueHandler) Grab(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client, err := h.selectClient(r.Context(), req.Protocol, req.MediaType)
-	if err != nil || client == nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no enabled download client configured"})
-		return
-	}
-
-	protocol := downloader.ProtocolForClient(client.Type)
-	dl := &models.Download{
-		GUID:             req.GUID,
-		BookID:           req.BookID,
-		IndexerID:        req.IndexerID,
-		DownloadClientID: &client.ID,
-		Title:            req.Title,
-		NZBURL:           req.NZBURL,
-		Size:             req.Size,
-		Status:           models.StateGrabbed,
-		Protocol:         protocol,
-		Quality:          indexer.ParseRelease(req.Title).Format,
-	}
-	if err := h.downloads.Create(r.Context(), dl); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-
-	sendRes, err := downloader.SendDownload(r.Context(), client, req.NZBURL, req.Title)
+	dl, err := h.grab(r.Context(), req)
 	if err != nil {
-		slog.Error("failed to send download", "client_type", client.Type, "error", err, "title", req.Title)
-		if setErr := h.downloads.SetError(r.Context(), dl.ID, err.Error()); setErr != nil {
-			slog.Warn("failed to persist download error", "download_id", dl.ID, "error", setErr)
+		status := http.StatusBadGateway
+		if strings.Contains(err.Error(), "no enabled download client") {
+			status = http.StatusBadRequest
 		}
-		h.recordHistory(r.Context(), models.HistoryEventDownloadFailed, req.Title, req.BookID, map[string]any{"guid": req.GUID, "message": err.Error()})
-		if h.notif != nil {
-			h.notif.Send(r.Context(), notifier.EventDownloadFailed, map[string]any{"title": req.Title, "message": err.Error()})
-		}
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to send to downloader: " + err.Error()})
+		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
 
-	if remoteID := sendRes.RemoteID; remoteID != "" {
-		if sendRes.UsesTorrentID {
-			if err := h.downloads.SetTorrentID(r.Context(), dl.ID, remoteID); err != nil {
-				slog.Warn("failed to set torrent ID", "download_id", dl.ID, "error", err)
-			}
-			dl.TorrentID = &remoteID
-		} else {
-			if err := h.downloads.SetNzoID(r.Context(), dl.ID, remoteID); err != nil {
-				slog.Warn("failed to set NZO ID", "download_id", dl.ID, "error", err)
-			}
-			dl.SABnzbdNzoID = &remoteID
-		}
-	}
-	if err := h.downloads.UpdateStatus(r.Context(), dl.ID, models.StateDownloading); err != nil {
-		slog.Warn("failed to update download status", "download_id", dl.ID, "status", models.StateDownloading, "error", err)
-	}
-	dl.Status = models.StateDownloading
-
-	h.recordHistory(r.Context(), models.HistoryEventGrabbed, req.Title, req.BookID, map[string]any{
-		"guid":      req.GUID,
-		"size":      req.Size,
-		"indexerId": req.IndexerID,
-	})
-	if h.notif != nil {
-		h.notif.Send(r.Context(), notifier.EventGrabbed, map[string]any{"title": req.Title, "size": req.Size})
-	}
-
-	slog.Info("download grabbed", "title", req.Title, "client", client.Type)
+	slog.Info("download grabbed", "title", req.Title)
 	writeJSON(w, http.StatusAccepted, dl)
 }
 
@@ -223,6 +464,88 @@ func (h *QueueHandler) selectClient(ctx context.Context, protocol, mediaType str
 		return nil, fmt.Errorf("no enabled %s download client configured", protocol)
 	}
 	return db.PickClientForMediaType(candidates, mediaType), nil
+}
+
+// grab executes the core grab logic: creates a download record and sends to the client.
+// It is called by both the HTTP Grab handler and PendingHandler.Grab.
+func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Download, error) {
+	if req.Protocol == "" {
+		req.Protocol = "usenet"
+	}
+	client, err := h.selectClient(ctx, req.Protocol, req.MediaType)
+	if err != nil || client == nil {
+		return nil, fmt.Errorf("no enabled download client configured")
+	}
+
+	protocol := downloader.ProtocolForClient(client.Type)
+	// Coerce zero-valued BookID/IndexerID to nil. A caller that JSON-decodes
+	// into an older int64-typed grabRequest, or writes an explicit {"bookId":0},
+	// would otherwise insert 0 into the FK column and violate the constraint.
+	bookID := req.BookID
+	if bookID != nil && *bookID == 0 {
+		bookID = nil
+	}
+	indexerID := req.IndexerID
+	if indexerID != nil && *indexerID == 0 {
+		indexerID = nil
+	}
+	dl := &models.Download{
+		GUID:             req.GUID,
+		BookID:           bookID,
+		IndexerID:        indexerID,
+		DownloadClientID: &client.ID,
+		Title:            req.Title,
+		NZBURL:           req.NZBURL,
+		Size:             req.Size,
+		Status:           models.StateGrabbed,
+		Protocol:         protocol,
+		Quality:          indexer.ParseRelease(req.Title).Format,
+	}
+	if err := h.downloads.Create(ctx, dl); err != nil {
+		return nil, err
+	}
+
+	sendRes, err := downloader.SendDownload(ctx, client, req.NZBURL, req.Title)
+	if err != nil {
+		slog.Error("failed to send download", "client_type", client.Type, "error", err, "title", req.Title)
+		if setErr := h.downloads.SetError(ctx, dl.ID, err.Error()); setErr != nil {
+			slog.Warn("failed to persist download error", "download_id", dl.ID, "error", setErr)
+		}
+		h.recordHistory(ctx, models.HistoryEventDownloadFailed, req.Title, bookID, map[string]any{"guid": req.GUID, "message": err.Error()})
+		if h.notif != nil {
+			h.notif.Send(ctx, notifier.EventDownloadFailed, map[string]any{"title": req.Title, "message": err.Error()})
+		}
+		return nil, fmt.Errorf("failed to send to downloader: %w", err)
+	}
+
+	if remoteID := sendRes.RemoteID; remoteID != "" {
+		if sendRes.UsesTorrentID {
+			normalised := strings.ToLower(remoteID)
+			if err := h.downloads.SetTorrentID(ctx, dl.ID, normalised); err != nil {
+				slog.Warn("failed to set torrent ID", "download_id", dl.ID, "error", err)
+			}
+			dl.TorrentID = &normalised
+		} else {
+			if err := h.downloads.SetNzoID(ctx, dl.ID, remoteID); err != nil {
+				slog.Warn("failed to set NZO ID", "download_id", dl.ID, "error", err)
+			}
+			dl.SABnzbdNzoID = &remoteID
+		}
+	}
+	if err := h.downloads.UpdateStatus(ctx, dl.ID, models.StateDownloading); err != nil {
+		slog.Warn("failed to update download status", "download_id", dl.ID, "status", models.StateDownloading, "error", err)
+	}
+	dl.Status = models.StateDownloading
+
+	h.recordHistory(ctx, models.HistoryEventGrabbed, req.Title, bookID, map[string]any{
+		"guid":      req.GUID,
+		"size":      req.Size,
+		"indexerId": req.IndexerID,
+	})
+	if h.notif != nil {
+		h.notif.Send(ctx, notifier.EventGrabbed, map[string]any{"title": req.Title, "size": req.Size})
+	}
+	return dl, nil
 }
 
 // recordHistory is a helper to write a history event, swallowing errors.

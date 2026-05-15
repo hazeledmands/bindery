@@ -28,7 +28,9 @@
     "enable": "Activer",
     "disable": "Désactiver",
     "connOk": "Connexion réussie !",
-    "connFail": "Test échoué : {{error}}"
+    "connFail": "Test échoué : {{error}}",
+    "prev": "Prev",
+    "next": "Next"
   },
   "nav": {
     "authors": "Auteurs",
@@ -40,7 +42,8 @@
     "series": "Séries",
     "discover": "Discover",
     "blocklist": "Liste de blocage",
-    "settings": "Paramètres"
+    "settings": "Paramètres",
+    "search": "Search"
   },
   "login": {
     "title": "Connexion",
@@ -52,7 +55,10 @@
     "errorRequired": "Nom d'utilisateur et mot de passe requis",
     "errorFailed": "Échec de la connexion",
     "signOut": "Se déconnecter",
-    "signedInAs": "Connecté en tant que"
+    "signedInAs": "Connecté en tant que",
+    "proxyHint": "Connectez-vous via votre fournisseur SSO",
+    "signInWith": "Se connecter avec {{name}}",
+    "orLocal": "ou"
   },
   "setup": {
     "title": "Configuration initiale",
@@ -119,7 +125,6 @@
     "statusImported": "En bibliothèque",
     "statusSkipped": "Ignoré",
     "audioLabel": "🎧 Audio",
-    "download": "Télécharger",
     "downloadFile": "Télécharger le fichier",
     "setEbook": "📖 Définir livre numérique",
     "setAudiobook": "🎧 Définir livre audio",
@@ -199,6 +204,8 @@
       "logs": "Journaux",
       "general": "Général",
       "calibre": "Calibre",
+      "abs": "Audiobookshelf",
+      "grimmory": "Grimmory",
       "blocklist": "Liste de blocage"
     },
     "indexers": {
@@ -268,7 +275,14 @@
       "level": "Niveau :",
       "noEntries": "Aucune entrée de journal",
       "bufferNote": "Affiche les 200 entrées les plus récentes du tampon circulaire en cours (1 000 dernières entrées). Les journaux sont réinitialisés au redémarrage. Modifiez le niveau ci-dessus pour capturer la sortie DEBUG sans redémarrer.",
-      "autoRefresh": "Auto"
+      "autoRefresh": "Auto",
+      "from": "From:",
+      "to": "To:",
+      "componentPlaceholder": "Component",
+      "searchPlaceholder": "Search messages",
+      "clearFilters": "Clear filters",
+      "page": "Page {{page}}",
+      "persistNote": "Entries are persisted to the database and survive restarts. Default range: last hour."
     },
     "general": {
       "appearance": "Apparence",
@@ -291,6 +305,14 @@
       "audiobookTemplateHint": "Les livres audio sont importés comme des répertoires entiers (m4b/mp3 multi-parties + couverture restent ensemble). Le modèle produit le dossier de destination ; les noms de fichiers originaux à l'intérieur sont conservés.",
       "apiKeys": "Clés API externes",
       "googleBooksKey": "Clé API Google Books",
+      "storage": "Stockage",
+      "storageHint": "Chemins que Bindery lit et dans lesquels il écrit. Configurez via les variables d'environnement (ou votre fichier de configuration) avant le démarrage ; le processus les lit au lancement.",
+      "downloadDir": "Répertoire des téléchargements",
+      "audiobookDownloadDir": "Répertoire de téléchargement des livres audio",
+      "audiobookDownloadDirFallback": "Non défini — les téléchargements de livres audio utilisent le répertoire de téléchargement principal.",
+      "libraryDir": "Répertoire de la bibliothèque (ebooks)",
+      "audiobookDir": "Répertoire des livres audio",
+      "audiobookDirFallback": "Non défini — les livres audio sont importés dans le répertoire de la bibliothèque.",
       "library": "Bibliothèque",
       "scanLibrary": "Analyser la bibliothèque",
       "scanLibraryHint": "Parcourir le répertoire des livres et réconcilier les fichiers avec la base de données",
@@ -310,7 +332,11 @@
       "backupButton": "Créer une sauvegarde",
       "backupCreating": "Création en cours...",
       "existingBackups": "Sauvegardes existantes :",
-      "security": "Sécurité"
+      "security": "Sécurité",
+      "logRetention": "Log Retention",
+      "logRetentionLabel": "Keep log entries for",
+      "logRetentionHint": "Log entries older than this are deleted by the daily trim job.",
+      "days": "days"
     },
     "import": {
       "csvHeading": "CSV de noms d'auteurs",
@@ -326,6 +352,22 @@
       "resultSkipped": "ignorés (existent déjà)",
       "resultFailed": "échoués",
       "showFailures": "Afficher {{count}} échec(s)"
+    },
+    "oidc": {
+      "heading": "SSO / OIDC Providers",
+      "description": "Configure OpenID Connect providers. Users who sign in via OIDC are automatically provisioned a Bindery account on first login.",
+      "empty": "No OIDC providers configured.",
+      "addButton": "+ Add Provider",
+      "addHeading": "New OIDC Provider",
+      "addSave": "Add Provider",
+      "removeConfirm": "Remove this OIDC provider?",
+      "saveFail": "Failed to save providers",
+      "fieldId": "ID",
+      "fieldName": "Display Name",
+      "fieldIssuer": "Issuer URL",
+      "fieldClientId": "Client ID",
+      "fieldClientSecret": "Client Secret",
+      "fieldScopes": "Scopes"
     }
   },
   "addAuthorModal": {
@@ -387,5 +429,16 @@
       "coldStart": "Add more books to unlock personalized genre recommendations.",
       "goToSettings": "Go to Settings"
     }
+  },
+  "search": {
+    "heading": "Search Indexers",
+    "placeholder": "Title, author, or keyword…",
+    "submit": "Search",
+    "searching": "Searching…",
+    "noResults": "No results — try a different query or check your indexer configuration.",
+    "resultCount": "{{count}} results",
+    "grab": "Grab",
+    "grabbing": "Grabbing…",
+    "grabbed": "Grabbed"
   }
 }

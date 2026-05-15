@@ -2,19 +2,27 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/vavallee/bindery/internal/abs"
 	"github.com/vavallee/bindery/internal/api"
 	"github.com/vavallee/bindery/internal/auth"
+	oidcauth "github.com/vavallee/bindery/internal/auth/oidc"
 	"github.com/vavallee/bindery/internal/calibre"
 	"github.com/vavallee/bindery/internal/config"
 	"github.com/vavallee/bindery/internal/db"
@@ -27,12 +35,14 @@ import (
 	"github.com/vavallee/bindery/internal/metadata/googlebooks"
 	"github.com/vavallee/bindery/internal/metadata/hardcover"
 	"github.com/vavallee/bindery/internal/metadata/openlibrary"
+	"github.com/vavallee/bindery/internal/metrics"
 	"github.com/vavallee/bindery/internal/models"
 	"github.com/vavallee/bindery/internal/notifier"
 	"github.com/vavallee/bindery/internal/opds"
 	"github.com/vavallee/bindery/internal/prowlarr"
 	"github.com/vavallee/bindery/internal/recommender"
 	"github.com/vavallee/bindery/internal/scheduler"
+	"github.com/vavallee/bindery/internal/telemetry"
 	"github.com/vavallee/bindery/internal/webui"
 )
 
@@ -40,6 +50,11 @@ var (
 	version = "dev"
 	commit  = "unknown"
 	date    = "unknown"
+)
+
+const (
+	settingGoogleBooksAPIKey       = "googlebooks.apiKey"
+	legacySettingGoogleBooksAPIKey = "google_books_api_key"
 )
 
 func main() {
@@ -77,6 +92,14 @@ func main() {
 		"dataDir", cfg.DataDir,
 	)
 
+	// Validate config before anything else touches the filesystem or network.
+	// Warnings are logged inline; a non-nil return means a clearly broken
+	// config (e.g. an unparseable OIDC redirect URL) and is treated as fatal.
+	if err := cfg.Validate(slog.Default()); err != nil {
+		slog.Error("configuration error — refusing to start", "error", err)
+		os.Exit(1)
+	}
+
 	// Fail fast if BINDERY_PUID/PGID is set but the container isn't running
 	// as that UID/GID. See cmd/bindery/uidcheck.go for the full rationale.
 	checkPUIDPGID()
@@ -90,16 +113,34 @@ func main() {
 	defer database.Close()
 
 	// Repos
+	// Persistent log store — extend the slog pipeline to also write to SQLite.
+	logRepo := db.NewLogRepo(database)
+	logDBHandler := db.NewLogSlogHandler(logRepo, level)
+	slog.SetDefault(slog.New(logbuf.NewTee(logbuf.NewTee(stdoutHandler, ring), logDBHandler)))
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := logDBHandler.Stop(shutdownCtx); err != nil {
+			slog.Warn("log handler shutdown timed out", "error", err)
+		}
+	}()
+
 	authorRepo := db.NewAuthorRepo(database)
 	authorAliasRepo := db.NewAuthorAliasRepo(database)
 	bookRepo := db.NewBookRepo(database)
 	editionRepo := db.NewEditionRepo(database)
+	absImportRunRepo := db.NewABSImportRunRepo(database)
+	absImportRunEntityRepo := db.NewABSImportRunEntityRepo(database)
+	absProvenanceRepo := db.NewABSProvenanceRepo(database)
+	absConflictRepo := db.NewABSMetadataConflictRepo(database)
+	absReviewRepo := db.NewABSReviewItemRepo(database)
 	indexerRepo := db.NewIndexerRepo(database)
 	dlClientRepo := db.NewDownloadClientRepo(database)
 	downloadRepo := db.NewDownloadRepo(database)
 	settingsRepo := db.NewSettingsRepo(database)
 	historyRepo := db.NewHistoryRepo(database)
 	blocklistRepo := db.NewBlocklistRepo(database)
+	pendingReleaseRepo := db.NewPendingReleaseRepo(database)
 	notificationRepo := db.NewNotificationRepo(database)
 	qualityProfileRepo := db.NewQualityProfileRepo(database)
 	seriesRepo := db.NewSeriesRepo(database)
@@ -122,21 +163,63 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Login rate limiter: 5 failures / 15 min per IP, matches Sonarr's posture.
-	loginLimiter := auth.NewLoginLimiter(5, 15*time.Minute)
+	// Parse trusted-proxy CIDRs once at startup (shared by trustedProxyMiddleware
+	// and the proxy-auth identity check).
+	trustedCIDRs := parseTrustedProxyCIDRs(os.Getenv("BINDERY_TRUSTED_PROXY"))
+
+	// Safety gate: proxy auth mode requires at least one trusted proxy CIDR so
+	// that the identity header cannot be forged by arbitrary LAN hosts.
+	if s, _ := settingsRepo.Get(ctxBoot, api.SettingAuthMode); s != nil && s.Value == string(auth.ModeProxy) {
+		if len(trustedCIDRs) == 0 {
+			slog.Error("proxy auth mode is active but BINDERY_TRUSTED_PROXY is empty — refusing to start (any host could forge the identity header)")
+			os.Exit(1)
+		}
+		slog.Info("proxy auth mode: trusted proxies", "cidrs", trustedCIDRs)
+	}
+
+	// Login rate limiter: thresholds are configurable via BINDERY_RATE_LIMIT_MAX_FAILURES
+	// and BINDERY_RATE_LIMIT_WINDOW_MINUTES; defaults match the original Sonarr-style posture.
+	loginLimiter := auth.NewLoginLimiter(cfg.RateLimitMaxFailures, time.Duration(cfg.RateLimitWindowMinutes)*time.Minute)
 
 	// Metadata providers
 	olClient := openlibrary.New()
+	dnbClient := dnb.New()
+
+	// Determine primary provider from settings (default: openlibrary).
+	// When metadata.primary_provider = "dnb", DNB is promoted to primary and
+	// OpenLibrary is added as an enricher instead. This is the recommended
+	// choice for German/Austrian/Swiss catalogues where OpenLibrary coverage
+	// is too thin for German-language books.
+	var primaryProvider metadata.Provider = olClient
+	if s, _ := settingsRepo.Get(context.Background(), api.SettingMetadataPrimaryProvider); s != nil && s.Value == "dnb" {
+		primaryProvider = dnbClient
+		slog.Info("metadata primary provider: dnb")
+	} else {
+		slog.Info("metadata primary provider: openlibrary")
+	}
+
 	var enrichers []metadata.Provider
-	if setting, _ := settingsRepo.Get(context.Background(), "google_books_api_key"); setting != nil && setting.Value != "" {
-		enrichers = append(enrichers, googlebooks.New(setting.Value))
+	if apiKey := googleBooksAPIKey(context.Background(), settingsRepo); apiKey != "" {
+		enrichers = append(enrichers, googlebooks.New(apiKey))
 		slog.Info("google books enrichment enabled")
 	}
-	enrichers = append(enrichers, hardcover.New())
+	hcClient := hardcover.New().WithTokenSource(func(ctx context.Context) string {
+		return api.GetHardcoverAPIToken(ctx, settingsRepo)
+	})
+	enrichers = append(enrichers, hcClient)
 	slog.Info("hardcover enrichment enabled")
-	enrichers = append(enrichers, dnb.New())
-	slog.Info("dnb enrichment enabled")
-	metaAgg := metadata.NewAggregator(olClient, enrichers...)
+
+	// Add the non-primary provider as enricher so metadata is always
+	// cross-checked regardless of which provider is primary.
+	if primaryProvider == olClient {
+		enrichers = append(enrichers, dnbClient)
+		slog.Info("dnb enrichment enabled")
+	} else {
+		enrichers = append(enrichers, olClient)
+		slog.Info("openlibrary enrichment enabled")
+	}
+
+	metaAgg := metadata.NewAggregator(primaryProvider, enrichers...)
 
 	// Optional CLI subcommand: `bindery migrate {csv,readarr} <path>`.
 	// Runs the import and exits; does not start the HTTP server. Useful
@@ -166,23 +249,36 @@ func main() {
 		cfg.LibraryDir, cfg.AudiobookDir, namingTemplate, audiobookTemplate,
 		cfg.DownloadPathRemap,
 	)
+	if cfg.AudiobookDownloadDir != "" {
+		importScanner.WithAudiobookDownloadDir(cfg.AudiobookDownloadDir)
+		slog.Info("audiobook download dir configured", "path", cfg.AudiobookDownloadDir)
+	}
+
+	// Wire ABS post-import scan notification (Bug #10). The notifier reads ABS
+	// config from settings at call time so that config changes (URL, API key,
+	// library ID) take effect without restarting Bindery.
+	importScanner.WithABSNotifier(
+		abs.NewScanNotifier(settingsRepo),
+		func() string {
+			cfg := api.LoadABSConfig(context.Background(), settingsRepo)
+			if !cfg.Enabled {
+				return ""
+			}
+			return cfg.LibraryID
+		},
+	)
 
 	modeResolver := func() calibre.Mode { return api.LoadCalibreMode(settingsRepo) }
 	calibreCfg := api.LoadCalibreConfig(settingsRepo)
 	currentMode := api.LoadCalibreMode(settingsRepo)
-	var calibreAdderForScheduler interface {
-		Add(ctx context.Context, path string) (int64, error)
-	}
 	if currentMode == calibre.ModePlugin {
 		pluginClient := calibre.NewPluginClient(calibreCfg.PluginURL, calibreCfg.PluginAPIKey)
 		importScanner.WithCalibre(modeResolver, pluginClient)
-		calibreAdderForScheduler = pluginClient
 		slog.Info("calibre integration enabled", "mode", "plugin", "url", calibreCfg.PluginURL)
 	} else {
 		calibreClient := calibre.New(calibreCfg)
 		importScanner.WithCalibre(modeResolver, calibreClient)
 		if currentMode == calibre.ModeCalibredb {
-			calibreAdderForScheduler = calibreClient
 			slog.Info("calibre integration enabled", "mode", "calibredb")
 		}
 	}
@@ -193,6 +289,28 @@ func main() {
 	// startup-sync branch below — both paths share the "only one import
 	// at a time" guard.
 	calibreImporter := calibre.NewImporter(authorRepo, authorAliasRepo, bookRepo, editionRepo, settingsRepo)
+	absImporter := abs.NewImporter(authorRepo, authorAliasRepo, bookRepo, editionRepo, seriesRepo, settingsRepo, absImportRunRepo, absImportRunEntityRepo, absProvenanceRepo, absReviewRepo, absConflictRepo).
+		WithVersion(version).
+		WithStoragePaths(cfg.LibraryDir, cfg.AudiobookDir, rootFolderRepo).
+		WithMetadata(metaAgg).
+		WithEnhancedHardcoverSeriesEnabled(func(ctx context.Context) bool {
+			return api.HardcoverFeatureStateFor(ctx, settingsRepo, cfg.EnhancedHardcoverAPI).EnhancedHardcoverAPI
+		})
+	storedABS := api.LoadABSConfig(ctxBoot, settingsRepo)
+	resumeCfg := abs.ImportConfig{
+		SourceID:  abs.DefaultSourceID,
+		BaseURL:   storedABS.BaseURL,
+		APIKey:    storedABS.APIKey,
+		LibraryID: storedABS.LibraryID,
+		PathRemap: storedABS.PathRemap,
+		Label:     storedABS.Label,
+		Enabled:   storedABS.Enabled,
+	}
+	if resumed, err := absImporter.ResumeInterrupted(ctxBoot, resumeCfg); err != nil {
+		slog.Warn("abs interrupted import resume skipped", "error", err)
+	} else if resumed {
+		slog.Info("abs interrupted import resumed from checkpoint")
+	}
 	if syncOnStartup(settingsRepo) {
 		cfg := api.LoadCalibreConfig(settingsRepo)
 		if cfg.Enabled && cfg.LibraryPath != "" {
@@ -210,6 +328,7 @@ func main() {
 	// Prowlarr startup sync: kick off sync for all enabled instances that have
 	// sync_on_startup set. Runs concurrently so it doesn't block server start.
 	{
+		prowlarrTimeout := api.LoadProwlarrTimeout(context.Background(), settingsRepo)
 		instances, _ := prowlarrRepo.List(context.Background())
 		for _, inst := range instances {
 			if !inst.Enabled || !inst.SyncOnStartup {
@@ -217,7 +336,7 @@ func main() {
 			}
 			inst := inst // capture
 			go func() {
-				client := prowlarr.New(inst.URL, inst.APIKey)
+				client := prowlarr.NewWithTimeout(inst.URL, inst.APIKey, prowlarrTimeout)
 				syncer := prowlarr.NewSyncer(client, indexerRepo, prowlarrRepo)
 				if _, err := syncer.Sync(context.Background(), inst.ID); err != nil {
 					slog.Warn("prowlarr startup sync failed", "instance", inst.Name, "error", err)
@@ -230,6 +349,11 @@ func main() {
 	sched := scheduler.New(importScanner, idxSearcher, metaAgg,
 		authorRepo, bookRepo, indexerRepo, downloadRepo, dlClientRepo, settingsRepo, blocklistRepo)
 	sched.WithHistory(historyRepo)
+	sched.WithAliases(authorAliasRepo)
+	sched.WithDelayProfiles(delayProfileRepo)
+	sched.WithPendingReleases(pendingReleaseRepo)
+	// Register the Calibre importer as the 24-hour sync job. The scheduler
+	// only fires the job when the syncer is non-nil, so no guard needed here.
 	sched.WithCalibreSyncer(calibreImporter)
 	if calibreAdderForScheduler != nil {
 		sched.WithCalibreAdder(calibreAdderForScheduler)
@@ -239,7 +363,7 @@ func main() {
 	recRepo := db.NewRecommendationRepo(database)
 	recEngine := recommender.New(bookRepo, authorRepo, seriesRepo, recRepo, settingsRepo)
 	recEngine.WithOLClient(olClient)
-	if s, _ := settingsRepo.Get(context.Background(), "hardcover.api_token"); s != nil && s.Value != "" {
+	if s, _ := settingsRepo.Get(context.Background(), api.SettingHardcoverAPIToken); s != nil && s.Value != "" {
 		recEngine.WithHCClient(hardcover.New().WithToken(s.Value))
 		slog.Info("hardcover wishlist integration enabled for recommendations")
 	}
@@ -248,6 +372,11 @@ func main() {
 	// Register the Hardcover list syncer (24-hour job).
 	hcSyncer := hardcoverlistsyncer.New(importListRepo, authorRepo, bookRepo)
 	sched.WithHardcoverSyncer(hcSyncer)
+	sched.WithLogRepo(logRepo, cfg.LogRetentionDays)
+
+	// Anonymous install ping (opt-out via telemetry.enabled=false in settings).
+	telemetryClient := telemetry.New(settingsRepo, version)
+	sched.WithTelemetry(telemetryClient)
 
 	sched.Start()
 	defer sched.Stop()
@@ -255,93 +384,214 @@ func main() {
 	// Notifier
 	notif := notifier.New(notificationRepo)
 
+	// OIDC manager — loaded from settings, reload on config change. The
+	// redirect base URL is resolved per-request from the Login/Callback
+	// handlers, falling back through (1) BINDERY_OIDC_REDIRECT_BASE_URL,
+	// (2) X-Forwarded-* from a trusted proxy, (3) the request Host.
+	oidcMgr := oidcauth.NewManager()
+	if s, _ := settingsRepo.Get(ctxBoot, api.SettingOIDCProviders); s != nil && s.Value != "" {
+		if ps, err := oidcauth.ParseProviders(s.Value); err == nil && len(ps) > 0 {
+			oidcMgr.Reload(ctxBoot, ps)
+			slog.Info("oidc: loaded providers from settings", "count", len(ps))
+			if cfg.OIDCRedirectBaseURL == "" && len(trustedCIDRs) == 0 {
+				slog.Warn("oidc: BINDERY_OIDC_REDIRECT_BASE_URL is unset and no trusted-proxy CIDRs are configured — callback URLs will be derived from the request Host header, which is the internal hostname behind a proxy. Set BINDERY_OIDC_REDIRECT_BASE_URL or BINDERY_TRUSTED_PROXY to fix.")
+			}
+		}
+	}
+
 	// API handlers
-	authHandler := api.NewAuthHandler(userRepo, settingsRepo, loginLimiter)
+	authHandler := api.NewAuthHandler(userRepo, settingsRepo, loginLimiter).
+		WithLocalAuthEnabled(cfg.LocalAuthEnabled)
+	oidcResolveBase := func(r *http.Request) string {
+		return api.ResolveOIDCRedirectBase(r, cfg.OIDCRedirectBaseURL, trustedCIDRs)
+	}
+	oidcHandler := api.NewOIDCHandler(oidcMgr, userRepo, settingsRepo, authHandler, oidcResolveBase).
+		WithBaseConfigured(cfg.OIDCRedirectBaseURL != "").
+		WithOIDCAutoProvision(cfg.OIDCAutoProvision).
+		WithOIDCEmailLink(cfg.OIDCEmailLink)
+	userMgmtHandler := api.NewUserManagementHandler(userRepo).
+		WithLocalAuthEnabled(cfg.LocalAuthEnabled)
 	searchHandler := api.NewSearchHandler(metaAgg)
 	authorHandler := api.NewAuthorHandler(authorRepo, authorAliasRepo, bookRepo, seriesRepo, metaAgg, settingsRepo, metadataProfileRepo, sched).WithFinder(importScanner)
 	authorAliasHandler := api.NewAuthorAliasHandler(authorRepo, authorAliasRepo)
-	bookHandler := api.NewBookHandler(bookRepo, metaAgg, historyRepo, sched).WithSettings(settingsRepo).WithDownloads(downloadRepo)
-	indexerHandler := api.NewIndexerHandler(indexerRepo, bookRepo, authorRepo, metadataProfileRepo, idxSearcher, settingsRepo, blocklistRepo)
+	bookHandler := api.NewBookHandler(bookRepo, metaAgg, historyRepo, sched).WithSettings(settingsRepo).WithDownloads(downloadRepo).WithAuthors(authorRepo).WithSeries(seriesRepo)
+	indexerHandler := api.NewIndexerHandler(indexerRepo, bookRepo, authorRepo, metadataProfileRepo, idxSearcher, settingsRepo, blocklistRepo).WithAliases(authorAliasRepo)
 	dlClientHandler := api.NewDownloadClientHandler(dlClientRepo)
 	queueHandler := api.NewQueueHandler(downloadRepo, dlClientRepo, bookRepo, historyRepo).WithNotifier(notif)
+	pendingHandler := api.NewPendingHandler(pendingReleaseRepo, queueHandler, downloadRepo, bookRepo)
 	importScanner.WithSettings(settingsRepo)
 	importScanner.WithRootFolders(rootFolderRepo)
+	importScanner.WithSeriesRepo(seriesRepo)
+
+	// Startup check: warn if the configured default root folder no longer exists on disk.
+	if s, _ := settingsRepo.Get(ctxBoot, api.SettingDefaultLibraryRootFolderID); s != nil && s.Value != "" {
+		if id, err := strconv.ParseInt(s.Value, 10, 64); err == nil && id > 0 {
+			if rf, err := rootFolderRepo.GetByID(ctxBoot, id); err == nil && rf != nil {
+				if _, statErr := os.Stat(rf.Path); statErr != nil {
+					slog.Warn("default library root folder does not exist on disk — falling back to BINDERY_LIBRARY_DIR",
+						"path", rf.Path, "rootFolderId", id, "error", statErr)
+				}
+			} else {
+				slog.Warn("default library root folder ID not found in database — falling back to BINDERY_LIBRARY_DIR",
+					"rootFolderId", id)
+			}
+		}
+	}
+
 	libraryHandler := api.NewLibraryHandler(importScanner).WithSettings(settingsRepo)
-	fileHandler := api.NewFileHandler(bookRepo)
+	fileHandler := api.NewFileHandler(bookRepo, cfg.LibraryDir, cfg.AudiobookDir)
 	historyHandler := api.NewHistoryHandler(historyRepo, blocklistRepo)
 	blocklistHandler := api.NewBlocklistHandler(blocklistRepo)
 	notificationHandler := api.NewNotificationHandler(notificationRepo, notif)
 	qualityProfileHandler := api.NewQualityProfileHandler(qualityProfileRepo)
 	settingsHandler := api.NewSettingsHandler(settingsRepo)
-	seriesHandler := api.NewSeriesHandler(seriesRepo)
+	seriesHandler := api.NewSeriesHandler(seriesRepo, bookRepo, authorRepo, metaAgg, sched).
+		WithHardcoverFeatureSettings(settingsRepo, cfg.EnhancedHardcoverAPI).
+		WithFinder(importScanner)
 	tagHandler := api.NewTagHandler(tagRepo)
-	importListHandler := api.NewImportListHandler(importListRepo)
+	importListHandler := api.NewImportListHandler(importListRepo, hcSyncer)
 	metadataProfileHandler := api.NewMetadataProfileHandler(metadataProfileRepo)
 	delayProfileHandler := api.NewDelayProfileHandler(delayProfileRepo)
 	customFormatHandler := api.NewCustomFormatHandler(customFormatRepo)
 	bulkHandler := api.NewBulkHandler(authorRepo, bookRepo, blocklistRepo, sched)
 	backupHandler := api.NewBackupHandler(cfg.DBPath, cfg.DataDir)
 	rootFolderHandler := api.NewRootFolderHandler(rootFolderRepo)
-	logHandler := api.NewLogHandler(ring)
-	prowlarrHandler := api.NewProwlarrHandler(prowlarrRepo, indexerRepo)
+	logHandler := api.NewLogHandler(ring).WithLogRepo(logRepo).WithDBLogHandler(logDBHandler)
+	prowlarrHandler := api.NewProwlarrHandler(prowlarrRepo, indexerRepo).WithSettings(settingsRepo)
 	calibreHandler := api.NewCalibreHandler(settingsRepo)
-	calibreHandler.WithBookRepo(bookRepo)
-	if calibreAdderForScheduler != nil {
-		calibreHandler.WithAdder(calibreAdderForScheduler)
-	}
+	grimmoryHandler := api.NewGrimmoryHandler(settingsRepo).WithVersion(version)
+	absHandler := api.NewABSHandler(settingsRepo).WithVersion(version)
+	absConflictHandler := api.NewABSConflictHandler(absConflictRepo, authorRepo, bookRepo)
+	absImportHandler := api.NewABSImportHandler(absImporter, func(ctx context.Context) api.ABSStoredConfig {
+		return api.LoadABSConfig(ctx, settingsRepo)
+	})
+	absReviewHandler := api.NewABSReviewHandler(absReviewRepo, absImporter, func(ctx context.Context) api.ABSStoredConfig {
+		return api.LoadABSConfig(ctx, settingsRepo)
+	})
 	calibreImportHandler := api.NewCalibreImportHandler(calibreImporter, func() calibre.Config {
 		return api.LoadCalibreConfig(settingsRepo)
 	})
-	recHandler := api.NewRecommendationHandler(recRepo, recEngine, authorRepo, bookRepo, sched)
+	calibreSyncer := calibre.NewSyncer(bookRepo)
+	calibreSyncHandler := api.NewCalibreSyncHandler(
+		calibreSyncer,
+		func() calibre.Config { return api.LoadCalibreConfig(settingsRepo) },
+		func() calibre.Mode { return api.LoadCalibreMode(settingsRepo) },
+	)
+	recHandler := api.NewRecommendationHandler(recRepo, recEngine, authorRepo, bookRepo, sched).
+		WithFinder(seriesRepo, importScanner)
 	imageProxyHandler := api.NewImageProxyHandler(cfg.DataDir)
 	imageProxyHandler.StartEviction(24 * time.Hour)
 	migrateHandler := api.NewMigrateHandler(
 		authorRepo, indexerRepo, dlClientRepo, blocklistRepo, bookRepo, metaAgg,
 		// Bulk imports always populate the catalogue but never auto-grab.
-		func(a *models.Author) { authorHandler.FetchAuthorBooks(a, false) },
+		// Pass an empty media type so the handler falls back to the global
+		// default.media_type setting for each newly-created book.
+		func(a *models.Author) { authorHandler.FetchAuthorBooks(a, false, "") },
 	)
 
 	// Router
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
+	// BINDERY_TRUSTED_PROXY (optional): comma-separated IP/CIDR list of
+	// reverse proxies permitted to set X-Forwarded-For. When unset, XFF
+	// headers are ignored — required for local-only auth mode to be safe
+	// against on-network spoofing.
+	r.Use(trustedProxyMiddleware())
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Compress(5))
 	r.Use(api.SecurityHeaders)
+	r.Use(metrics.HTTPMiddleware(routeTemplate))
+
+	// Prometheus exposition. Mounted at the router root (no auth, no
+	// CSRF, no XRequestedWith) because Prometheus scrapes don't carry
+	// session cookies — operators are expected to restrict access via
+	// NetworkPolicy / firewall / reverse-proxy ACL. Bindery's API key
+	// is intentionally not honored here either; adding auth would
+	// require every scrape config to also carry the key, which is a
+	// worse default for the typical Helm-chart deployment.
+	metrics.SetBuildInfo(version, commit, date)
+	r.Handle("/metrics", metrics.Handler())
 
 	// Composite auth: session cookie (UI) OR API key (external apps) OR
 	// local-IP bypass when mode=local-only. Mode, key, and secret are sourced
 	// live from the DB so they can be rotated without a process restart.
-	authProvider := &dbAuthProvider{settings: settingsRepo, users: userRepo}
+	authProvider := &dbAuthProvider{
+		settings:       settingsRepo,
+		users:          userRepo,
+		proxyHeader:    cfg.ProxyAuthHeader,
+		proxyProvision: cfg.ProxyAutoProvision,
+		proxyCIDRs:     trustedCIDRs,
+	}
+
+	r.Route("/api", func(r chi.Router) {
+		r.Use(auth.Middleware(authProvider))
+		r.Use(auth.RequireXRequestedWith)
+		r.Use(auth.RequireCSRFToken(authProvider.SessionSecret))
+
+		r.Get("/queue", queueHandler.ListArrCompatible)
+	})
 
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Use(auth.Middleware(authProvider))
+		r.Use(auth.RequireXRequestedWith)
+		r.Use(auth.RequireCSRFToken(authProvider.SessionSecret))
 
 		// System
 		r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"status":"ok","version":"` + version + `"}`))
 		})
-		r.Get("/system/status", func(w http.ResponseWriter, _ *http.Request) {
+		r.Get("/system/status", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			cacheBytes, _ := imageProxyHandler.CacheSize()
-			_, _ = fmt.Fprintf(w,
-				`{"version":"%s","commit":"%s","buildDate":"%s","imageCacheBytes":%d}`,
-				version, commit, date, cacheBytes,
-			)
+			hardcoverState := api.HardcoverFeatureStateFor(r.Context(), settingsRepo, cfg.EnhancedHardcoverAPI)
+			_ = json.NewEncoder(w).Encode(struct {
+				Version                         string `json:"version"`
+				Commit                          string `json:"commit"`
+				BuildDate                       string `json:"buildDate"`
+				ImageCacheBytes                 int64  `json:"imageCacheBytes"`
+				EnhancedHardcoverAPI            bool   `json:"enhancedHardcoverApi"`
+				HardcoverTokenConfigured        bool   `json:"hardcoverTokenConfigured"`
+				EnhancedHardcoverDisabledReason string `json:"enhancedHardcoverDisabledReason,omitempty"`
+			}{
+				Version:                         version,
+				Commit:                          commit,
+				BuildDate:                       date,
+				ImageCacheBytes:                 cacheBytes,
+				EnhancedHardcoverAPI:            hardcoverState.EnhancedHardcoverAPI,
+				HardcoverTokenConfigured:        hardcoverState.HardcoverTokenConfigured,
+				EnhancedHardcoverDisabledReason: hardcoverState.EnhancedHardcoverDisabledReason,
+			})
 		})
 
 		// Auth — status/login/logout/setup are always allowed through the
 		// middleware (see auth.AllowUnauthPath). The config + mutation
 		// endpoints below sit behind it.
 		r.Get("/auth/status", authHandler.Status)
+		r.Get("/auth/csrf", authHandler.CSRF)
 		r.Post("/auth/login", authHandler.Login)
 		r.Post("/auth/logout", authHandler.Logout)
 		r.Post("/auth/setup", authHandler.Setup)
 		r.Get("/auth/config", authHandler.GetConfig)
 		r.Post("/auth/password", authHandler.ChangePassword)
 		r.Post("/auth/apikey/regenerate", authHandler.RegenerateAPIKey)
-		r.Put("/auth/mode", authHandler.SetMode)
+		// OIDC — login/callback are unauthenticated; provider management requires auth.
+		r.Get("/auth/oidc/providers", oidcHandler.GetProviders)
+		r.Put("/auth/oidc/providers", oidcHandler.SetProviders)
+		r.Get("/auth/oidc/redirect-base", oidcHandler.GetRedirectBase)
+		r.Post("/auth/oidc/test-discovery", oidcHandler.TestDiscovery)
+		r.Get("/auth/oidc/{provider}/login", oidcHandler.Login)
+		r.Get("/auth/oidc/{provider}/callback", oidcHandler.Callback)
+		// Admin-only auth mutations.
+		r.Group(func(r chi.Router) {
+			r.Use(auth.RequireAdmin)
+			r.Put("/auth/mode", authHandler.SetMode)
+			r.Get("/auth/users", userMgmtHandler.List)
+			r.Post("/auth/users", userMgmtHandler.Create)
+			r.Delete("/auth/users/{id}", userMgmtHandler.Delete)
+			r.Put("/auth/users/{id}/role", userMgmtHandler.SetRole)
+			r.Put("/auth/users/{id}/reset-password", userMgmtHandler.ResetPassword)
+		})
 
 		// Metadata search
 		r.Get("/search/author", searchHandler.SearchAuthors)
@@ -357,7 +607,9 @@ func main() {
 		r.Put("/author/{id}", authorHandler.Update)
 		r.Delete("/author/{id}", authorHandler.Delete)
 		r.Post("/author/{id}/refresh", authorHandler.Refresh)
+		r.Post("/author/{id}/relink-upstream", authorHandler.RelinkUpstream)
 		r.Get("/author/{id}/aliases", authorAliasHandler.List)
+		r.Delete("/author/{id}/aliases/{aliasID}", authorAliasHandler.Delete)
 		r.Post("/author/{id}/merge", authorAliasHandler.Merge)
 
 		// Books
@@ -368,6 +620,8 @@ func main() {
 		r.Delete("/book/{id}", bookHandler.Delete)
 		r.Delete("/book/{id}/file", bookHandler.DeleteFile)
 		r.Put("/book/{id}/exclude", bookHandler.ToggleExcluded)
+		r.Post("/book/{id}/rebind", bookHandler.Rebind)
+		r.Post("/book/{id}/map", bookHandler.MapMetadata)
 		r.Post("/book/{id}/enrich-audiobook", bookHandler.EnrichAudiobook)
 		r.Post("/book/{id}/calibre-sync", calibreHandler.CalibreSync)
 		r.Post("/book/{id}/search", indexerHandler.SearchBook)
@@ -377,14 +631,27 @@ func main() {
 		r.Get("/wanted/missing", bookHandler.ListWanted)
 		r.Post("/wanted/bulk", bulkHandler.WantedBulk)
 
-		// Indexers
+		// Indexers — reads available to all; mutations admin-only.
 		r.Get("/indexer", indexerHandler.List)
-		r.Post("/indexer", indexerHandler.Create)
 		r.Get("/indexer/{id}", indexerHandler.Get)
-		r.Put("/indexer/{id}", indexerHandler.Update)
-		r.Delete("/indexer/{id}", indexerHandler.Delete)
-		r.Post("/indexer/{id}/test", indexerHandler.Test)
 		r.Get("/indexer/search", indexerHandler.SearchQuery)
+		r.Get("/search/last-debug", indexerHandler.LastSearchDebug)
+		r.Group(func(r chi.Router) {
+			r.Use(auth.RequireAdmin)
+			r.Post("/indexer", indexerHandler.Create)
+			r.Put("/indexer/{id}", indexerHandler.Update)
+			r.Delete("/indexer/{id}", indexerHandler.Delete)
+			r.Post("/indexer/{id}/test", indexerHandler.Test)
+		})
+
+		// Prowlarr indexer sync
+		r.Get("/prowlarr", prowlarrHandler.List)
+		r.Post("/prowlarr", prowlarrHandler.Create)
+		r.Get("/prowlarr/{id}", prowlarrHandler.Get)
+		r.Put("/prowlarr/{id}", prowlarrHandler.Update)
+		r.Delete("/prowlarr/{id}", prowlarrHandler.Delete)
+		r.Post("/prowlarr/{id}/test", prowlarrHandler.Test)
+		r.Post("/prowlarr/{id}/sync", prowlarrHandler.Sync)
 
 		// Prowlarr indexer sync
 		r.Get("/prowlarr", prowlarrHandler.List)
@@ -400,18 +667,24 @@ func main() {
 		r.Post("/rootfolder", rootFolderHandler.Create)
 		r.Delete("/rootfolder/{id}", rootFolderHandler.Delete)
 
-		// Download clients
+		// Download clients — reads available to all; mutations admin-only.
 		r.Get("/downloadclient", dlClientHandler.List)
-		r.Post("/downloadclient", dlClientHandler.Create)
 		r.Get("/downloadclient/{id}", dlClientHandler.Get)
-		r.Put("/downloadclient/{id}", dlClientHandler.Update)
-		r.Delete("/downloadclient/{id}", dlClientHandler.Delete)
-		r.Post("/downloadclient/{id}/test", dlClientHandler.Test)
+		r.Group(func(r chi.Router) {
+			r.Use(auth.RequireAdmin)
+			r.Post("/downloadclient", dlClientHandler.Create)
+			r.Put("/downloadclient/{id}", dlClientHandler.Update)
+			r.Delete("/downloadclient/{id}", dlClientHandler.Delete)
+			r.Post("/downloadclient/{id}/test", dlClientHandler.Test)
+		})
 
 		// Queue
 		r.Get("/queue", queueHandler.List)
 		r.Post("/queue/grab", queueHandler.Grab)
 		r.Delete("/queue/{id}", queueHandler.Delete)
+		r.Get("/pending", pendingHandler.List)
+		r.Delete("/pending/{id}", pendingHandler.Delete)
+		r.Post("/pending/{id}/grab", pendingHandler.Grab)
 
 		// History
 		r.Get("/history", historyHandler.List)
@@ -435,15 +708,34 @@ func main() {
 		r.Get("/qualityprofile", qualityProfileHandler.List)
 		r.Get("/qualityprofile/{id}", qualityProfileHandler.Get)
 
-		// Settings
+		// Settings — reads available to all; mutations admin-only.
 		r.Get("/setting", settingsHandler.List)
 		r.Get("/setting/{key}", settingsHandler.Get)
-		r.Put("/setting/{key}", settingsHandler.Set)
-		r.Delete("/setting/{key}", settingsHandler.Delete)
+		r.Group(func(r chi.Router) {
+			r.Use(auth.RequireAdmin)
+			r.Put("/setting/{key}", settingsHandler.Set)
+			r.Delete("/setting/{key}", settingsHandler.Delete)
+			r.Post("/hardcover/test", settingsHandler.TestHardcover)
+			r.Get("/abs/config", absHandler.GetConfig)
+			r.Put("/abs/config", absHandler.SetConfig)
+			r.Post("/abs/test", absHandler.Test)
+			r.Post("/abs/libraries", absHandler.Libraries)
+			r.Post("/abs/import", absImportHandler.Start)
+			r.Get("/abs/import/status", absImportHandler.Status)
+			r.Get("/abs/import/runs", absImportHandler.Runs)
+			r.Post("/abs/import/runs/{runID}/rollback/preview", absImportHandler.RollbackPreview)
+			r.Post("/abs/import/runs/{runID}/rollback", absImportHandler.Rollback)
+			r.Get("/abs/review", absReviewHandler.List)
+			r.Post("/abs/review/{id}/approve", absReviewHandler.Approve)
+			r.Post("/abs/review/{id}/resolve-author", absReviewHandler.ResolveAuthor)
+			r.Post("/abs/review/{id}/resolve-book", absReviewHandler.ResolveBook)
+			r.Post("/abs/review/{id}/dismiss", absReviewHandler.Dismiss)
+			r.Get("/abs/conflicts", absConflictHandler.List)
+			r.Post("/abs/conflicts/{id}/resolve", absConflictHandler.Resolve)
+		})
 
 		// Series
-		r.Get("/series", seriesHandler.List)
-		r.Get("/series/{id}", seriesHandler.Get)
+		registerSeriesRoutes(r, seriesHandler)
 
 		// Recommendations
 		r.Get("/recommendations", recHandler.List)
@@ -467,6 +759,7 @@ func main() {
 		r.Get("/importlist/{id}", importListHandler.Get)
 		r.Put("/importlist/{id}", importListHandler.Update)
 		r.Delete("/importlist/{id}", importListHandler.Delete)
+		r.Post("/importlist/{id}/sync", importListHandler.Sync)
 
 		// Import list exclusions
 		r.Get("/importlistexclusion", importListHandler.ListExclusions)
@@ -505,9 +798,18 @@ func main() {
 		r.Get("/system/loglevel", logHandler.GetLevel)
 		r.Put("/system/loglevel", logHandler.SetLevel)
 
+		// Storage paths (read-only view of the env/config-driven dirs)
+		storageHandler := api.NewStorageHandler(cfg)
+		r.Get("/system/storage", storageHandler.Get)
+
 		// Library
 		r.Post("/library/scan", libraryHandler.Scan)
 		r.Get("/library/scan/status", libraryHandler.ScanStatus)
+
+		// Grimmory integration.
+		r.Get("/grimmory/config", grimmoryHandler.GetConfig)
+		r.Put("/grimmory/config", grimmoryHandler.SetConfig)
+		r.Post("/grimmory/test", grimmoryHandler.Test)
 
 		// Calibre integration — settings live under /setting/calibre.*,
 		// this endpoint just validates + probes the configured install.
@@ -518,9 +820,18 @@ func main() {
 		r.Post("/calibre/import", calibreImportHandler.Start)
 		r.Get("/calibre/import/status", calibreImportHandler.Status)
 
+		// Calibre bulk push (write side). Iterates every imported book and
+		// POSTs its file to the plugin; 409 Conflict is treated as
+		// idempotent. Single-job policy — second call returns 409.
+		r.Post("/calibre/sync", calibreSyncHandler.Start)
+		r.Get("/calibre/sync/status", calibreSyncHandler.Status)
+
 		// Migration imports (CSV of author names, or Readarr SQLite DB).
+		// The Readarr import is async — POST returns 202 immediately and the
+		// UI polls GET /migrate/readarr/status to track completion.
 		r.Post("/migrate/csv", migrateHandler.ImportCSV)
 		r.Post("/migrate/readarr", migrateHandler.ImportReadarr)
+		r.Get("/migrate/readarr/status", migrateHandler.ImportReadarrStatus)
 
 		// Image proxy — caches external cover images locally so the browser
 		// never leaks the user's IP to Goodreads / OpenLibrary / etc.
@@ -533,7 +844,7 @@ func main() {
 	opdsBuilder := opds.NewBuilder(opds.Config{Title: "Bindery", PageSize: 50}, bookRepo, authorRepo, seriesRepo)
 	opdsHandler := api.NewOPDSHandler(opdsBuilder, bookRepo, fileHandler)
 	r.Route("/opds", func(r chi.Router) {
-		r.Use(api.OPDSAuth(authProvider, userRepo))
+		r.Use(api.OPDSAuth(authProvider, userRepo, loginLimiter))
 		r.Get("/", opdsHandler.Root)
 		r.Get("/authors", opdsHandler.Authors)
 		r.Get("/authors/{id}", opdsHandler.Author)
@@ -550,34 +861,111 @@ func main() {
 		slog.Error("failed to load embedded frontend", "error", err)
 		os.Exit(1)
 	}
+
+	// Build the index.html payload once at startup. The backend injects two
+	// things before </head>:
+	//   1. <base href="<URLBase>/"> so that Vite's relative asset URLs
+	//      (./assets/…) resolve correctly regardless of which SPA route the
+	//      browser navigates to directly.
+	//   2. window.__BINDERY_BASE__ so the frontend can set BrowserRouter
+	//      basename and prefix API calls without a per-deployment build.
+	rawIndex, err := fs.ReadFile(distFS, "index.html")
+	if err != nil {
+		slog.Error("failed to read embedded index.html", "error", err)
+		os.Exit(1)
+	}
+	baseHref := cfg.URLBase + "/"
+	baseJSON, _ := json.Marshal(cfg.URLBase)
+	injection := fmt.Sprintf(`<script>window.__BINDERY_BASE__=%s</script><base href="%s">`, baseJSON, baseHref)
+	indexHTML := []byte(strings.Replace(string(rawIndex), "</head>", injection+"</head>", 1))
+
 	fileServer := http.FileServer(http.FS(distFS))
 	r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path[1:]
-		if path == "" {
-			path = "index.html"
+		if path == "" || path == "index.html" {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+			_, _ = w.Write(indexHTML)
+			return
 		}
 		if _, err := fs.Stat(distFS, path); err == nil {
 			fileServer.ServeHTTP(w, r)
 			return
 		}
-		r.URL.Path = "/"
-		fileServer.ServeHTTP(w, r)
+		// SPA fallback — unknown paths render the app shell.
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		_, _ = w.Write(indexHTML)
 	})
+
+	// If BINDERY_URL_BASE is set, mount the entire router under that prefix.
+	// chi.Mount strips the prefix before dispatching so all inner routes and
+	// the SPA handler continue to work unchanged against un-prefixed paths.
+	var handler http.Handler = r
+	if cfg.URLBase != "" {
+		outer := chi.NewRouter()
+		// Redirect bare prefix (no trailing slash) to prefix/ so the SPA
+		// bootstrap and asset resolution work correctly.
+		outer.Get(cfg.URLBase, http.RedirectHandler(cfg.URLBase+"/", http.StatusMovedPermanently).ServeHTTP)
+		outer.Mount(cfg.URLBase, r)
+		handler = outer
+		slog.Info("serving under path prefix", "urlBase", cfg.URLBase)
+	}
+
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	gracePeriod := 30 * time.Second
+	if v := os.Getenv("BINDERY_SHUTDOWN_GRACE"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			gracePeriod = d
+		}
+	}
 
 	addr := ":" + cfg.Port
 	slog.Info("listening", "addr", addr)
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           r,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      120 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
-	if err := srv.ListenAndServe(); err != nil {
-		slog.Error("server failed", "error", err)
-		os.Exit(1)
+
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- srv.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serveErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("server failed", "error", err)
+			os.Exit(1)
+		}
+	case <-sigCtx.Done():
+		slog.Info("received shutdown signal, draining…")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), gracePeriod)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			slog.Warn("server shutdown did not complete cleanly", "error", err)
+		}
+		slog.Info("shutdown complete")
 	}
+}
+
+func googleBooksAPIKey(ctx context.Context, settings *db.SettingsRepo) string {
+	if settings == nil {
+		return ""
+	}
+	if s, _ := settings.Get(ctx, settingGoogleBooksAPIKey); s != nil {
+		return strings.TrimSpace(s.Value)
+	}
+	if s, _ := settings.Get(ctx, legacySettingGoogleBooksAPIKey); s != nil {
+		return strings.TrimSpace(s.Value)
+	}
+	return ""
 }
 
 func defaultNamingTemplate(settings *db.SettingsRepo) string {
@@ -661,8 +1049,11 @@ func bootstrapAuth(ctx context.Context, settings *db.SettingsRepo, envSeed strin
 // dbAuthProvider adapts the DB-backed settings + user repo to the minimal
 // auth.Provider interface consumed by auth.Middleware.
 type dbAuthProvider struct {
-	settings *db.SettingsRepo
-	users    *db.UserRepo
+	settings       *db.SettingsRepo
+	users          *db.UserRepo
+	proxyHeader    string
+	proxyProvision bool
+	proxyCIDRs     []*net.IPNet
 }
 
 func (p *dbAuthProvider) Mode() auth.Mode {
@@ -692,4 +1083,58 @@ func (p *dbAuthProvider) SessionSecret() []byte {
 func (p *dbAuthProvider) SetupRequired() bool {
 	n, err := p.users.Count(context.Background())
 	return err == nil && n == 0
+}
+
+func (p *dbAuthProvider) ProxyAuthHeader() string         { return p.proxyHeader }
+func (p *dbAuthProvider) ProxyAutoProvision() bool        { return p.proxyProvision }
+func (p *dbAuthProvider) TrustedProxyCIDRs() []*net.IPNet { return p.proxyCIDRs }
+func (p *dbAuthProvider) UserRole(ctx context.Context, userID int64) string {
+	u, err := p.users.GetByID(ctx, userID)
+	if err != nil || u == nil {
+		return ""
+	}
+	return u.Role
+}
+func (p *dbAuthProvider) UserProvisioner() auth.UserProvisioner {
+	return &dbUserProvisioner{users: p.users}
+}
+
+// dbUserProvisioner implements auth.UserProvisioner using the UserRepo.
+type dbUserProvisioner struct {
+	users *db.UserRepo
+}
+
+func (p *dbUserProvisioner) ResolveOrProvisionUser(ctx context.Context, username string, autoProvision bool) (int64, error) {
+	if autoProvision {
+		u, err := p.users.GetOrCreateByUsername(ctx, username)
+		if err != nil {
+			return 0, err
+		}
+		return u.ID, nil
+	}
+	u, err := p.users.GetByUsername(ctx, username)
+	if err != nil {
+		return 0, err
+	}
+	if u == nil {
+		return 0, nil
+	}
+	return u.ID, nil
+}
+
+// routeTemplate returns the chi route pattern for the request (e.g.
+// "/api/v1/book/{id}") rather than the raw URL. Critical for Prometheus
+// metric labels — using the raw URL would create unbounded label cardinality
+// because every distinct id becomes a separate time series.
+//
+// Falls back to the URL path before any handler has matched the route, which
+// happens for 404s. Strip query strings — they're already excluded by URL.Path
+// but the comment is here for the reader.
+func routeTemplate(r *http.Request) string {
+	if rc := chi.RouteContext(r.Context()); rc != nil {
+		if pat := rc.RoutePattern(); pat != "" {
+			return pat
+		}
+	}
+	return r.URL.Path
 }

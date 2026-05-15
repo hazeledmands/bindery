@@ -3,12 +3,14 @@ package api
 import (
 	"context"
 	"encoding/xml"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -79,7 +81,7 @@ func opdsFixture(t *testing.T) (*chi.Mux, *db.UserRepo, *db.SettingsRepo, string
 
 	r := chi.NewRouter()
 	r.Route("/opds", func(r chi.Router) {
-		r.Use(OPDSAuth(p, users))
+		r.Use(OPDSAuth(p, users, auth.NewLoginLimiter(5, 15*time.Minute)))
 		r.Get("/", h.Root)
 		r.Get("/authors", h.Authors)
 		r.Get("/authors/{id}", h.Author)
@@ -119,7 +121,14 @@ func (p *testProvider) SessionSecret() []byte {
 	}
 	return []byte(s.Value)
 }
-func (p *testProvider) SetupRequired() bool { return false }
+func (p *testProvider) SetupRequired() bool                        { return false }
+func (p *testProvider) ProxyAuthHeader() string                    { return "X-Forwarded-User" }
+func (p *testProvider) ProxyAutoProvision() bool                   { return false }
+func (p *testProvider) TrustedProxyCIDRs() []*net.IPNet            { return nil }
+func (p *testProvider) UserRole(_ context.Context, _ int64) string { return "admin" }
+func (p *testProvider) UserProvisioner() auth.UserProvisioner {
+	return nil // proxy auth not exercised in these tests
+}
 
 // --- tests -------------------------------------------------------------------
 

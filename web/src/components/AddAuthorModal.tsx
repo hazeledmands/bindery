@@ -1,16 +1,31 @@
 import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { api, Author, MetadataProfile, RootFolder } from '../api/client'
+import { api, Author, MediaType, MetadataProfile, RootFolder } from '../api/client'
+import { splitAuthorSearchResults } from './addAuthorTitleGuard'
 
 interface Props {
   onClose: () => void
   onAdded: () => void
 }
 
+const AUTO_GRAB_STORAGE_KEY = 'addAuthor.autoGrab'
+
+function loadAutoGrabDefault(): boolean {
+  try {
+    const stored = localStorage.getItem(AUTO_GRAB_STORAGE_KEY)
+    if (stored === null) return true
+    return stored === 'true'
+  } catch {
+    return true
+  }
+}
+
 export default function AddAuthorModal({ onClose, onAdded }: Props) {
   const { t } = useTranslation()
   const [query, setQuery] = useState('')
   const [results, setResults] = useState<Author[]>([])
+  const [hiddenResults, setHiddenResults] = useState<Author[]>([])
+  const [showHiddenResults, setShowHiddenResults] = useState(false)
   const [searching, setSearching] = useState(false)
   const [searchError, setSearchError] = useState<string | null>(null)
   const [adding, setAdding] = useState<string | null>(null)
@@ -18,7 +33,8 @@ export default function AddAuthorModal({ onClose, onAdded }: Props) {
   const [profileId, setProfileId] = useState<number | null>(null)
   const [rootFolders, setRootFolders] = useState<RootFolder[]>([])
   const [rootFolderId, setRootFolderId] = useState<number | null>(null)
-  const [searchOnAdd, setSearchOnAdd] = useState(true)
+  const [searchOnAdd, setSearchOnAdd] = useState(loadAutoGrabDefault)
+  const [mediaType, setMediaType] = useState<MediaType>('ebook')
 
   useEffect(() => {
     api.listMetadataProfiles().then(ps => {
@@ -32,18 +48,35 @@ export default function AddAuthorModal({ onClose, onAdded }: Props) {
       setRootFolders(rfs)
       if (rfs.length > 0) setRootFolderId(rfs[0].id)
     }).catch(console.error)
+    // Seed the media-type dropdown with the global default setting so the
+    // user only has to override it when they want something different.
+    api.getSetting('default.media_type')
+      .then(s => {
+        if (s.value === 'ebook' || s.value === 'audiobook' || s.value === 'both') {
+          setMediaType(s.value)
+        }
+      })
+      .catch(() => { /* 404 = unset; keep ebook default */ })
   }, [])
 
   const search = async () => {
-    if (!query.trim()) return
+    const q = query.trim()
+    if (!q) return
     setSearching(true)
     setSearchError(null)
+    setShowHiddenResults(false)
     try {
-      const authors = await api.searchAuthors(query)
-      setResults(authors)
+      const [authors, books] = await Promise.all([
+        api.searchAuthors(q),
+        api.searchBooks(q).catch(() => []),
+      ])
+      const split = splitAuthorSearchResults(authors, books, q)
+      setResults(split.visible)
+      setHiddenResults(split.hidden)
     } catch (err) {
       setSearchError(err instanceof Error ? err.message : 'Search failed — try again')
       setResults([])
+      setHiddenResults([])
     } finally {
       setSearching(false)
     }
@@ -59,7 +92,13 @@ export default function AddAuthorModal({ onClose, onAdded }: Props) {
         searchOnAdd,
         metadataProfileId: profileId,
         rootFolderId: rootFolderId,
+        mediaType,
       })
+      try {
+        localStorage.setItem(AUTO_GRAB_STORAGE_KEY, String(searchOnAdd))
+      } catch {
+        // ignore storage failures (private mode, quota, etc.)
+      }
       onAdded()
       onClose()
     } catch (err: unknown) {
@@ -105,6 +144,20 @@ export default function AddAuthorModal({ onClose, onAdded }: Props) {
               </select>
             </div>
           )}
+          <div className="mb-3">
+            <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">
+              {t('addAuthorModal.mediaType', 'Media type')}
+            </label>
+            <select
+              value={mediaType}
+              onChange={e => setMediaType(e.target.value as MediaType)}
+              className="w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-emerald-500"
+            >
+              <option value="ebook">{t('mediaType.ebook', 'Ebook')}</option>
+              <option value="audiobook">{t('mediaType.audiobook', 'Audiobook')}</option>
+              <option value="both">{t('mediaType.both', 'Both')}</option>
+            </select>
+          </div>
           <label className="flex items-start gap-2 text-sm mb-3 cursor-pointer select-none">
             <input
               type="checkbox"
@@ -138,7 +191,7 @@ export default function AddAuthorModal({ onClose, onAdded }: Props) {
           </div>
 
           <div className="mt-4 max-h-80 overflow-y-auto space-y-2">
-            {results.map(author => (
+            {(showHiddenResults ? [...results, ...hiddenResults] : results).map(author => (
               <div
                 key={author.foreignAuthorId}
                 className="flex items-center justify-between p-3 rounded-md bg-slate-200/50 dark:bg-zinc-800/50 hover:bg-slate-200 dark:hover:bg-zinc-800"
@@ -147,7 +200,7 @@ export default function AddAuthorModal({ onClose, onAdded }: Props) {
                   <div className="font-medium text-sm">{author.authorName}</div>
                   <div className="text-xs text-slate-600 dark:text-zinc-500 flex flex-wrap gap-x-3">
                     {author.disambiguation && <span>{t('addAuthorModal.topWork')} {author.disambiguation}</span>}
-                    {author.statistics?.bookCount ? <span>{t('addAuthorModal.books', { count: author.statistics.bookCount })}</span> : null}
+                    {author.statistics?.bookCount ? <span title={t('addAuthorModal.booksTooltip')}>{t('addAuthorModal.books', { count: author.statistics.bookCount })}</span> : null}
                     {author.ratingsCount ? <span>{t('addAuthorModal.ratings', { count: author.ratingsCount })}</span> : null}
                   </div>
                 </div>
@@ -160,10 +213,22 @@ export default function AddAuthorModal({ onClose, onAdded }: Props) {
                 </button>
               </div>
             ))}
+            {hiddenResults.length > 0 && !showHiddenResults && (
+              <button
+                type="button"
+                onClick={() => setShowHiddenResults(true)}
+                className="w-full px-3 py-2 rounded-md border border-slate-300 dark:border-zinc-700 text-xs font-medium text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/60 dark:hover:bg-zinc-800/60 transition-colors"
+              >
+                {t('addAuthorModal.showHiddenResults', {
+                  count: hiddenResults.length,
+                  defaultValue: `Show ${hiddenResults.length} hidden result${hiddenResults.length === 1 ? '' : 's'}`,
+                })}
+              </button>
+            )}
             {searchError && (
               <p className="text-sm text-red-400 text-center py-4">{t('addAuthorModal.searchError', { error: searchError })}</p>
             )}
-            {results.length === 0 && !searching && !searchError && query && (
+            {results.length === 0 && hiddenResults.length === 0 && !searching && !searchError && query && (
               <p className="text-sm text-slate-600 dark:text-zinc-500 text-center py-4">{t('addAuthorModal.noResults')}</p>
             )}
           </div>

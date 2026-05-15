@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useMemo } from 'react'
+import { useEffect, useRef, useState, useMemo, useCallback } from 'react'
 import { Link } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { api, Book, SearchResult } from '../api/client'
@@ -22,6 +22,7 @@ export default function WantedPage() {
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [bulkBusy, setBulkBusy] = useState(false)
   const [showExcluded, setShowExcluded] = useState(false)
+  const [toast, setToast] = useState<string | null>(null)
   const selectAllRef = useRef<HTMLInputElement>(null)
 
   const load = () => {
@@ -31,6 +32,14 @@ export default function WantedPage() {
   useEffect(() => {
     load()
   }, [showExcluded])
+
+  useEffect(() => {
+    if (!toast) return
+    const timer = setTimeout(() => setToast(null), 2500)
+    return () => clearTimeout(timer)
+  }, [toast])
+
+  const showToast = useCallback((msg: string) => { setToast(msg) }, [])
 
   const filtered = useMemo(() => {
     if (!search.trim()) return books
@@ -45,7 +54,7 @@ export default function WantedPage() {
     setSearchingId(book.id)
     try {
       const res = await api.searchBook(book.id)
-      setResults(res)
+      setResults(res.results)
       setShowResults(book.id)
     } catch (err) {
       console.error(err)
@@ -65,11 +74,13 @@ export default function WantedPage() {
 
   const unmonitor = async (book: Book) => {
     setUnmonitoringId(book.id)
+    const prev = books
+    setBooks(books.filter(b => b.id !== book.id))
     try {
       await api.updateBook(book.id, { monitored: false })
-      setBooks(books.filter(b => b.id !== book.id))
-    } catch (err) {
-      alert(err instanceof Error ? err.message : 'Failed to unmonitor')
+    } catch {
+      setBooks(prev)
+      showToast("Couldn't update wanted list — reverted.")
     } finally {
       setUnmonitoringId(null)
     }
@@ -150,6 +161,11 @@ export default function WantedPage() {
 
   return (
     <div className={selectedIds.size > 0 ? 'pb-16' : ''}>
+      {toast && (
+        <div className="fixed bottom-6 right-6 z-50 px-4 py-2.5 bg-red-600 text-white rounded-lg shadow-lg text-sm font-medium animate-fade-in">
+          {toast}
+        </div>
+      )}
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-2xl font-bold">{t('wanted.title')}</h2>
         <div className="flex items-center gap-4">

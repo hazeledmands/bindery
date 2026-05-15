@@ -9,25 +9,42 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/vavallee/bindery/internal/db"
+	"github.com/vavallee/bindery/internal/importer"
 	"github.com/vavallee/bindery/internal/metadata"
 	"github.com/vavallee/bindery/internal/models"
+	"github.com/vavallee/bindery/internal/textutil"
 )
 
 type BookHandler struct {
 	books     *db.BookRepo
 	meta      *metadata.Aggregator
+	lookup    BookMetaLookup // used by Rebind; defaults to meta when non-nil
 	history   *db.HistoryRepo
 	searcher  BookSearcher
 	settings  *db.SettingsRepo
 	downloads *db.DownloadRepo
+	authors   *db.AuthorRepo
+	series    *db.SeriesRepo
 }
 
 func NewBookHandler(books *db.BookRepo, meta *metadata.Aggregator, history *db.HistoryRepo, searcher BookSearcher) *BookHandler {
-	return &BookHandler{books: books, meta: meta, history: history, searcher: searcher}
+	h := &BookHandler{books: books, meta: meta, history: history, searcher: searcher}
+	if meta != nil {
+		h.lookup = meta
+	}
+	return h
+}
+
+// WithMetaLookup overrides the BookMetaLookup used by Rebind. Useful in tests
+// to inject a stub without a real HTTP client.
+func (h *BookHandler) WithMetaLookup(l BookMetaLookup) *BookHandler {
+	h.lookup = l
+	return h
 }
 
 // WithSettings wires in the settings repo so the book handler can consult the
@@ -38,9 +55,21 @@ func (h *BookHandler) WithSettings(settings *db.SettingsRepo) *BookHandler {
 }
 
 // WithDownloads wires in the download repo so the book handler can clean up
-// download records when a book is deleted.
-func (h *BookHandler) WithDownloads(downloads *db.DownloadRepo) *BookHandler {
-	h.downloads = downloads
+// download records when a book is deleted with ?deleteFiles=true.
+func (h *BookHandler) WithDownloads(d *db.DownloadRepo) *BookHandler {
+	h.downloads = d
+	return h
+}
+
+// WithAuthors wires in the author repo so Rebind can detect author mismatches.
+func (h *BookHandler) WithAuthors(a *db.AuthorRepo) *BookHandler {
+	h.authors = a
+	return h
+}
+
+// WithSeries wires in the series repo so Rebind can re-link series membership.
+func (h *BookHandler) WithSeries(s *db.SeriesRepo) *BookHandler {
+	h.series = s
 	return h
 }
 
@@ -57,7 +86,7 @@ func (h *BookHandler) EnrichAudiobook(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "book not found"})
 		return
 	}
-	if book.MediaType != models.MediaTypeAudiobook {
+	if book.MediaType != models.MediaTypeAudiobook && book.MediaType != models.MediaTypeBoth {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "book is not an audiobook"})
 		return
 	}
@@ -65,16 +94,61 @@ func (h *BookHandler) EnrichAudiobook(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "set ASIN before enriching"})
 		return
 	}
+	if h.meta == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "metadata provider unavailable"})
+		return
+	}
 	if err := h.meta.EnrichAudiobook(r.Context(), book); err != nil {
 		slog.Warn("audnex enrich failed", "bookId", book.ID, "error", err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
 	}
+	h.tryMapAudiobookMetadataByASIN(r.Context(), book)
 	if err := h.books.Update(r.Context(), book); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	cleanBookDescription(book)
 	writeJSON(w, http.StatusOK, book)
+}
+
+func (h *BookHandler) tryMapAudiobookMetadataByASIN(ctx context.Context, book *models.Book) {
+	if h == nil || h.meta == nil || h.authors == nil || book == nil || strings.TrimSpace(book.ASIN) == "" {
+		return
+	}
+	target, err := h.meta.GetCanonicalBookByASIN(ctx, book.ASIN)
+	if err != nil {
+		slog.Debug("asin metadata map skipped", "bookId", book.ID, "asin", book.ASIN, "error", err)
+		return
+	}
+	if target == nil || strings.TrimSpace(target.ForeignID) == "" {
+		return
+	}
+	if existing, err := h.books.GetByForeignID(ctx, target.ForeignID); err != nil {
+		slog.Warn("asin metadata map conflict check failed", "bookId", book.ID, "foreignId", target.ForeignID, "error", err)
+		return
+	} else if existing != nil && existing.ID != book.ID {
+		return
+	}
+	currentAuthor, err := h.authors.GetByID(ctx, book.AuthorID)
+	if err != nil || currentAuthor == nil {
+		if err != nil {
+			slog.Warn("asin metadata map author lookup failed", "bookId", book.ID, "authorId", book.AuthorID, "error", err)
+		}
+		return
+	}
+	if !bookMapAuthorMatches(currentAuthor, target.Author) {
+		return
+	}
+	fallbackDescription := book.Description
+	fallbackImageURL := book.ImageURL
+	preserveBookStateForMetadataMap(book, target)
+	if book.Description == "" {
+		book.Description = fallbackDescription
+	}
+	if book.ImageURL == "" {
+		book.ImageURL = fallbackImageURL
+	}
 }
 
 func (h *BookHandler) List(w http.ResponseWriter, r *http.Request) {
@@ -115,6 +189,7 @@ func (h *BookHandler) List(w http.ResponseWriter, r *http.Request) {
 		books = []models.Book{}
 	}
 	for i := range books {
+		cleanBookDescription(&books[i])
 		proxyBookImages(&books[i])
 	}
 	writeJSON(w, http.StatusOK, books)
@@ -137,7 +212,23 @@ func (h *BookHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	proxyBookImages(book)
+	cleanBookDescription(book)
+	h.attachBookFiles(r.Context(), book)
 	writeJSON(w, http.StatusOK, book)
+}
+
+func cleanBookDescription(book *models.Book) {
+	if book != nil {
+		book.Description = textutil.CleanDescription(book.Description)
+	}
+}
+
+// attachBookFiles populates book.BookFiles from the book_files table.
+// Called on single-book responses so the frontend can display all tracked files.
+func (h *BookHandler) attachBookFiles(ctx context.Context, book *models.Book) {
+	if files, err := h.books.ListFiles(ctx, book.ID); err == nil {
+		book.BookFiles = files
+	}
 }
 
 func (h *BookHandler) Update(w http.ResponseWriter, r *http.Request) {
@@ -226,25 +317,33 @@ func (h *BookHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid id"})
 		return
 	}
-	// Opt-in `?deleteFiles=true` removes the on-disk file or folder for every
-	// tracked format, then sweeps for same-basename sibling files left behind by
-	// multi-format downloads (e.g. a download containing both .epub and .mobi).
+	// Opt-in `?deleteFiles=true` also removes every on-disk file tracked in
+	// book_files before dropping the record.
 	if r.URL.Query().Get("deleteFiles") == "true" {
-		if book, _ := h.books.GetByID(r.Context(), id); book != nil {
-			for _, p := range []string{book.EbookFilePath, book.AudiobookFilePath} {
-				if p != "" {
-					if err := removeBookPath(p); err != nil {
-						slog.Warn("book delete: failed to remove files", "id", id, "path", p, "error", err)
+		files, _ := h.books.ListFiles(r.Context(), id)
+		for _, f := range files {
+			if err := removeBookPath(f.Path); err != nil {
+				slog.Warn("book delete: failed to remove file", "id", id, "path", f.Path, "error", err)
+			}
+		}
+		// Fallback for books imported before the book_files migration.
+		if len(files) == 0 {
+			if book, _ := h.books.GetByID(r.Context(), id); book != nil {
+				for _, p := range []string{book.EbookFilePath, book.AudiobookFilePath, book.FilePath} {
+					if p != "" {
+						if err := removeBookPath(p); err != nil {
+							slog.Warn("book delete: failed to remove legacy file", "id", id, "path", p, "error", err)
+						}
 					}
 					deleteSiblings(p)
 				}
 			}
-			// Fallback for books with only the legacy file_path set.
-			if book.EbookFilePath == "" && book.AudiobookFilePath == "" && book.FilePath != "" {
-				if err := removeBookPath(book.FilePath); err != nil {
-					slog.Warn("book delete: failed to remove files", "id", id, "path", book.FilePath, "error", err)
-				}
-				deleteSiblings(book.FilePath)
+		}
+		// Clean up any pending/completed download records for this book so the
+		// queue does not show stale entries after a full book deletion.
+		if h.downloads != nil {
+			if err := h.downloads.DeleteByBook(r.Context(), id); err != nil {
+				slog.Warn("book delete: failed to clean download records", "id", id, "error", err)
 			}
 		}
 	}
@@ -262,90 +361,99 @@ func (h *BookHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// DeleteFile removes the on-disk file or folder backing an imported book and
+// DeleteFile removes the on-disk file(s) backing an imported book and
 // flips the book's status back to `wanted` so it re-appears on the Wanted page.
 //
-// For single-format books the file is always the one stored in file_path.
-// For dual-format books (media_type='both') an optional `?format=ebook` or
-// `?format=audiobook` query param scopes the deletion to one format; omitting
-// it (or passing any other value) deletes both.
+// An optional `?format=ebook` or `?format=audiobook` query param scopes the
+// deletion to one format; omitting it deletes all files for the book.
+// Files are enumerated from book_files; the legacy single-path columns are
+// checked as a fallback for books imported before the migration.
 func (h *BookHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseID(w, r)
 	if !ok {
 		return
 	}
+
+	format := r.URL.Query().Get("format") // optional: "ebook" | "audiobook"
+
+	// Enumerate files from book_files for this book.
+	allFiles, err := h.books.ListFiles(r.Context(), id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	// Filter to the requested format(s).
+	var toDelete []string
+	for _, f := range allFiles {
+		if format == "" || f.Format == format {
+			toDelete = append(toDelete, f.Path)
+		}
+	}
+
+	// Fallback for books imported before the book_files migration.
+	if len(toDelete) == 0 {
+		book, err := h.books.GetByID(r.Context(), id)
+		if err != nil || book == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "book not found"})
+			return
+		}
+		if format == "" || format == models.MediaTypeEbook {
+			if book.EbookFilePath != "" { //nolint:staticcheck
+				toDelete = append(toDelete, book.EbookFilePath) //nolint:staticcheck
+			} else if book.FilePath != "" && format == models.MediaTypeEbook {
+				toDelete = append(toDelete, book.FilePath)
+			}
+		}
+		if format == "" || format == models.MediaTypeAudiobook {
+			if book.AudiobookFilePath != "" { //nolint:staticcheck
+				toDelete = append(toDelete, book.AudiobookFilePath) //nolint:staticcheck
+			}
+		}
+		// Legacy single file_path (no format qualifier).
+		if format == "" && len(toDelete) == 0 && book.FilePath != "" {
+			toDelete = append(toDelete, book.FilePath)
+		}
+		if len(toDelete) == 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "book has no file to delete"})
+			return
+		}
+	}
+
+	// Remove files from disk and from book_files.
+	var deletedPaths []string
+	for _, p := range toDelete {
+		if err := removeBookPath(p); err != nil {
+			slog.Error("failed to remove book file", "id", id, "path", p, "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		deletedPaths = append(deletedPaths, p)
+		if _, err := h.books.RemoveBookFile(r.Context(), p); err != nil {
+			slog.Warn("failed to deregister book file", "id", id, "path", p, "error", err)
+		}
+	}
+
+	// Re-load the book to get the refreshed status and file paths.
 	book, err := h.books.GetByID(r.Context(), id)
 	if err != nil || book == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "book not found"})
 		return
 	}
-
-	format := r.URL.Query().Get("format") // optional: "ebook" | "audiobook"
-	deleteEbook := (format == "" || format == models.MediaTypeEbook) && book.EbookFilePath != ""
-	deleteAudiobook := (format == "" || format == models.MediaTypeAudiobook) && book.AudiobookFilePath != ""
-
-	if !deleteEbook && !deleteAudiobook {
-		// Legacy fallback: check the old file_path for books migrated before
-		// the dual-format columns were added.
-		if book.FilePath == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "book has no file to delete"})
-			return
-		}
-		deleteEbook = true // treat legacy file_path as ebook
-	}
-
-	var deletedPaths []string
-
-	if deleteEbook && book.EbookFilePath != "" {
-		if err := removeBookPath(book.EbookFilePath); err != nil {
-			slog.Error("failed to remove ebook path", "id", id, "path", book.EbookFilePath, "error", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-			return
-		}
-		deletedPaths = append(deletedPaths, book.EbookFilePath)
-		book.EbookFilePath = ""
-	}
-
-	if deleteAudiobook && book.AudiobookFilePath != "" {
-		if err := removeBookPath(book.AudiobookFilePath); err != nil {
-			slog.Error("failed to remove audiobook path", "id", id, "path", book.AudiobookFilePath, "error", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-			return
-		}
-		deletedPaths = append(deletedPaths, book.AudiobookFilePath)
-		book.AudiobookFilePath = ""
-	}
-
-	// Legacy file_path: clear when the corresponding per-format column is gone.
-	if book.EbookFilePath == "" && book.AudiobookFilePath == "" {
-		book.FilePath = ""
-	} else if book.EbookFilePath != "" {
-		book.FilePath = book.EbookFilePath
-	} else {
-		book.FilePath = book.AudiobookFilePath
-	}
-
-	// Status: back to wanted if any wanted format is now missing.
-	if book.NeedsEbook() || book.NeedsAudiobook() {
-		book.Status = models.BookStatusWanted
-	}
-
-	if err := h.books.Update(r.Context(), book); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
+	h.attachBookFiles(r.Context(), book)
+	cleanBookDescription(book)
 
 	if h.history != nil {
 		data, err := json.Marshal(map[string]any{"paths": deletedPaths})
 		if err != nil {
-			slog.Warn("failed to marshal deleted paths history event", "book_id", book.ID, "error", err)
+			slog.Warn("failed to marshal deleted paths history event", "book_id", id, "error", err)
 		} else if err := h.history.Create(r.Context(), &models.HistoryEvent{
 			BookID:      &book.ID,
 			EventType:   models.HistoryEventBookFileDeleted,
 			SourceTitle: book.Title,
 			Data:        string(data),
 		}); err != nil {
-			slog.Warn("failed to create deleted paths history event", "book_id", book.ID, "error", err)
+			slog.Warn("failed to create deleted paths history event", "book_id", id, "error", err)
 		}
 	}
 
@@ -354,6 +462,9 @@ func (h *BookHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 
 // removeBookPath deletes a file or directory at p. Audiobooks are stored as
 // folders (multi-part mp3/m4b + cover + cue); ebooks are single files.
+// For single files it also sweeps any sibling files in the same directory
+// that share the same basename (stem) and have a recognised book extension —
+// this handles dual-format downloads where epub + mobi land in one folder.
 // Returns nil if the path no longer exists — the net state is the same.
 func removeBookPath(p string) error {
 	info, err := os.Stat(p)
@@ -366,54 +477,41 @@ func removeBookPath(p string) error {
 	if info.IsDir() {
 		return os.RemoveAll(p)
 	}
-	if err := os.Remove(p); err != nil { //nosec G304 -- p is a DB-stored path, not user input
-		return err
-	}
-	// Clean up the parent directory when it is now empty.
-	parent := filepath.Dir(p)
-	if entries, err := os.ReadDir(parent); err == nil && len(entries) == 0 {
-		_ = os.Remove(parent) //nosec G304 -- derived from DB-stored path
-	}
-	return nil
-}
 
-// deleteSiblings removes all plain files in the same directory as p that
-// share the same stem (base name without extension). Used to sweep up
-// multi-format ebook files (epub/mobi/azw3) left behind when only one format
-// was tracked. p may have already been removed by removeBookPath — the
-// function derives dir and stem from the path string directly. Paths without
-// an extension (audiobook folder paths) are skipped. Errors are logged and
-// swallowed — best-effort cleanup.
-func deleteSiblings(p string) {
-	ext := filepath.Ext(p)
-	if ext == "" {
-		return // audiobook folders handled by removeBookPath; nothing to sweep
-	}
-	dir := filepath.Dir(p)
-	stem := strings.TrimSuffix(filepath.Base(p), ext)
-	if stem == "" {
-		return
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return // dir already gone or inaccessible
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		name := e.Name()
-		if strings.TrimSuffix(name, filepath.Ext(name)) == stem {
-			target := filepath.Join(dir, name)
-			if err := os.Remove(target); err != nil && !os.IsNotExist(err) { //nosec G304
-				slog.Warn("book delete: failed to remove sibling file", "path", target, "error", err)
+	// Sweep sibling book files with the same stem in the parent directory.
+	parent := filepath.Dir(p)
+	stem := strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
+	entries, readErr := os.ReadDir(parent)
+	if readErr == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			n := e.Name()
+			if !importer.IsBookFile(n) {
+				continue
+			}
+			s := strings.TrimSuffix(n, filepath.Ext(n))
+			if !strings.EqualFold(s, stem) {
+				continue
+			}
+			if rmErr := os.Remove(filepath.Join(parent, n)); rmErr != nil && !os.IsNotExist(rmErr) { //nosec G304 -- derived from DB-stored path
+				slog.Warn("book delete: failed to remove sibling file", "path", filepath.Join(parent, n), "error", rmErr)
 			}
 		}
+	} else {
+		// ReadDir failed — fall back to deleting only the target file.
+		if err := os.Remove(p); err != nil { //nosec G304 -- p is a DB-stored path written by the import pipeline, not user input
+			return err
+		}
 	}
-	// Clean up the parent directory when it is now empty.
-	if entries2, err := os.ReadDir(dir); err == nil && len(entries2) == 0 {
-		_ = os.Remove(dir) //nosec G304
+
+	// Clean up parent directory if it is now empty.
+	remaining, err := os.ReadDir(parent)
+	if err == nil && len(remaining) == 0 {
+		_ = os.Remove(parent) //nosec G304 -- derived from DB-stored path, not user input
 	}
+	return nil
 }
 
 func (h *BookHandler) ListWanted(w http.ResponseWriter, r *http.Request) {
@@ -431,11 +529,187 @@ func (h *BookHandler) ListWanted(w http.ResponseWriter, r *http.Request) {
 	if books == nil {
 		books = []models.Book{}
 	}
+	for i := range books {
+		cleanBookDescription(&books[i])
+	}
 	writeJSON(w, http.StatusOK, books)
 }
 
-// ToggleExcluded flips the excluded flag on a book. The response body is the
-// updated book so the UI can refresh in place without a second round-trip.
+// Rebind updates a book's foreign_id and metadata_provider, then re-fetches
+// metadata from that provider. This lets users correct a wrong metadata match
+// (e.g. an omnibus instead of the standalone Book 1) without deleting and
+// re-adding the book.
+//
+// Request body:
+//
+//	{
+//	  "provider":   "openlibrary"|"hardcover",
+//	  "foreign_id": "<id>",
+//	  "force":      false   // set true to override an author-mismatch warning
+//	}
+//
+// Returns 409 when the upstream record belongs to a different author unless
+// force=true is passed. Returns the updated book JSON on success.
+func (h *BookHandler) Rebind(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	book, err := h.books.GetByID(r.Context(), id)
+	if err != nil || book == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "book not found"})
+		return
+	}
+
+	var req struct {
+		Provider  string `json:"provider"`
+		ForeignID string `json:"foreign_id"`
+		Force     bool   `json:"force"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	req.Provider = strings.TrimSpace(strings.ToLower(req.Provider))
+	req.ForeignID = strings.TrimSpace(req.ForeignID)
+	if req.Provider == "" || req.ForeignID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provider and foreign_id are required"})
+		return
+	}
+	switch req.Provider {
+	case "openlibrary", "hardcover":
+		// valid
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provider must be 'openlibrary' or 'hardcover'"})
+		return
+	}
+
+	if h.lookup == nil {
+		writeJSON(w, http.StatusFailedDependency, map[string]string{"error": "metadata aggregator not configured"})
+		return
+	}
+
+	upstream, err := h.lookup.GetBookFromProvider(r.Context(), req.Provider, req.ForeignID)
+	if err != nil {
+		slog.Warn("rebind: upstream fetch failed", "bookId", book.ID, "provider", req.Provider, "foreignId", req.ForeignID, "error", err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	if upstream == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no record found for that provider and foreign ID"})
+		return
+	}
+
+	// Author-mismatch guard: if the upstream record belongs to a different
+	// author than the current book row, reject unless the caller passes force=true.
+	// This prevents a typo in the foreign ID from silently corrupting authorship.
+	if !req.Force && h.authors != nil && upstream.Author != nil && upstream.Author.ForeignID != "" {
+		currentAuthor, authErr := h.authors.GetByID(r.Context(), book.AuthorID)
+		if authErr == nil && currentAuthor != nil && currentAuthor.ForeignID != upstream.Author.ForeignID {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":           "author mismatch: upstream record belongs to a different author",
+				"current_author":  currentAuthor.Name,
+				"upstream_author": upstream.Author.Name,
+				"force_required":  true,
+			})
+			return
+		}
+	}
+
+	// Snapshot old identifiers for the audit trail before mutating the book.
+	oldProvider := book.MetadataProvider
+	oldForeignID := book.ForeignID
+
+	// Update the book with the new foreign ID and refreshed metadata.
+	// Preserve fields managed by the user or the import pipeline (status,
+	// monitored, file paths, media type, ASIN, narrator, calibre_id).
+	book.ForeignID = req.ForeignID
+	book.MetadataProvider = req.Provider
+	if upstream.Title != "" {
+		book.Title = upstream.Title
+		book.SortTitle = upstream.SortTitle
+	}
+	if upstream.OriginalTitle != "" {
+		book.OriginalTitle = upstream.OriginalTitle
+	}
+	if upstream.Description != "" {
+		book.Description = upstream.Description
+	}
+	if upstream.ImageURL != "" {
+		book.ImageURL = upstream.ImageURL
+	}
+	if upstream.ReleaseDate != nil {
+		book.ReleaseDate = upstream.ReleaseDate
+	}
+	if len(upstream.Genres) > 0 {
+		book.Genres = upstream.Genres
+	}
+	if upstream.AverageRating > 0 {
+		book.AverageRating = upstream.AverageRating
+		book.RatingsCount = upstream.RatingsCount
+	}
+	if upstream.Language != "" {
+		book.Language = upstream.Language
+	}
+	now := time.Now().UTC()
+	book.LastMetadataRefreshAt = &now
+
+	if err := h.books.Update(r.Context(), book); err != nil {
+		// A UNIQUE constraint means another book row already owns this foreign_id.
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "a different book already uses that foreign ID"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	// Re-link series membership: remove all existing links for this book, then
+	// attach whatever the upstream record declares.
+	if h.series != nil {
+		if existingIDs, serErr := h.series.GetSeriesIDsForBook(r.Context(), book.ID); serErr == nil {
+			for _, sid := range existingIDs {
+				_ = h.series.UnlinkBook(r.Context(), sid, book.ID)
+			}
+		}
+		for _, ref := range upstream.SeriesRefs {
+			s := &models.Series{ForeignID: ref.ForeignID, Title: ref.Title}
+			if err := h.series.CreateOrGet(r.Context(), s); err != nil {
+				slog.Warn("rebind: failed to upsert series", "series", ref.Title, "error", err)
+				continue
+			}
+			if err := h.series.LinkBook(r.Context(), s.ID, book.ID, ref.Position, ref.Primary); err != nil {
+				slog.Warn("rebind: failed to link book to series", "book", book.Title, "series", ref.Title, "error", err)
+			}
+		}
+	}
+
+	// Audit trail: record old and new identifiers so the operation is reversible
+	// by hand and visible in the activity history.
+	if h.history != nil {
+		type rebindData struct {
+			OldProvider  string `json:"oldProvider"`
+			OldForeignID string `json:"oldForeignId"`
+			NewProvider  string `json:"newProvider"`
+			NewForeignID string `json:"newForeignId"`
+		}
+		if data, jerr := json.Marshal(rebindData{oldProvider, oldForeignID, req.Provider, req.ForeignID}); jerr == nil {
+			bookID := book.ID
+			_ = h.history.Create(r.Context(), &models.HistoryEvent{
+				BookID:      &bookID,
+				EventType:   models.HistoryEventBookRebound,
+				SourceTitle: book.Title,
+				Data:        string(data),
+			})
+		}
+	}
+
+	h.attachBookFiles(r.Context(), book)
+	cleanBookDescription(book)
+	proxyBookImages(book)
+	writeJSON(w, http.StatusOK, book)
+}
+
 func (h *BookHandler) ToggleExcluded(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseID(w, r)
 	if !ok {
@@ -453,5 +727,163 @@ func (h *BookHandler) ToggleExcluded(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	book.Excluded = newVal
+	cleanBookDescription(book)
 	writeJSON(w, http.StatusOK, book)
+}
+
+func (h *BookHandler) MapMetadata(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	if h.meta == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "metadata provider unavailable"})
+		return
+	}
+	if h.authors == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "author repository unavailable"})
+		return
+	}
+	var req struct {
+		ForeignBookID string `json:"foreignBookId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if strings.TrimSpace(req.ForeignBookID) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "foreignBookId is required"})
+		return
+	}
+	book, err := h.books.GetByID(r.Context(), id)
+	if err != nil || book == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "book not found"})
+		return
+	}
+	target, err := h.meta.GetBook(r.Context(), req.ForeignBookID)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	if target == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "upstream book not found"})
+		return
+	}
+	if target.ForeignID == "" {
+		target.ForeignID = req.ForeignBookID
+	}
+	currentAuthor, err := h.authors.GetByID(r.Context(), book.AuthorID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if !bookMapAuthorMatches(currentAuthor, target.Author) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "target book author does not match current author"})
+		return
+	}
+
+	preserveBookStateForMetadataMap(book, target)
+	if err := h.books.Update(r.Context(), book); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	updated, err := h.books.GetByID(r.Context(), book.ID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	h.attachBookFiles(r.Context(), updated)
+	cleanBookDescription(updated)
+	proxyBookImages(updated)
+	writeJSON(w, http.StatusOK, updated)
+}
+
+func preserveBookStateForMetadataMap(book *models.Book, target *models.Book) {
+	id := book.ID
+	authorID := book.AuthorID
+	monitored := book.Monitored
+	status := book.Status
+	anyEditionOK := book.AnyEditionOK
+	selectedEditionID := book.SelectedEditionID
+	filePath := book.FilePath
+	mediaType := book.MediaType
+	narrator := book.Narrator
+	durationSeconds := book.DurationSeconds
+	asin := book.ASIN
+	calibreID := book.CalibreID
+	createdAt := book.CreatedAt
+	ebookFilePath := book.EbookFilePath
+	audiobookFilePath := book.AudiobookFilePath
+	excluded := book.Excluded
+
+	book.ForeignID = target.ForeignID
+	book.Title = target.Title
+	book.SortTitle = firstNonEmpty(target.SortTitle, target.Title)
+	book.OriginalTitle = target.OriginalTitle
+	book.Description = target.Description
+	book.ImageURL = target.ImageURL
+	book.ReleaseDate = target.ReleaseDate
+	book.Genres = target.Genres
+	if book.Genres == nil {
+		book.Genres = []string{}
+	}
+	book.AverageRating = target.AverageRating
+	book.RatingsCount = target.RatingsCount
+	book.Language = target.Language
+	book.MetadataProvider = firstNonEmpty(target.MetadataProvider, metadataProviderFromForeignID(target.ForeignID))
+
+	book.ID = id
+	book.AuthorID = authorID
+	book.Monitored = monitored
+	book.Status = status
+	book.AnyEditionOK = anyEditionOK
+	book.SelectedEditionID = selectedEditionID
+	book.FilePath = filePath
+	book.MediaType = mediaType
+	book.Narrator = narrator
+	book.DurationSeconds = durationSeconds
+	book.ASIN = asin
+	book.CalibreID = calibreID
+	book.CreatedAt = createdAt
+	book.EbookFilePath = ebookFilePath
+	book.AudiobookFilePath = audiobookFilePath
+	book.Excluded = excluded
+}
+
+func bookMapAuthorMatches(current, target *models.Author) bool {
+	if current == nil || target == nil {
+		return false
+	}
+	if strings.TrimSpace(current.ForeignID) != "" &&
+		strings.TrimSpace(target.ForeignID) != "" &&
+		strings.TrimSpace(current.ForeignID) == strings.TrimSpace(target.ForeignID) {
+		return true
+	}
+	if authorNameAutoMatches(current.Name, target.Name) {
+		return true
+	}
+	for _, alias := range target.AlternateNames {
+		if authorNameAutoMatches(current.Name, alias) {
+			return true
+		}
+	}
+	return false
+}
+
+func authorNameAutoMatches(a, b string) bool {
+	match := textutil.MatchAuthorName(a, b)
+	return match.Kind == textutil.AuthorMatchExact || match.Kind == textutil.AuthorMatchFuzzyAuto
+}
+
+func metadataProviderFromForeignID(foreignID string) string {
+	switch {
+	case strings.HasPrefix(foreignID, "gb:"):
+		return "googlebooks"
+	case strings.HasPrefix(foreignID, "hc:"):
+		return "hardcover"
+	case strings.HasPrefix(foreignID, "dnb:"):
+		return "dnb"
+	default:
+		return "openlibrary"
+	}
 }

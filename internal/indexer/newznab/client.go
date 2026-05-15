@@ -7,9 +7,11 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -17,15 +19,17 @@ import (
 
 // Client interacts with a single Newznab-compatible indexer.
 type Client struct {
-	baseURL string
-	apiKey  string
-	http    *http.Client
+	baseURL  string
+	baseHost string
+	apiKey   string
+	http     *http.Client
 }
 
 // New creates a Newznab client for a specific indexer.
 func New(baseURL, apiKey string) *Client {
 	parsedURL := normalizeEndpointURL(baseURL)
 	resolvedAPIKey := strings.TrimSpace(apiKey)
+	var baseHost string
 	if u, err := url.Parse(parsedURL); err == nil {
 		q := u.Query()
 		if resolvedAPIKey == "" {
@@ -36,13 +40,40 @@ func New(baseURL, apiKey string) *Client {
 		q.Del("apikey")
 		u.RawQuery = q.Encode()
 		parsedURL = strings.TrimRight(u.String(), "/")
+		baseHost = strings.ToLower(u.Host)
 	}
 
 	return &Client{
-		baseURL: parsedURL,
-		apiKey:  resolvedAPIKey,
-		http:    &http.Client{Timeout: 30 * time.Second},
+		baseURL:  parsedURL,
+		baseHost: baseHost,
+		apiKey:   resolvedAPIKey,
+		http:     &http.Client{Timeout: 30 * time.Second},
 	}
+}
+
+// signDownloadURL appends the indexer's apikey query parameter to a download
+// URL when, and only when, the URL points at the indexer's own host. This
+// fixes Prowlarr-proxy enclosure URLs (which omit the apikey and get rejected
+// by NZBGet as empty content) without leaking the apikey to third-party
+// direct-from-uploader links an indexer might return.
+func (c *Client) signDownloadURL(raw string) string {
+	if raw == "" || c.apiKey == "" {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if !strings.EqualFold(u.Host, c.baseHost) {
+		return raw
+	}
+	q := u.Query()
+	if q.Get("apikey") != "" {
+		return raw
+	}
+	q.Set("apikey", c.apiKey)
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 // Caps fetches the indexer capabilities.
@@ -69,6 +100,8 @@ func (c *Client) Search(ctx context.Context, query string, categories []int) ([]
 	if err != nil {
 		return nil, fmt.Errorf("search: %w", err)
 	}
+
+	slog.Debug("indexer query", "url", redactAPIKey(u))
 
 	var rss rssResponse
 	if err := c.getXML(ctx, u, &rss); err != nil {
@@ -101,10 +134,13 @@ func (c *Client) BookSearch(ctx context.Context, title, author string, categorie
 			"limit":  "100",
 		})
 		if err == nil {
+			slog.Debug("indexer query", "tier", 1, "url", redactAPIKey(u))
 			var rss rssResponse
 			if err := c.getXML(ctx, u, &rss); err == nil && len(rss.Channel.Items) > 0 && rss.Channel.Response.Total < 1000 {
+				slog.Debug("indexer query tier matched", "tier", 1, "count", len(rss.Channel.Items))
 				return c.parseResults(rss.Channel.Items), nil
 			}
+			slog.Debug("indexer query tier fallthrough", "tier", 1, "items", len(rss.Channel.Items))
 		}
 	}
 
@@ -112,6 +148,7 @@ func (c *Client) BookSearch(ctx context.Context, title, author string, categorie
 	if surname != "" && !strings.EqualFold(surname, author) {
 		results, err := c.Search(ctx, surname+" "+queryTitle, categories)
 		if err == nil && len(results) > 0 {
+			slog.Debug("indexer query tier matched", "tier", 2, "count", len(results))
 			return results, nil
 		}
 	}
@@ -120,22 +157,68 @@ func (c *Client) BookSearch(ctx context.Context, title, author string, categorie
 	if author != "" {
 		results, err := c.Search(ctx, author+" "+queryTitle, categories)
 		if err == nil && len(results) > 0 {
+			slog.Debug("indexer query tier matched", "tier", 3, "count", len(results))
 			return results, nil
 		}
 	}
 
 	// Tier 4: title only
+	slog.Debug("indexer query tier 4 (title only)", "title", queryTitle)
 	return c.Search(ctx, queryTitle, categories)
+}
+
+// redactAPIKey replaces the apikey query parameter value with *** so URLs
+// can be logged without leaking credentials.
+func redactAPIKey(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	q := u.Query()
+	if q.Get("apikey") != "" {
+		q.Set("apikey", "***")
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
 }
 
 // primaryTitleForQuery returns the portion of a book title before a colon,
 // so "Dune: Messiah" queries as "Dune". Indexers rarely have the subtitle
 // in the release name and including it can cause all-keyword-match failures.
+//
+// The title is also normalized so two book rows that differ only in
+// incidental metadata (leading/trailing whitespace, collapsed interior
+// whitespace, smart-quote variants, parenthesised language suffixes like
+// "(German Edition)") produce identical queries. Without this, ingesting
+// the same work from multiple metadata providers yields two rows that
+// search differently — see issue #250.
 func primaryTitleForQuery(title string) string {
 	if i := strings.Index(title, ":"); i > 0 {
-		return strings.TrimSpace(title[:i])
+		title = title[:i]
 	}
-	return title
+	return NormalizeQueryTitle(title)
+}
+
+// parenSuffixRe matches a trailing parenthesised qualifier used by metadata
+// providers to distinguish editions of the same work, e.g. "(German Edition)",
+// "(Unabridged)", "(2nd ed.)". Indexers almost never carry these qualifiers
+// in the release name, so including them reliably zeros out the result set.
+var parenSuffixRe = regexp.MustCompile(`\s*\([^)]*\)\s*$`)
+
+// NormalizeQueryTitle strips incidental differences that would cause two
+// metadata-provider rows for the same work to generate different indexer
+// queries: Unicode smart quotes are folded to ASCII, whitespace is trimmed
+// and collapsed, and a single trailing parenthesised qualifier is removed.
+// Called by primaryTitleForQuery and exported so ingestion paths can use
+// the same normalization for title-based deduplication.
+func NormalizeQueryTitle(title string) string {
+	title = strings.NewReplacer(
+		"\u2018", "'", "\u2019", "'",
+		"\u201C", `"`, "\u201D", `"`,
+		"\u2013", "-", "\u2014", "-",
+	).Replace(title)
+	title = parenSuffixRe.ReplaceAllString(title, "")
+	return strings.Join(strings.Fields(title), " ")
 }
 
 func authorSurname(author string) string {
@@ -152,6 +235,95 @@ func (c *Client) Test(ctx context.Context) error {
 	return err
 }
 
+// ProbeResult summarizes a connectivity and search check against the indexer.
+type ProbeResult struct {
+	Status        int    `json:"status"`
+	Categories    int    `json:"categories"`
+	BookSearch    bool   `json:"bookSearch"`
+	GeneralSearch bool   `json:"generalSearch"`
+	LatencyMs     int64  `json:"latencyMs"`
+	SearchResults int    `json:"searchResults"` // results from the test search query
+	SearchError   string `json:"searchError,omitempty"`
+	Error         string `json:"error,omitempty"`
+}
+
+// Probe performs a capabilities fetch followed by a lightweight test search,
+// returning a structured summary without writing anything to the database.
+//
+// The two-step approach catches a class of misconfiguration that caps-only
+// probes miss: an indexer can report HTTP 200 and valid capabilities while
+// still returning zero results for every query (wrong API key permissions,
+// no books indexed, category mismatch). The test search uses "t=search&q=book"
+// against the configured book categories and records how many results came
+// back so the UI can warn when connectivity succeeds but searches return nothing.
+func (c *Client) Probe(ctx context.Context) ProbeResult {
+	u, err := c.buildURL("caps", map[string]string{})
+	if err != nil {
+		return ProbeResult{Error: err.Error()}
+	}
+
+	start := time.Now()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return ProbeResult{Error: err.Error()}
+	}
+	req.Header.Set("User-Agent", "Bindery/0.1")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return ProbeResult{LatencyMs: time.Since(start).Milliseconds(), Error: err.Error()}
+	}
+	defer resp.Body.Close()
+
+	result := ProbeResult{Status: resp.StatusCode, LatencyMs: time.Since(start).Milliseconds()}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		result.Error = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return result
+	}
+
+	var caps capsResponse
+	if err := xml.NewDecoder(resp.Body).Decode(&caps); err != nil {
+		result.Error = fmt.Sprintf("parse caps: %v", err)
+		return result
+	}
+
+	result.Categories = len(caps.Categories.Categories)
+	result.BookSearch = strings.EqualFold(caps.Searching.BookSearch.Available, "yes")
+	result.GeneralSearch = strings.EqualFold(caps.Searching.Search.Available, "yes")
+
+	// Run a real test search against the book categories to catch the case
+	// where caps succeeds but actual queries return nothing.
+	hits, err := c.Search(ctx, "book", bookCategoriesFromCaps(caps))
+	if err != nil {
+		result.SearchError = err.Error()
+	} else {
+		result.SearchResults = len(hits)
+	}
+
+	return result
+}
+
+// bookCategoriesFromCaps extracts 7xxx (ebook) category IDs from a caps
+// response. Falls back to [7020] when none are advertised so the test
+// search always targets book content.
+func bookCategoriesFromCaps(caps capsResponse) []int {
+	var out []int
+	for _, cat := range caps.Categories.Categories {
+		id, err := strconv.Atoi(cat.ID)
+		if err != nil {
+			continue
+		}
+		if id/1000 == 7 {
+			out = append(out, id)
+		}
+	}
+	if len(out) == 0 {
+		return []int{7020}
+	}
+	return out
+}
+
 func (c *Client) parseResults(items []rssItem) []SearchResult {
 	results := make([]SearchResult, 0, len(items))
 	for _, item := range items {
@@ -159,7 +331,7 @@ func (c *Client) parseResults(items []rssItem) []SearchResult {
 			GUID:    item.GUID.Value,
 			Title:   item.Title,
 			Size:    item.Enclosure.Length,
-			NZBURL:  item.Enclosure.URL,
+			NZBURL:  c.signDownloadURL(item.Enclosure.URL),
 			PubDate: item.PubDate,
 		}
 
@@ -186,7 +358,7 @@ func (c *Client) parseResults(items []rssItem) []SearchResult {
 		}
 
 		if r.NZBURL == "" {
-			r.NZBURL = item.Link
+			r.NZBURL = c.signDownloadURL(item.Link)
 		}
 
 		results = append(results, r)
@@ -278,7 +450,7 @@ func normalizeEndpointURL(raw string) string {
 
 func intSliceToCSV(ints []int) string {
 	if len(ints) == 0 {
-		return "7000,7020"
+		return "7020"
 	}
 	parts := make([]string, len(ints))
 	for i, v := range ints {

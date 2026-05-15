@@ -4,9 +4,823 @@ All notable changes to Bindery are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com) and versions follow
 [Semantic Versioning](https://semver.org).
 
-## [Unreleased] — development branch
+## [Unreleased]
 
-The `development` branch carries the in-flight feature set for the next release. Images are published as `ghcr.io/vavallee/bindery:development` and `:dev-<sha>`; point ArgoCD at the `development` branch to follow. Treat these features as beta — schema migrations are additive and safe, but UX may still shift before tagging.
+## [v1.11.0] — 2026-05-14
+
+### Added
+
+- **SSO-only mode and OIDC account controls** (#654) — Three new env vars: `BINDERY_LOCAL_AUTH_ENABLED` (default `true`) disables password login entirely when set to `false`; `BINDERY_OIDC_AUTO_PROVISION` (default `true`) prevents automatic account creation for unknown OIDC users when set to `false`; `BINDERY_OIDC_EMAIL_LINK` (default `false`) links an unknown OIDC identity to an existing account by email on first login. Deployments that don't set these vars are unaffected.
+
+- **Indexer priority now applied to release scoring** (#656) — The `Priority` field on indexers (Settings → Indexers) previously had no effect. It now adds directly to the composite release score, so a higher-priority indexer wins ties and can outweigh small quality differences. Set Usenet indexers to a higher priority than torrent indexers to prefer Usenet when both have matching releases.
+
+### Fixed
+
+- **Recommendations now return empty genre arrays instead of null** — Recommendation storage normalizes missing and legacy `null` genre values to `[]`, keeping API responses consistent for clients.
+
+- **qBittorrent Docker hostname fix** (#640) — Bindery now fetches .torrent content itself and submits it to qBittorrent via multipart/form-data. Fixes setups where qBittorrent runs in a separate container and cannot resolve the Prowlarr/indexer internal hostname (e.g. `prowlarr:9696`). No config change needed.
+
+- **NZBGet Docker hostname fix** (#531) — Bindery now fetches the NZB file itself and sends it to NZBGet as base64-encoded content. Same fix as #640 for Usenet: NZBGet in a separate container no longer needs to reach the indexer URL directly. No config change needed.
+
+- **Non-standard indexer category passthrough** (#636) — Category IDs outside the standard 7xxx/3xxx ranges (e.g. MaM-style IDs) are now forwarded to the indexer unchanged instead of being dropped. Fixes searches returning no results on niche indexers with custom category numbering.
+
+- **Backup delete button in Settings → General → Backup** (#638) — Backup entries now have a delete button in the UI. Previously backups could only be removed by SSHing into the container.
+
+- **Log level toggle now propagates to log viewer** (#651) — Switching to DEBUG in Settings → System now immediately affects the log viewer. Previously only `BINDERY_LOG_LEVEL=debug` at startup had any visible effect.
+
+- **Discover page no longer crashes on books with no genre metadata** (#645) — The Recommendations page handles `genres: null` from the API gracefully instead of throwing a runtime render error.
+
+### Improved
+
+- **Book list query performance** (#648) — Book list queries now use a single CTE JOIN instead of correlated subqueries (previously 2N SQLite queries for N books). Noticeable speedup for libraries with more than a few hundred books.
+
+- **Download client form shows inline errors on save failure** (#649) — The Save button in the Add/Edit Download Client forms now displays an inline error message when the API call fails, rather than appearing to do nothing.
+
+### Internal
+
+- **Test coverage for grimmory and hardcoverlistsyncer** (#652) — Added unit and HTTP test coverage for `internal/grimmory` (0% → 93%) and `internal/hardcoverlistsyncer` (13% → 20%).
+
+### Chores
+
+- **Local check cleanup** — Restored downloader lint compliance and aligned the WantedPage test with optimistic unmonitor behavior so local checks can pass.
+
+## [v1.10.0] — 2026-05-13
+
+### Added
+
+- **Discord stats voice channels** — A k8s CronJob in `deploy/discord-stats.yaml` updates three Discord voice channels every 10 minutes with live active-install count, latest released version, and GitHub star count. Powered by a new `/stats.json` JSON endpoint on the telemetry server. Setup steps in `deploy/README.md`.
+- **Live ISBN provider integration tests** — New torture-corpus tests (`BINDERY_INTEGRATION=1` to run) exercise the aggregator's ISBN fallback chain against real DNB / OpenLibrary / GoogleBooks / Hardcover endpoints. Useful for catching upstream schema drift; skipped by default to avoid CI flake. Extracted from #515.
+- **Library scan status auto-refresh** (#544) — The Settings page now polls the scan endpoint every 2 s while a scan is running and shows an inline progress banner. No more F5 to see when the scan finishes.
+- **Expanded frontend test coverage** (#485) — Auth flow, Login page, History page, Queue page, WantedPage, full SettingsPage suite, and MSW-based API client tests; previously untested paths now have coverage.
+- **Auto-bump `bindery-ping` on release** (#557) — The goreleaser CI job now updates the `LATEST_VERSION` env var on the bindery-ping deployment automatically, eliminating the manual `auto/prod-deploy-X.Y.Z` step after each release. Requires `HETZ1_KUBECONFIG` secret.
+
+### Fixed
+
+- **Stale ABS-sourced author aliases are now cleaned up post-import** — When an audiobook import recorded a co-author (or a different-named primary author) as an alias, the alias would stick around tagged `SourceOLID="abs"` even when it no longer matched the canonical author. The importer now sweeps these at the end of each run and drops aliases that don't fuzzy-match the canonical name. Also prevents pen-name corruption by requiring secondary-author aliases recorded during import to fuzzy-match the canonical author. Extracted from #515.
+- **Manual alias deletion** — New `DELETE /api/v1/author/{id}/aliases/{aliasID}` endpoint lets the UI / API clients remove specific aliases without merging the whole author. Scoped to (authorID, aliasID) pair; returns 404 if the alias isn't on that author so cross-author tampering can't happen. Extracted from #515.
+- **Download client error messages now suggest the root cause** (#621) — Test-connection failures are classified by errno: DNS resolution failure suggests checking container networking; connection refused suggests the service isn't running on that port; timeouts suggest a firewall or proxy.
+- **WantedPage optimistic updates now roll back on failure** (#551) — If the API call fails after a monitored/wanted toggle, the UI reverts to the previous state and shows a toast ("Couldn't update — reverted. Retry?") instead of silently diverging from server state.
+- **Graceful SIGTERM/SIGINT shutdown** (#559) — The server now drains in-flight requests before exiting. Grace period defaults to 30 s and is configurable via `BINDERY_SHUTDOWN_GRACE`. `kubectl rollout restart` no longer drops in-flight requests.
+
+## [v1.9.3] — 2026-05-12
+
+### Fixed
+
+- **DNB add-by-ISBN no longer fails for German books with no OpenLibrary coverage** (#608) — DNB results now carry a stable author ForeignID (GND from MARC 100 $0 when present, otherwise a synthetic `dnb:author:<name-slug>`). When a canonical author (OpenLibrary / Hardcover) later arrives for the same SortName, the synthetic DNB row is migrated in place so the user keeps a single author record. Previously the add flow returned 422 "Author metadata unavailable" whenever no canonical provider had the ISBN.
+
+## [v1.9.2] — 2026-05-12
+
+### Fixed
+
+- **Backup creation no longer crashes the Settings page** (#594) — The backup endpoint returns `{name, size, modTime}` but the frontend was typed for `{filename}` and rendered the raw object, triggering React error #31 ("Objects are not valid as a React child"). Frontend types and the backup list rendering now match the API response shape.
+
+- **Hardcover list sync** (#562) — `GetListBooks` now queries the plural `lists(where: {id: {_eq: $id}}, limit: 1)` root field. The singular `list(id:)` query was rejected by Hardcover's GraphQL schema ("field 'list' not found in type: 'query_root'"), breaking every custom list Sync Now since v1.1.0.
+
+- **Proxy auth `/api/v1/auth/status`** (#560) — Proxy identity resolution now runs before the allow-unauth fast-path. Previously `/auth/status` was on the allow-unauth list and bypassed the proxy header lookup entirely, so SSO-authed users were never let past the login screen. Trusted-proxy CIDR gating preserved.
+
+- **Newznab / Prowlarr-proxy NZBGet rejections** (#531) — Download enclosure URLs are now signed with the indexer apikey when the URL host matches the indexer's own host. Prowlarr-proxied Usenet downloads were arriving at NZBGet as empty content ("Document is empty" / `id 0`) because the apikey was stripped at client construction but never re-applied to download URLs. Apikey is only appended for same-host URLs to avoid leaking it to third-party redirect targets.
+
+- **Author matching false positives** (#563) — Indexer release filter and library scanner now require all significant author tokens (>=3 chars) to match at word boundaries, not just surname substring. Releases like `Adam.Reid.Book.epub` will no longer be auto-imported under monitored author "Rachel Reid". Initials (1-2 char tokens) are treated as optional, so "George R. R. Martin" still matches "George Martin". ABS path was already safe (Jaro-Winkler whole-string match).
+
+- **Enhanced Hardcover series controls no longer hidden by default** (#596) — The deployment-wide `BINDERY_ENHANCED_HARDCOVER_API` flag now defaults to enabled. The saved Hardcover token and **Settings → General** admin toggle remain as the normal feature gates. Operators can still set the flag to `false` to disable the feature for an entire deployment.
+
+- **ABS review search results are scrollable and keep book-author links intact** (#599) — No-match review author/book searches now show up to 10 scrollable matches instead of truncating after three, and selecting a book result auto-links its author before resolving the book when the review item does not already have a resolved author.
+
+### Added
+
+- **Download queue surfaces timestamps** (#543, #592) — Each queue entry now shows the most recent meaningful event (imported / completed / grabbed / added) as a relative time, with the absolute UTC timestamp on hover.
+
+## [v1.9.1] — 2026-05-11
+
+### Fixed
+
+- **Author list no longer hides authors after user re-creation** — The "author already exists" duplicate check was global-scoped while the author list filtered by `owner_user_id`. Authors whose `owner_user_id` pointed to a deleted or re-created user were permanently invisible in the list but blocked re-addition. The check is now user-scoped so it agrees with what the list shows. A new migration (039) resets orphaned `owner_user_id` values to NULL so those authors become visible to all users immediately on upgrade.
+
+- **Canonical author name search now scoped to current user** — The name-deduplication path during author creation previously searched the global author pool, which could conflict with authors belonging to other users in multi-user setups.
+
+### Chores
+
+- **Frontend regression coverage expanded** (#427) — Added MSW-backed tests for login, CSRF handling, auth state/guards, Book Detail search/grab flows, and Wanted page search/grab/bulk actions.
+
+## [v1.9.0] — 2026-05-11
+
+### Added
+
+- **Book metadata can be remapped from the Book Detail page** (#590) — Books with ABS or stale metadata now show an **Improve metadata** action that searches upstream providers or accepts a direct provider ID. New `POST /api/v1/book/{id}/map` applies the upstream title, cover, language, ratings, genres, and provider ID while preserving local status, files, media type, ASIN, narrator, selected edition, and exclusion state.
+
+- **Calibre-Web-Automated (CWA) ingest** (#417) — A new
+  **Settings → General → Calibre-Web-Automated (CWA)** field configures a
+  shared ingest folder. When set, every successful ebook import is also
+  copied into that folder so a sibling
+  [CWA](https://github.com/crocodilestick/Calibre-Web-Automated) container
+  can auto-ingest it. Bindery keeps its own copy and never moves the file,
+  so a misconfigured CWA can't take bindery's library with it. No Calibre
+  runtime dependency is added to the bindery container — only the file
+  drop is in scope. Audiobook imports are unaffected since CWA is built
+  around ebook libraries.
+
+- **Prowlarr search timeout is now configurable** (#576) — The Prowlarr indexer
+  search timeout has been raised from 15 s to 60 s and can be adjusted in
+  **Settings → Indexers → Prowlarr → Search timeout**. Slow usenet indexers
+  no longer time out on the first query.
+
+### Fixed
+
+**Importer / download clients**
+
+- **qBittorrent SavePath fallback caused incorrect imports** (#574) — When
+  qBittorrent's `content_path` field was absent or empty, the importer
+  fell back to `SavePath` (the shared download root) and could match
+  unrelated files or walk directories it should not touch. The importer
+  now uses `content_path` exclusively and aborts cleanly when it is missing.
+- **Default import mode changed from `move` to `hardlink`/`copy`** (#577) —
+  The out-of-box default was `move`, which silently broke torrent/usenet
+  seeding immediately after import. Bindery now defaults to `hardlink` when
+  source and destination are on the same filesystem (free, preserves seeding)
+  or `copy` when they are cross-device. **Upgrade note**: migration 038
+  clears the implicit `move` default written at install time; users who
+  explicitly set an import mode in Settings are not affected.
+- **Downloads stuck in `importFailed` are now retried automatically** (#578)
+  — Previously, a download that failed during import was permanently orphaned.
+  Bindery now retries up to three times before leaving it for manual
+  intervention. Retry count is persisted via migration 037.
+- **CheckDownloads now polls all enabled download clients** (#572) — Only
+  the highest-priority client was polled for status updates. Secondary
+  clients (e.g. a second qBittorrent instance or a fallover) were silently
+  ignored. All enabled clients are now iterated in priority order.
+- **Bulk-grab torrent dedup race condition fixed** (#573) — Grabbing multiple
+  releases simultaneously could assign the same `torrent_id` to two
+  downloads, breaking per-download tracking. `AddTorrent` is now serialised.
+
+**Auth**
+
+- **API key authentication now grants admin role** (#582) — Requests
+  authenticated via API key successfully verified the key but did not set
+  the admin role in the request context, causing `RequireAdmin`-protected
+  endpoints to return 403. The role is now correctly propagated.
+- **Auth endpoints no longer require `X-Requested-With` header** (#575) —
+  The login endpoint enforced `X-Requested-With: bindery-ui`, blocking
+  non-browser clients (curl, mobile apps, integrations). Auth endpoints are
+  now exempt; programmatic clients should use API key auth instead of cookie
+  sessions.
+
+**AudioBookShelf (ABS)**
+
+- **ABS library is rescanned after audiobook import** (#581) — Bindery now
+  triggers `POST /api/v2/libraries/:id/scan` after a successful audiobook
+  import so the file appears in ABS immediately rather than on its next
+  scheduled scan.
+- **Move-mode audiobook imports no longer appear MISSING in ABS** (#583) —
+  The ABS rescan after import updates ABS's path knowledge, resolving the
+  MISSING status that appeared when the import moved the file.
+- **History events include format for dual-format books** (#584) — `bookImported`
+  events for books with `media_type='both'` now record which format (ebook
+  or audiobook) was imported, making the History page unambiguous.
+
+**Metadata**
+
+- **ISBN lookups now canonicalise provider-native matches** (#590) — ISBN
+  searches normalise ISBN input, consult configured metadata enrichers, and
+  conservatively relink provider-native results back to canonical OpenLibrary
+  works when the author/title evidence is unambiguous. This improves
+  translated and edition-specific matches while avoiding plausible
+  wrong-title fallbacks.
+- **Audiobook ASIN enrichment can relink to upstream metadata** (#590) —
+  Enriching an audiobook now uses Audnex ASIN metadata to find a safe
+  canonical upstream match, so ABS/imported audiobook rows can gain better
+  titles, covers, language, search metadata, and OpenLibrary IDs while
+  keeping audiobook-specific fields intact.
+- **ABS imports no longer trust stale secondary-author aliases or provenance**
+  (#590) — Existing ABS author provenance and aliases are reused only when
+  they still match the local author, preventing secondary-author names from
+  corrupting future imports.
+- **Direct book adds preserve series links** (#590) — Adding a book directly
+  no longer drops existing series associations during metadata
+  canonicalization.
+- **Google Books provider settings are respected at startup** (#590) —
+  Bindery now prefers the UI-managed Google Books API key, keeps legacy
+  setting fallback for existing installs, and treats a deliberately cleared
+  UI setting as disabled.
+
+## [v1.8.1] — 2026-05-09
+
+### Fixed
+
+- **DNB search results couldn't be added to the wanted list** (#545, #561)
+  — DNB bib records expose author *names* but not author IDs, so every
+  result had the Add button greyed out with a misleading "try a more
+  specific search" hint. The fix extracts ISBN(s) from MARC 020 in DNB
+  records and adds a cross-provider author resolver: when a search result
+  lacks a foreign author ID, the backend looks up the ISBN in OpenLibrary
+  and rewrites the request to use OL's canonical author/book identity.
+  Books that resolve end up under their OpenLibrary record (with OL's
+  title and metadata); books with no OL match return a clear "add the
+  author manually first" error instead of silently failing.
+- **Telemetry chart hides the freshly cut release** (#546) — `/stats`
+  truncated the version chart to top-8 by count, so a brand-new release
+  with one or two installs disappeared into `(other)` until it
+  organically out-ranked older versions (sometimes weeks). The chart now
+  pins the configured `LATEST_VERSION` into the visible region and
+  annotates it `(latest)` so newly cut releases are immediately visible.
+- **Transmission retry path silently used corrupted bodies** (#558) — On
+  retry against the Transmission RPC endpoint, `io.ReadAll` errors were
+  dropped and an empty / partial slice was used as the response body.
+  Errors now propagate via `fmt.Errorf("transmission: read retry body:
+  %w", err)` so a torn body fails loudly instead of producing
+  garbage-decoded torrent state.
+- **`refreshBookStatus` could zero a user's file paths on transient DB
+  errors** (#558) — `Scan` errors on the `book_files` lookup were dropped
+  via `_ = QueryRowContext(...).Scan(&path)`, so any error other than
+  `sql.ErrNoRows` (lock timeout, corruption, connection drop) wrote `""`
+  back to `book.EbookFilePath` / `book.AudiobookFilePath`. Now distinguishes
+  `sql.ErrNoRows` (legitimate empty path) from real failures via
+  `errors.Is`, returning the wrapped error in the latter case.
+- **Non-ASCII filenames mangled in Content-Disposition** (#558) — Library
+  file downloads now emit RFC 5987 `filename*=UTF-8''<percent-encoded>`
+  alongside the legacy `filename="..."` parameter, so titles with German /
+  Cyrillic / CJK characters land on disk with the correct name instead of
+  being rewritten to a quoted-printable mojibake form.
+- **Frontend timer leaks on unmount** (#556) — `AuthSettings`'s
+  copy-to-clipboard "copied" badge and `DiscoverPage`'s toast clear-out
+  used bare `setTimeout` calls that fired against unmounted components,
+  producing React's "can't update state on unmounted component" warning.
+  Both are now `useEffect`-driven with `clearTimeout` cleanup.
+
+### Changed
+
+- **Log persistence shutdown is now graceful** (#558) — `LogHandler.Stop()`
+  closes the in-memory channel and waits (bounded by a 5s context) for
+  the drain goroutine to flush any in-flight log entries before the
+  process exits. Wired into `cmd/bindery/main.go` as a deferred call.
+  Previously the goroutine leaked for the lifetime of the process and
+  any buffered entries were lost on shutdown. Note: the `defer` only
+  fires on clean main-return paths, not on signal-driven termination —
+  full benefit requires #559 (signal-based graceful shutdown), tracked
+  separately.
+- **Several previously-dropped errors now surface in the log stream**
+  (#558) — `slog.Warn` calls were added to `internal/api/imageproxy.go`
+  (response write), `internal/api/auth_oidc.go` (provider parse),
+  `internal/api/authors.go` (batch dedup updates),
+  `internal/db/recommendations.go` (genres marshal), and
+  `internal/prowlarr/syncer.go` (`SetLastSyncAt` after a successful
+  sync). Behaviour is unchanged; visibility is not.
+
+### Security
+
+- **API key compared with `subtle.ConstantTimeCompare` instead of `==`**
+  (#555) — Both the main HTTP middleware (`internal/auth/middleware.go`)
+  and the OPDS auth path (`internal/api/opds_auth.go`) used variable-time
+  string equality on the API key, leaking enough timing information to
+  enable a remote byte-by-byte recovery attack against a sufficiently
+  determined attacker. Both sites now use `subtle.ConstantTimeCompare`,
+  with the existing empty-key short-circuit preserved so empty submissions
+  don't telegraph the real key's length.
+- **GitHub Actions in `ping-server.yml` pinned to commit SHAs** (#555) —
+  Five actions (`actions/checkout`, `docker/login-action`,
+  `docker/setup-qemu-action`, `docker/setup-buildx-action`,
+  `docker/build-push-action`) were pinned by tag, leaving the workflow
+  vulnerable to a tag-rotation supply-chain attack. All are now pinned to
+  the same commit SHAs already in use in `ci.yml`.
+- **`cmd/telemetry-server/Dockerfile` base images pinned by digest**
+  (#555) — `golang:1.25-alpine` and `alpine:3.21` are now pinned to their
+  content-addressable digests so a tag rotation can't silently swap the
+  base image during the next ping-server build.
+- **Dedicated `*http.Client` for telemetry pings** (#555) — Replaces
+  `http.DefaultClient` for the once-per-day telemetry ping path with a
+  package-local client carrying its own timeout. The 10s context deadline
+  was already in place, but the dedicated client guards against unrelated
+  code mutating `DefaultClient` and reaching into the ping path.
+
+## [v1.8.0] — 2026-05-09
+
+### Added
+
+- **Manual Hardcover list sync** (#536) — A "Sync now" button on each Hardcover list row in **Settings → Import** triggers an immediate sync without waiting for the 24-hour scheduler tick. New `POST /api/v1/importlist/{id}/sync` endpoint backs the button and is scriptable from the CLI.
+- **Top-level React ErrorBoundary** (#530, #539) — Render-time errors no longer blank the entire page. A friendly fallback card with **Reload** / **Show details** buttons sits outside the router, so even router-level throws are caught.
+
+### Fixed
+
+- **Prowlarr add-form silently swallowed errors** (#536) — Failed adds now surface a red error message under the form instead of failing silently. Sync errors (separate from the add itself) are non-fatal so a successful Prowlarr connection is not rolled back by a transient sync failure.
+- **Telemetry only pings for semver release versions** (#527) — Dev / branch builds no longer ping the telemetry endpoint, keeping ingestion data clean.
+
+### Security
+
+- **Go 1.26.3 stdlib security release** (#540) — Bumps the runtime image from `golang:1.26.2-alpine` to `1.26.3-alpine`, picking up patches for CVE-2026-42499, CVE-2026-39820, CVE-2026-39823, CVE-2026-39825, CVE-2026-39826, CVE-2026-33811, CVE-2026-33814, CVE-2026-39836. Container Scan (Trivy CRITICAL+HIGH) returns to green on this release.
+- **`security-events: write` scoped to SARIF-uploading jobs only** (#538) — Removed the over-broad workflow-level write permission from `security.yml`; only the four jobs that actually call `github/codeql-action/upload-sarif` (`sast-go`, `sast-frontend`, `secrets-scan`, `iac-scan`) hold the scope. OpenSSF Scorecard `Token-Permissions` improvement.
+- **Dependabot security updates enabled** at the repo level — weekly version updates already shipped via `dependabot.yml`; this turns on the security advisory channel for transitive vulns.
+
+### Docs
+
+- **Indexer / Prowlarr URL guidance** (#536) — New section in `docs/DEPLOYMENT.md` explaining why loopback URLs (`127.0.0.1`, `localhost`) are rejected by the SSRF policy and what alternatives to use (docker service name, LAN IP, or container IP).
+- **README pruned to ~280 lines** — Hero, Why Bindery, Features (compressed), Quick Start, signposts. Implementation detail moved to new `docs/ARCHITECTURE.md` and `docs/API.md`. SECURITY.md supported-versions table bumped to 1.8.x.
+- **Unraid Community Apps template** (#526) — Template added to repo; selfhosters marketplace listing pending review.
+
+### Chores
+
+- **Series Codecov follow-up coverage** (#475) — Targeted tests for series API edge cases, repository hydration and linking behavior, metadata aggregator series catalog fallback/cache behavior, and series matching helpers after gaps were noticed in the Codecov report for PR #459.
+- **Hero screenshots refreshed** (#528, #529).
+
+## [v1.7.0] — 2026-05-08
+
+### Added
+
+- **Subpath / reverse-proxy hosting** (`BINDERY_URL_BASE`) (#516) — New env var strips incoming URLs to their path, validates the prefix, injects `<base href>` and `window.__BINDERY_BASE__` into the served `index.html` at runtime, and mounts all chi routes under the prefix. Vite is built with `base: './'` for relative asset URLs; the React router and API client read `window.__BINDERY_BASE__` for the basename and prefix.
+- **Re-bind book to a different metadata record** (#519) — New `POST /api/v1/books/{id}/rebind` endpoint accepts a provider (`openlibrary` | `hardcover`) and a foreign ID, validates the upstream record, warns on author mismatch (with `force_required:true`) unless `force:true` is sent, clears and re-links series membership, and writes a `bookRebound` audit entry to History. A Re-bind dialog is accessible from the Book Detail page.
+- **DNB as primary metadata provider** (#521) — DNB's SRU endpoint now supports `GetAuthorWorks()` and can be selected as the primary provider in **Settings → General → Metadata Provider**. OpenLibrary remains the default. When DNB is primary, roles are swapped at startup.
+
+### Fixed
+
+- **Library scan: sort-suffix folders now reconciled** (#517) — Files stored in librarian sort-suffix form (`Title, The` / `Title, A`) are correctly matched during library scan. A new `normalizeTitle()` helper handles `, the` / `, an` / `, a` comma-suffix inversion and is applied in both `titleMatch()` and the JW-similarity comparison in `ScanLibrary()`.
+- **Hardcover lists fetch repaired** (#518) — Three response structs (`GetUserWishlist`, `GetUserLists`, `getShelfBooks`) incorrectly expected a single `Me` object; they now unmarshal `Me` as an array with a `len==0` guard, matching the actual API response shape.
+
+### Changed / Refactored
+
+- **Post-create wanted-book logic centralised** (#520) — `handleNewWantedBook()` extracted in `internal/api/authors.go` and called from `FetchAuthorBooks`, `RecommendationHandler.Add`, and `SeriesHandler.ensureHardcoverCatalogBook`, eliminating three copies of the same file-exists / auto-search dance.
+
+## [v1.6.0] — 2026-05-07
+
+### Fixed
+
+- **Authenticated users no longer see the login page** (#493) — Visiting `/login` (or `/setup`) with a valid session now redirects to `/` instead of rendering a stale auth screen. New `PublicOnlyRoute` guard wraps both routes; mirrors the existing `AuthGuard` loading behaviour so there is no flash on refresh, and routes back to `/setup` if setup is still required.
+- **Discover page now uses the wrapping-grid layout** (#347) — Recommendation rows now match Books and Authors with `grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4` so all cards are visible at a glance, instead of horizontally scrolling. Section headings, grouping logic, the cold-start note, and empty/disabled states are unchanged.
+
+## [v1.5.0] — 2026-05-07
+
+### Added
+
+- **Audiobookshelf (ABS) integration is now always enabled** — The `BINDERY_ABS_ENABLED` feature flag has been removed. ABS configuration, import, review, and conflict endpoints are unconditionally available; the ABS tab always appears in Settings for admins. Existing installs that relied on the flag being `false` to hide the UI will now see the tab; those that set it to `true` can simply remove the env var.
+- **Grimmory integration** — New **Settings → Grimmory** tab for configuring a [Grimmory](https://grimmory.org/) self-hosted digital library. Stores server URL and API key; a Test Connection button pings `GET /api/status`. New `GET/PUT /api/v1/grimmory/config` and `POST /api/v1/grimmory/test` endpoints back the UI. API paths are based on current Grimmory OpenAPI docs and will be updated as the API stabilises.
+- **Separate audiobook download watch folder** — New `BINDERY_AUDIOBOOK_DOWNLOAD_DIR` env var (also exposed in **Settings → General**). When set, the scanner uses this directory for audiobook downloads and falls back to `BINDERY_DOWNLOAD_DIR` for ebooks. Unset by default — fully backwards-compatible. Mirrors the existing `BINDERY_AUDIOBOOK_DIR` split on the library side.
+
+### Fixed
+
+- **`.opus` added to recognised book and audio-tag extensions** — Opus-encoded audiobook files are now detected and tagged correctly.
+- **Hardcover built-in shelves surface in the list picker** — "Want to Read", "Currently Reading", and "Read" now appear alongside user-created lists when adding a book to a Hardcover shelf.
+- **Telemetry security hardening** (#482) — Three fixes to the optional telemetry server: redirect target now uses `CANONICAL_HOST` instead of the user-controlled `Host` header (open redirect); rate-limiter key now strips the port from `RemoteAddr` so connections from the same IP share one bucket; `BINDERY_TELEMETRY_DISABLED=true` is now checked before the settings table on first boot so the opt-out takes effect immediately.
+
+## [v1.4.5] — 2026-05-06
+
+### Added
+
+- **Book Detail page now exposes the media-type selector** — Imported and downloaded books can now be flipped between ebook / audiobook / both directly from the Book Detail page. Previously this was only available on the Wanted page, so once a book progressed past wanted there was no UI path to add the second format short of deleting and re-adding the author.
+- **Author Detail page now has an Edit modal** — Quality profile, metadata profile, and root folder are now editable from the Author Detail page; previously the only way to change them was to delete the author and re-add. Triggered from a new Edit button next to the existing actions.
+
+### Fixed
+
+- **Mobile session cookie no longer evicted on app switch** — Login without "Remember me" now sets `Max-Age` on the session cookie (was previously a browser-session cookie with no expiry hint), so iOS Safari and Android Chrome don't drop it when the tab is backgrounded or the OS suspends the browser process. The 12-hour / 30-day durations were already encoded in `auth.SessionDurationShort` / `auth.SessionDuration` but never reached the wire on the short branch.
+
+## [v1.4.4] — 2026-05-06
+
+### Fixed
+
+- **Manual series mutations require admin role** (#468) — Authenticated non-admin users can no longer create, update, monitor, delete, fill, or link series to Hardcover. Read-only series endpoints remain available to authenticated users.
+- **Library file matching now respects media type** (#488, #454) — `FindExisting` now picks the right library root based on the book's `media_type` instead of always walking `BINDERY_LIBRARY_DIR` first. Audiobook book rows are matched against `BINDERY_AUDIOBOOK_DIR` (with fallback to `BINDERY_LIBRARY_DIR` when the audiobook root is unset), ebook rows are matched against `BINDERY_LIBRARY_DIR`, and dual-format / unspecified rows preserve the prior behaviour of walking both roots with the ebook library first. Previously a same-titled ebook in `libraryDir` could be mis-attributed to an audiobook entry on rescan, and authors filtered to "audiobooks only" still had file lookups walk the ebook root.
+- **Edition dedup now strips subtitles** (#458) — Author sync no longer creates duplicate rows when OpenLibrary returns the same work twice with different subtitle handling — typically the audiobook drops the post-colon subtitle while the ebook keeps it (e.g. *Carl's Doomsday Scenario* vs. *Carl's Doomsday Scenario: Dungeon Crawler Carl, Book 2*). `NormalizeTitleForDedup` now drops a `: subtitle` tail when the colon is followed by whitespace, so both editions collapse to the same key and the existing v1.3.1 dual-format upgrade path is taken instead of inserting a duplicate.
+- **Series title inputs now have an API length limit** (#469) — Manual series creation and title updates now reject titles longer than 500 bytes before writing to SQLite, preventing oversized titles from being stored through the HTTP API.
+- **Hardcover GraphQL success responses are bounded** (#470) — Successful Hardcover responses are now read through an 8 MiB cap so a misbehaving upstream cannot force unbounded memory growth before JSON parsing.
+- **Add-author search no longer hides valid author results when the query matches a book title** — Results whose name exactly matches a known book title and whose disambiguation points to that book's real author are now placed behind a reveal button rather than silently dropped.
+
+## [v1.4.3] — 2026-05-06
+
+### Fixed
+
+- **Discover now shows recommendations for all libraries** — The `ratingsCount < 50` hard filter was silently dropping every candidate from the most useful recommendation sources: monitored-author books, series continuations, and genre-popular picks from OpenLibrary. These sources already carry an implicit quality signal (the user chose to monitor the author; the book is part of a series they're reading; OL's subject curators selected it), so gating them on OL's sparse ratings data was wrong. Only serendipity and list-cross candidates — which come from broader, uncurated pools — now require a ratings signal. The filter is unchanged for those types.
+
+## [v1.4.2] — 2026-05-06
+
+### Fixed
+
+- **Discover works for libraries migrated from pre-v1.4.1** — Author refresh now updates `ratings_count` and `average_rating` on books that already exist in the database. Previously, `FetchAuthorBooks` skipped all processing for existing books (by foreign ID or deduplicated title), so libraries that had synced authors before v1.4.1 kept `ratings_count=0` on every book even after an upgrade and refresh. The recommender's hard filter then dropped all candidates, leaving Discover empty. A refresh-metadata run now back-fills ratings from OpenLibrary for any book where we have better data.
+
+## [v1.4.1] — 2026-05-06
+
+### Fixed
+
+- **Discover page no longer shows "not enough data" for populated libraries** — `GetAuthorWorks` was not requesting `ratings_count`/`ratings_average` from the OpenLibrary search API, so every book stored via a monitored-author sync had `RatingsCount=0`. The recommender's hard filter drops candidates with fewer than 50 ratings, silently eliminating all author-new and series candidates regardless of library size. The search query now fetches those fields and the enrichment merge propagates them to the stored book rows.
+
+## [v1.4.0] — 2026-05-05
+
+### Added
+
+- **Enhanced series data via Hardcover** — Series can now be managed manually, linked to Hardcover series, and compared against the Hardcover catalog. The Series page shows present, missing, local-only, and uncertain books; missing catalog entries can be filled all at once or one row at a time, creating wanted/monitored book rows and queuing searches. The enhanced controls are gated behind `BINDERY_ENHANCED_HARDCOVER_API`, a saved Hardcover API token, and the admin setting in **Settings -> General**.
+- **Prometheus `/metrics` endpoint** (#429) — Bindery now exposes `bindery_http_*` (request rate / latency by route template), `bindery_scheduler_*` (job-run counts and durations), and `bindery_build_info` alongside the standard `go_*` runtime and `process_*` collectors. Mounted at `/metrics` outside the `/api` auth chain so Prometheus scrapes work without session cookies; restrict access via NetworkPolicy / firewall / reverse-proxy ACL. Background jobs now also recover from panics so a single buggy job no longer tears down the scheduler goroutine.
+- **OIDC settings UI gains a "Test discovery" button** (#460) — Next to the Issuer URL field on the **Add provider** form, a Test button hits the IdP's `/.well-known/openid-configuration` server-side and renders the result inline: discovered authorize/token endpoints + supported scopes on success, the raw error (DNS, TLS, 404, JSON parse) on failure. Critically, surfaces **issuer mismatch** when the discovered issuer differs from the entered URL — the silent killer for Authentik per-provider mode and Keycloak realm paths. New `POST /api/v1/auth/oidc/test-discovery` endpoint backs the button.
+- **OIDC settings UI shows a live callback URL preview** (#460) — As you type the provider id in **Settings → Security → OIDC Providers → Add provider**, the form renders the exact redirect URI Bindery will register with the IdP, with a copy-to-clipboard button. New `GET /api/v1/auth/oidc/redirect-base` endpoint returns `{ base, callback_path }` for the current request — eliminates the most common setup mistake (registering a URL that doesn't match what Bindery actually sends).
+
+### Changed
+
+- **OIDC redirect base URL is now optional behind a trusted proxy** (#460) — `BINDERY_OIDC_REDIRECT_BASE_URL` is no longer strictly required when Bindery sits behind a reverse proxy. If the env var is unset and `BINDERY_TRUSTED_PROXY` is configured, Bindery derives the public-facing base URL from `X-Forwarded-Proto` + `X-Forwarded-Host` on each request. Explicit env-var values still win when set (needed for path-prefix deploys). Previously a missing env var produced a relative `redirect_uri`, which IdPs reject with `redirect_uri_mismatch`. The redirect base resolved at `/login` is round-tripped through the flow cookie so `/callback` uses the same value during the token exchange.
+
+### Fixed
+
+- **OIDC providers no longer silently dropped after failed startup discovery** (#461) — Providers whose discovery fails during `Reload()` are now tracked in a separate failed-providers map instead of being silently logged-and-forgotten. `GET /api/v1/auth/oidc/providers` returns a per-provider `status` block (`"ok"` / `"failed"` with the last error and timestamp) so admins can diagnose without grepping logs. The first login attempt for a failed provider triggers an on-demand re-discovery (rate-limited to once per 30s), so transient startup failures (e.g. pod recreated before IdP is reachable) recover automatically without an admin restart.
+- **ABS imports require saved source configuration** — import and dry-run starts now use only the stored ABS configuration, and the UI blocks runs while ABS settings contain unsaved changes so previews and imports cannot run against one-off request overrides.
+- **Hardcover auto-linking requires local evidence** — automatic series linking now requires local book overlap or author agreement before accepting a high-confidence Hardcover candidate, and missing-book fill skips books that already exist as excluded titles.
+
+### Docs
+
+- Added user-facing Hardcover series wiki documentation and documented the enhanced Hardcover series migration, feature flag, token requirement, admin toggle, and production network expectations in the deployment guide.
+
+## [v1.3.1] — 2026-05-05
+
+### Fixed
+
+- **Possessive author prefix stripped before release matching** (#446) — Search results for titles like *Tom Clancy's Rainbow Six* no longer require the release to carry "Clancy's"; the possessive prefix is stripped before keyword extraction. Handles both ASCII apostrophe and Unicode right-single-quotation-mark (U+2019).
+- **Readarr import returns structured error on failure** (#447) — The Readarr DB import handler now returns a JSON `{"error": "…"}` body with an appropriate HTTP status on failure instead of an empty 500.
+- **Edition deduplication upgrades existing row to dual-format** (#448) — When OpenLibrary returns both an ebook Work and an audiobook Work for the same title during an author sync, Bindery now upgrades the existing book row to `media_type: both` instead of inserting a duplicate entry.
+- **Library scanner searches both library and audiobook roots** (#456) — `FindExisting` now walks `BINDERY_AUDIOBOOK_DIR` alongside `BINDERY_LIBRARY_DIR` when checking for pre-existing files, and pre-filters by author folder to prevent cross-author mismatches. Previously only the ebook library was checked, leaving audiobook files undetected on rescan.
+- **Download client edge-case coverage** (#431) — Added hermetic matrix tests for RemoteID normalization, live status error mapping, poll failures, unreachable clients, context deadlines, and qBittorrent unfiltered hash polling. Transmission queue overlays now surface non-empty `errorString` values as error statuses.
+
+## [v1.3.0] — 2026-05-05
+
+### Added
+
+- **Audiobookshelf (ABS) import workflow** (#371) — Bindery can now connect to one ABS source, validate an API key, discover visible book libraries, and import ABS catalog metadata into shared authors, books, series, and ebook/audiobook editions. Imports support dry runs, persisted run history, rollback preview/rollback, low-confidence review queues, metadata conflict resolution, and path remaps when ABS and Bindery see the same files under different mount prefixes. Import quality is best when the ABS library already has strong metadata, especially ASIN coverage.
+
+### Changed
+
+- **ABS configuration saves no longer probe the live server** — saving ABS settings now normalizes and stores the base URL, label, enabled flag, selected library ID, path remaps, and write-only API key without contacting ABS. Use **Test connection** or **List libraries** for live validation; library discovery returns book libraries only.
+- **ABS importer internals split by domain** — the importer orchestration remains in `internal/abs/importer.go`, with author matching, upserts, file reconciliation, metadata conflicts, rollback, snapshots, shared types, and utilities split into focused helper files.
+
+### Fixed
+
+- **ABS imports reject non-book libraries before scanning** — import enumeration now validates that the selected ABS library page is `mediaType=book` and that each returned item is a book item before mapping catalog data.
+- **ABS API calls use a Bindery user agent** — config probes and import enumeration now send `User-Agent: bindery/<version>` (`bindery/dev` when no build version is available) instead of the Go default user agent.
+- **Docker image now published for linux/arm64** (#445) — the `image` CI job previously only built `linux/amd64`; both `linux/amd64` and `linux/arm64` are now built and pushed in a single multi-platform manifest, fixing image-pull failures on Apple Silicon and Raspberry Pi hosts.
+
+### Chores
+
+- **Go toolchain pinned for CI** — `go.mod` now targets Go `1.25.9`, while GitHub Actions setup uses the Go `1.25` minor family across CI, security, and ABS contract jobs.
+
+### Docs
+
+- Added an ABS import guide and user-facing wiki documentation covering setup, required API-key access, path remaps, review flow, conflicts, rollback, and import-quality expectations.
+
+## [v1.2.7] — 2026-05-04
+
+### Added
+
+- **Arr-compatible queue endpoint for Harpoon integrations** (#370) — `GET /api/queue` returns a Sonarr/Radarr-style queue payload with `totalRecords`, queue records, live `size`/`sizeleft`, downloader status, client name, remote download ID, protocol, optional pagination, and sorting. The existing `GET /api/v1/queue` UI response remains unchanged.
+- **Author detail search-all-wanted action** (#410) — the Author Detail page now has a **Search all wanted** button that queues searches for that author's monitored wanted books, disables itself when there is nothing searchable, and surfaces bulk-search errors inline. Author bulk search now also skips unmonitored wanted books so explicit per-book unmonitor decisions are respected.
+- **Startup configuration validation** (#430) — Bindery now validates its configuration on startup and logs actionable warnings for known conflict patterns (conflicting audiobook dir, invalid URLs, non-existent paths). Does not block startup; surfaces problems early before they cause silent failures at runtime.
+- **Configurable login rate-limit thresholds** (#428) — `BINDERY_RATE_LIMIT_MAX_FAILURES` (default 5) and `BINDERY_RATE_LIMIT_WINDOW_MINUTES` (default 15) let operators tune the per-IP brute-force lockout without recompiling.
+
+### Fixed
+
+- **OpenLibrary search results restored** (#408) — the deprecated `/search.json` endpoint (which began returning HTTP 500) is replaced by `/authors/{id}/works.json` as the primary works source with `/search` demoted to enrichment. Series data now comes from the primary call so fewer round-trips are needed.
+- **Audiobook routing now respects `BINDERY_AUDIOBOOK_DIR`** (#421) — per-author ebook root folders were incorrectly applied to audiobook destinations; audiobooks now always route to the dedicated audiobook directory and ignore the ebook root.
+- **Audiobook directory visible in Settings UI** (#420) — the audiobook storage path is now displayed in Settings → General alongside the library directory.
+- **API-key requests exempt from CSRF middleware** (#424) — external tools such as Harpoon that authenticate via X-Api-Key header were receiving 403 on `POST /api/queue`; API-key-authenticated requests now bypass `RequireXRequestedWith` and `RequireCSRFToken` checks while browser-session requests remain protected.
+- **Torrent hash case sensitivity** (#425) — torrent hashes are now lowercased on assignment, preventing hash-not-found mismatches when clients return mixed-case identifiers.
+- **Transmission error states now surface in queue** (#426) — integer status codes 16 and 32 (error / isolated-error) are now recognised and translated to `TrackedDownloadStatus: Warning`, so stuck Transmission downloads appear in the queue instead of silently stalling.
+- **CSV author import skips header row** (#419) — CSV imports with a header row no longer create a spurious author entry from column names.
+- **qBittorrent hash detection no longer filtered by category** (#418) — the category filter on the hash detection poll was a spurious race condition that prevented hashes from being recorded on redirect URLs; the filter is removed.
+- **Credential normalization silent clear fixed** (#422) — `normalizeClientCredentialStorage` now applies the same `legacyCredentialURLBase` guard as the read path, preventing a bare `url_base` with no `api_key` from being silently migrated into `username` on write.
+- **Library scanner series matching now runs in production** — the scanner is wired to the series repository at startup; filename-based series/position matching now runs during normal library scans.
+- **qBittorrent and Transmission URL Base preserved on read** — legacy credential hydration no longer clears real reverse-proxy URL Base values (e.g. `/qbit`) — only old credential-as-url_base rows are migrated.
+
+## [v1.2.6] — 2026-04-25
+
+### Fixed
+
+- **NZBGet grabs broken** (#396) — `GetFirstEnabledByProtocol` and `GetEnabledByProtocol` only queried `sabnzbd` for the usenet protocol; NZBGet was never returned, causing "no enabled download clients" on every grab attempt for users with only NZBGet configured.
+- **NZBGet credentials zeroed on read** (#396) — `hydrateClientCredentials` blanked `username`/`password` for all non-qBit/Transmission clients, silently wiping NZBGet HTTP Basic auth credentials before they reached the adapter.
+- **Deluge missing from torrent protocol selector** (#396) — both `GetFirstEnabledByProtocol` and `GetEnabledByProtocol` excluded Deluge from the torrent client `IN` list, causing "no enabled download clients" for Deluge-only setups.
+- **Imageproxy concurrent-write race** (#396) — concurrent requests for the same image URL all wrote to the shared `imgFile+".tmp"` path; a racing `O_TRUNC` open could zero the file while another goroutine renamed it into the cache, resulting in empty image responses. Each goroutine now uses `os.CreateTemp()` for an isolated temp file.
+
+## [v1.2.5] — 2026-04-24
+
+### Added
+
+- **`{Series}` and `{SeriesNumber}` naming tokens** (#389) — file renaming templates now support `{Series}` (primary series name) and `{SeriesNumber}` (position in series, e.g. `3` or `3.5`). Both are looked up at import time from the `series_books` join table; books with no series silently omit the path segment so existing templates are unaffected. The audiobook destination template exposes the same tokens. Default template is unchanged.
+- **Scanner series-position matching** (#390) — the library scanner now attempts a fourth matching tier: if a filename contains a series name and position number (e.g. `[Dune Chronicles, Book 2]` or `(Mistborn #1)`) and no title/author match was found, Bindery looks up the series in the database and reconciles the book if the match is unambiguous. Supports bracket and parenthesis notation, `book/vol/part` prefixes, and integer or decimal position numbers. ISBN-shaped numbers are excluded via a letter-start requirement on the series name.
+
+### Fixed
+
+- **Discover: unrated and low-popularity books suppressed** (#391, closes #360) — `hardFilter` now drops candidates with fewer than 50 ratings (obscure long-tail editions that have never been rated) and candidates with 50+ ratings but an average below 3.0 (objectively poor books). Candidates with no ratings data at all are not penalised so missing metadata doesn't hide results.
+- **Discover: box sets, omnibuses, and anthology contributions excluded** (#392, closes #361) — a new keyword scan in `hardFilter` drops titles matching "omnibus", "box set", "complete works", "complete collection", "anthology", "collected works", "the best of", and similar multi-volume markers. Users see individual titles on the Discover page rather than compilation volumes they may already own in parts.
+- **Download client forms: Use SSL toggle and URL Base field added** (#393, closes #364) — both "Add client" and "Edit client" forms now expose a **Use SSL** checkbox and a **URL Base** text field. Previously these settings existed in the Go model and DB schema but were invisible in the UI, so operators behind a reverse-proxy subpath or needing TLS had no way to configure them without raw DB edits. `urlBase` is also added to the TypeScript `DownloadClient` interface which was missing it.
+- **Download client URLs now respect `url_base`** (#375, closes #369) — all five downloader clients (qBittorrent, Transmission, Deluge, NZBGet, SABnzbd) built their connection URL from `host:port` only, ignoring the stored `url_base`. Operators running a client behind a reverse-proxy subpath (e.g. `/qbit`) would see Bindery connect to the wrong endpoint. A new `internal/downloader/urlbase.Normalize()` helper canonicalises the stored value — handles missing leading slash, trailing slashes, and pasted full URLs — and the result is threaded through every `New()` constructor.
+
+## [v1.2.4] — 2026-04-24
+
+### Fixed
+
+- **Non-latin author names now match usenet releases** (#380) — authors whose names are written in a non-latin script (e.g. Japanese, Chinese, Arabic) have an ASCII surname of `""` after tokenisation, so every release was filtered out as irrelevant. Bindery now fetches the author's OpenLibrary `alternate_names` on first add, saves any ASCII-script aliases to `author_aliases`, and includes those aliases when building the surname candidate list for release matching.
+- **Import no longer stalls indefinitely on NFS timeouts** (#381) — the file-copy path used bare `io.Copy` with no cancellation. On an NFS stall the goroutine blocked forever and the download record stayed locked in `importing` state. Each import now runs under a 30-minute context timeout; copies run in a goroutine and respect cancellation, closing both file descriptors to help the kernel unblock the stalled call.
+- **Wanted filter no longer shows unmonitored books** (#382) — the Books page Wanted status filter matched `status === 'wanted'` without checking `monitored`, so books explicitly set to "don't monitor" appeared alongside genuinely wanted titles. The filter now requires `monitored === true` when the Wanted status is active.
+- **Recommender language filter applied to candidates** (#359) — `hardFilter` removed owned, dismissed, and excluded-author candidates but never checked language. Users with a preferred language set would receive foreign-language recommendations. Candidates whose `Language` field differs from `PreferredLanguage` are now filtered out; candidates with an empty language tag pass through so missing metadata doesn't silently hide results.
+- **Recommender recency score anchored to library median year** (#357) — `recencyScore` used `time.Now().Year()` as its reference point, penalising any book published before ~2005 regardless of the user's actual reading taste. The score is now relative to the median publication year of the user's library (computed in `BuildProfile`). Window widened from 20 → 30 years, floor lowered from 0.3 → 0.1, and `weightRecency` bumped from 0.10 → 0.15 to give the era-relative signal more influence.
+
+### Changed
+
+- **CI: parallel validate jobs and reduced friction** — the `validate` job split into `validate-go` (race-detector tests) and `validate-frontend` (npm build) running in parallel, cutting PR critical-path time from ~253 s to ~180 s. `golangci-lint` and `govulncheck` removed from the security workflow's `sast-go` job (both already run in `lint`). BuildKit GHA layer-cache added to container scans. Security workflow now skips doc-only changes via `paths-ignore`. Kubesec and Dockle removed (output was silently discarded). Discord release announcements now posted automatically on tag push.
+
+## [v1.2.3] — 2026-04-23
+
+### Fixed
+
+- **Logs tab now displays entries** — `db.LogEntry` was missing `json:""` tags, causing Go to serialise field names as PascalCase (`ID`, `TS`, `Level`, `Component`, `Message`, `Fields`). The TypeScript interface expected camelCase, so every row rendered blank. (#376)
+
+## [v1.2.2] — 2026-04-23
+
+### Fixed
+
+- **Calibre "Push all to Calibre" button state now matches Test-connection result** (#342) — the button was enabled even when the last connectivity test failed, allowing pushes to silently no-op against an unreachable bridge. It now stays disabled until a successful test in the current session.
+- **Download client host field no longer double-schemes the URL** (#353) — if a user typed `https://` or `http://` in the Host field, the downloader prepended the scheme a second time, producing `https://https://…` and causing every connection attempt to fail. The host is now stripped of any leading scheme before the URL is assembled.
+- **CSP nonce now injected server-side** (#353) — the inline `<script>` tag in `index.html` used a static placeholder nonce that never matched the server-generated nonce, causing the theme-initialisation script to be blocked by Content-Security-Policy in strict environments. The nonce is now written by the Go server at request time.
+- **Docker image tags now include `v`-prefixed semver variants** (#353) — the CI metadata action was missing `type=semver,pattern=v{{version}}`, so only bare `1.2.x` tags were pushed to ghcr.io. Both `1.2.x` and `v1.2.x` are now available.
+- **Version string in footer links to the GitHub releases page** (#356) — clicking the version badge now opens the corresponding release regardless of whether the string is a semver, `v`-prefixed semver, or `dev-<sha>`.
+
+## [v1.2.1] — 2026-04-23
+
+### Fixed
+
+- **Prowlarr-synced indexers no longer send broad parent category 7000** (#344) — indexers synced from Prowlarr were always requesting category 7000 (Books parent), which caused many indexers to return results for every book-adjacent category including comics. Bindery now sends the appropriate child category (7020 Ebooks, 3030 Audiobooks) and drops the parent when children are present.
+- **qBittorrent "hash could not be determined" on category mismatch** (#363) — after adding a torrent, Bindery polled only the configured download category, so if qBittorrent placed the torrent in a different category the hash was never found and the download was marked as failed. Bindery now polls the full torrent list (unfiltered) and logs a detailed error with hash diagnostics if the 30-second window expires.
+- **Dual-format delete leaves orphan sibling files** (#343) — deleting one format of a dual-format book failed to remove sibling format files from disk. Sibling cleanup now runs regardless of whether the file being deleted still exists.
+- **Rescan misbinds books with similar titles** (#290) — the Jaro-Winkler similarity threshold for matching filenames to book records was too permissive. Threshold raised from 0.80 to 0.88.
+- **Interactive search mixes ebook and audiobook results** (#333) — results from all indexers were shown in a single unsorted list for dual-format books. Results are now split into labelled **Ebook results** and **Audiobook results** sections.
+
+## [v1.2.0] — 2026-04-22
+
+### Added
+
+- **Default library location can now be set from Settings → General** (#332). A new "Default root folder" dropdown lets you pick any configured root folder as the library path used when an author has no per-author root folder. Existing `BINDERY_LIBRARY_DIR` continues to work as a fallback when the setting is unset. An inline "Add root folder" affordance lets you create a new root folder without leaving the page. Startup logs a warning (but does not fail) if the configured default root folder no longer exists on disk.
+- **Search results grouped by media type** — For dual-format books (ebook + audiobook), the Book Detail page now displays results in two titled sections (Ebooks / Audiobooks) each with its own 20-result cap, so audiobook results can no longer fall past the UI cap. Single-format books retain the existing flat list. Each result row in the split view shows a colour-coded media-type badge (#333).
+- **Persistent log store** — Settings → Logs now persists entries across restarts and supports filtering by date range, level, and component. Retention defaults to 14 days and is configurable via `BINDERY_LOG_RETENTION_DAYS` or Settings → General → Log retention. ([#241](https://github.com/vavallee/bindery/issues/241))
+
+### Fixed
+
+- **Multi-file ebook downloads are now fully tracked** — Delete + files removes every file (mobi, epub, pdf, etc.) and rescan cannot re-claim orphan files. Library rescan now requires a matched file to live under the candidate book's configured root folder, preventing cross-author mismapping (#343).
+- **Ebook searches no longer include the parent Books category (7000)**, which could return comics and magazines. Affects Prowlarr-synced indexers: `filterCategoriesForMedia` now matches only the 702x ebook subcategory range (7020–7029) and 303x audiobook range (3030–3039), and the syncer drops parent categories (7000, 3000) at sync time and propagates category changes on re-sync. (#344)
+- **Author sync no longer creates duplicate book rows that differ only in edition suffix, whitespace, or Unicode normalization.** Existing duplicates are merged on upgrade. Search result filtering no longer drops valid releases when the book title contains a parenthesised edition qualifier (#283).
+
+## [v1.1.7] — 2026-04-22
+
+### Fixed
+
+- **Discover page blank after first refresh** — `models.Recommendation.Genres` was typed as `string`, so the API serialised genres as a JSON-encoded string (`"[\"Fantasy\",...]"`) instead of a JSON array. The frontend called `.map()` on the string, threw a `TypeError`, and React unmounted the whole page. `Genres` is now `[]string`; the DB scan layer deserialises the stored JSON before the struct is marshalled to the API response.
+
+## [v1.1.6] — 2026-04-22
+
+### Fixed
+
+- **Discover page always empty** — `BuildProfile` added every book to `OwnedForeignIDs` regardless of status, so all candidate generators (series, author_new, genre_similar, serendipity) immediately skipped every known book and returned zero results. `OwnedForeignIDs` now only includes books with `downloaded` or `imported` status, allowing `wanted`/`skipped` books to surface as recommendations.
+
+## [v1.1.5] — 2026-04-22
+
+### Fixed
+
+- **Authors tab empty after adding author** (#339) — authors added via the UI or the AddBook implicit-create path were stored with `owner_user_id = NULL` because `Create()` always called `CreateForUser` with a hardcoded zero. The Authors list query filters by the authenticated user's ID, so every freshly-added author was invisible in the tab even though it existed in the database. Both creation sites now pass the user ID from the request context, so authors are correctly owned and appear immediately.
+
+## [v1.1.4] — 2026-04-21
+
+### Fixed
+
+- **Calibre import: Language unknown on all books** (#314) — `books_languages_link` was never queried, so every imported book showed "Language unknown" and editions were hardcoded to `"eng"`. The reader now reads the primary ISO 639-2 language code from Calibre's languages table (falls back gracefully for pre-0.7 Calibre libraries that predate the table). Language is applied to both the book row and the edition.
+- **Calibre import: Author ratings missing after first Refresh Metadata** (#314) — `relinkCalibreAuthor` fetched the full OL author but only copied image/description/sort name. `ratings_count` and `average_rating` are now copied as well.
+- **Calibre import: Duplicate book rows after Refresh Metadata** (#314) — `FetchAuthorBooks` skipped title-matched books with a bare `continue`, leaving calibre-imported stubs (synthetic `calibre:book:N` ForeignID, no language) un-upgraded when OpenLibrary returned the same title. Calibre stubs are now updated in-place with the real OL ForeignID and language instead of being silently skipped, preventing a second OL row from being created alongside them.
+
+## [v1.1.3] — 2026-04-21
+
+### Fixed
+
+- **Authors missing from list view** (#330) — authors with a NULL `owner_user_id` (created before the multi-user migration backfill ran, or imported without a user context) were silently excluded from `GET /api/v1/author`. The list query now includes `OR owner_user_id IS NULL` so all owned authors appear regardless of when they were added.
+- **Delete file leaves zombie on disk** (#290) — `DELETE /book/{id}/file` on legacy books (only `file_path` set, no `ebook_file_path`) cleared the DB column but never called `os.Remove` on the actual file. The legacy path is now handled explicitly in the deletion block.
+- **Download link missing for newer books** (#331) — `GET /api/v1/book/{id}/file` returned 404 for books added after the dual-format schema (migration 026+) because it only checked the legacy `file_path` column. It now falls back to `ebook_file_path` then `audiobook_file_path`. The book detail page also hid the "Download file" button for these books; it now appears whenever either path is present.
+
+## [v1.1.2] — 2026-04-21
+
+### Changed
+
+- Prowlarr package test coverage expanded from ~0% to ~98% — adds `client_test.go` covering all HTTP paths and `syncer_extra_test.go` with error-path and edge-case tests for the syncer.
+- Pinned all GitHub Actions in `scorecard.yml` to commit SHAs (OpenSSF Scorecard `Pinned-Dependencies` compliance).
+
+## [v1.1.1] — 2026-04-21
+
+### Security
+
+- **API key exposed to non-admin users** — `GET /api/v1/auth/config` returned the global API key to every authenticated account. Since the key is also accepted via the `?apikey=` query string, any regular user could authenticate with full API access. The key is now redacted unless the caller has `role=admin`.
+- **Cross-user author visibility** — `GET /api/v1/author` returned all authors regardless of `owner_user_id`, letting one user see (and enumerate) another user's library. The list is now scoped to the authenticated user.
+- **Non-admin auth-mode escalation** — `PUT /api/v1/auth/mode` lacked a `RequireAdmin` guard. A regular user could switch the instance to `local-only`, granting unauthenticated access to every client on the local network. The endpoint now requires admin role.
+- **Untrusted `X-Forwarded-*` header injection** — `X-Forwarded-Proto` and `X-Forwarded-Host` were accepted from any client when `BINDERY_TRUSTED_PROXY` was not set, enabling OPDS base-URL injection and spurious HSTS headers. All forwarded headers are now stripped from requests that do not originate from a configured trusted proxy.
+
+## [v1.1.0] — 2026-04-20
+
+### Added
+
+- **Audible-direct author lookup** (#302) — audiobook-heavy users no longer lose most of a prolific author's Audible catalogue to OpenLibrary/Hardcover ASIN gaps. When the effective media type is `audiobook` or `both`, `FetchAuthorBooks` supplements OpenLibrary's works list with results from Audible's public catalogue endpoint (`api.audible.com/1.0/catalog/products`). Supplemental books flow through the same dedup + metadata-profile `allowed_languages` filter as OpenLibrary, so foreign-language ASINs are filtered out before persisting.
+
+### Fixed
+
+- **Author ingestion drops books + catalogue noise** (#313) — `GetAuthorWorks` now uses OpenLibrary's search index as the primary source (one call returns title + language + subjects + cover + year) and keeps the `/authors/{id}/works` endpoint as a backfill that hydrates series membership and picks up works the search index has missed (e.g. recent releases). A new subject/title noise filter at the OL client layer drops study guides, summaries, film/TV adaptations, screenplays, and audio-CD pseudo-works before they reach the ingestion pipeline, stopping duplicates like the five "Dutch House" entries previously pulled for Ann Patchett.
+- **Audiobook library scan misses tagged files** (#303) — the library scan now reads embedded ID3/iTunes tags (title, author, ASIN) from MP3/M4B/M4A/FLAC/OGG files during reconciliation. Match priority is ASIN → tag title+author → fuzzy filename fallback, so well-tagged Audible/organised libraries match without manual correction. Files whose tags can't be read surface as scan warnings and a new `tag_read_failed` counter in `library.lastScan`.
+
+### Chores
+
+- **golangci-lint cleanup** — resolve errorlint (`%v` → `%w` for double-wrapped errors), staticcheck (apply De Morgan on ASIN charset check), and gofmt formatting noise introduced alongside the three fixes above.
+
+## [v1.0.5] — 2026-04-20
+
+### Fixed
+
+- **Admin role required on fresh install** (#321) — new users created via first-run setup were stored without the admin role, so Settings → Config showed only the General section and any config mutation (Calibre plugin, users, indexers) 403'd with "admin role required" regardless of the security mode. First-run user is now explicitly promoted to admin before the session is issued; existing single-user installs are unaffected. Unblocks #314 reporters from retesting the Calibre metadata fix.
+- **NZB grabs misrouted to qBittorrent** (#320) — Prowlarr-synced indexers were hardcoded as `torznab` regardless of the upstream indexer's actual protocol, so NZB search results were tagged `protocol=torrent` and dispatched to qBittorrent, which then failed with `add torrent accepted but hash could not be determined`. The syncer now uses Prowlarr's `protocol` field to choose `newznab` vs `torznab`, and corrects mis-typed rows on the next sync. The scheduler no longer falls back across protocols when the protocol-matched client list is empty — an NZB release can never be pushed to a torrent client.
+
+### Added
+
+- **Bulk media-type update across monitored authors** (#247) — select multiple authors on the Authors page and switch their media type in one action (or flip all authors from a Settings one-shot). `PATCH /api/v1/authors/bulk` re-evaluates wanted/missing status for affected books so a flip from ebook → audiobook (or reverse) doesn't leave the catalogue in an inconsistent state. Companion to the existing global default media-type setting.
+
+### Docs
+
+- **Discord invite added to README and CONTRIBUTING** (#319) — new Community section links the BINDERY Discord server as a real-time channel for support and contributor onboarding, alongside GitHub Issues and Discussions. Security reports continue to go through `SECURITY.md`, not Discord.
+
+### Chores
+
+- **vitest 3.2.4 → 4.1.4** (#312) — dev-dependency bump for the web test runner.
+
+## [v1.0.4] — 2026-04-20
+
+### Reverted
+
+- **eslint 9→10 bump** (#311) — reverted because `eslint-plugin-react-hooks@7.0.1` still peers eslint at `^9.0.0`, breaking `npm ci` in the Docker build. v1.0.3 tag was cut but never produced an image; v1.0.4 ships the same fixes without the eslint upgrade. Will retry once react-hooks catches up.
+
+## [v1.0.3] — 2026-04-20 *(tagged but not released — CI build failure, see v1.0.4)*
+
+### Fixed
+
+- **CSRF token lost on page reload** (#315) — sessions survived reloads cookie-wise, but `initCSRF()` only ran on login, so subsequent mutations hit 403 until next login. `AuthContext.refresh()` now re-hydrates the token whenever the session is authenticated.
+- **Calibre-imported authors stuck with no metadata** (#316) — authors with a `calibre:` foreign ID were hard-skipped by the metadata refresh. They are now re-linked to the metadata provider on first refresh via exact name match (case/whitespace-insensitive), pulling real image/description/sort name in place.
+- **Misleading author search book count** (#317) — the "books" number on author search results is OpenLibrary's raw work count before dedup/language-filter; relabelled to "up to N works" with a tooltip explaining the post-filter catalogue will be smaller.
+
+### Docs
+
+- **Auth, multi-user, and v1 upgrade guides** (#318) — added `docs/auth-multiuser.md`, `docs/auth-oidc.md`, `docs/auth-proxy.md`, `docs/multi-user.md`, `docs/troubleshooting-auth.md`, `docs/upgrade-v2.md` covering the v1.0 role model, OIDC/proxy setup, and migration path.
+
+### Chores
+
+- Dependency bumps: golang base image (#307), node base image (#308), `modernc.org/sqlite` (#309).
+
+## [v1.0.2] — 2026-04-20
+
+### Added
+
+- **Admin password reset** (#292/#305) — admins can reset any local user's password from the Users page without requiring the user to log out. New endpoint `PUT /auth/users/{id}/reset-password`.
+
+### Fixed
+
+- **Books sort with missing release dates** (#304) — books without a release date were bubbling to the top of "oldest first" date sorts. They now sort to the end in both directions.
+- **Empty folders left behind after deleting books** (#290/#306) — when the last file in a book folder was removed, the now-empty parent directory stayed behind. `removeBookPath` now cleans up the parent on a best-effort basis. Multi-format folders shared between ebook + audiobook are only removed when both formats are gone.
+
+## [v1.0.1] — 2026-04-19
+
+### Fixed
+
+- **Admin UI missing from v1.0.0** — the Users management page (`/users`), admin nav icon, role-gated Settings tabs, and `isAdmin` context were omitted from the v1.0.0 build. All admin UI components now ship correctly (#301).
+
+## [v1.0.0] — 2026-04-19
+
+### Added
+
+- **Reverse-proxy SSO** (#238/#239) — new `proxy` auth mode trusts an upstream identity header (`X-Forwarded-User` by default) when the request arrives from a configured trusted proxy IP. Startup refuses proxy mode without `BINDERY_TRUSTED_PROXY` set.
+- **Native OIDC client** (#237) — Authorization Code + PKCE with multi-provider support (Google, GitHub/Dex, Authelia, Keycloak). Providers configured via Settings → Authentication; users identified by stable `(issuer, sub)` pair.
+- **Multi-user scoping** (#236) — every user-owned entity (authors, books, downloads, profiles, root folders) scoped to its owner. First user auto-promoted to admin; admin users manage all settings.
+- **Admin user management** — Users page (admin only): invite users, set roles, delete with last-admin guard.
+- **Settings split** — per-user tabs (API key, password, notifications) and admin-only tabs (indexers, clients, profiles, system).
+- **CSRF double-submit tokens** (#240) — `GET /auth/csrf` issues a session-bound token; all authenticated mutations require matching `X-CSRF-Token` header. API-key requests exempt.
+
+### Fixed
+
+- **CSRF middleware login bypass** — `POST /auth/login` was incorrectly blocked by CSRF check before a session cookie existed; fixed to skip CSRF when no session is present.
+
+### Breaking
+
+- **Database migration 025**: `owner_user_id` added to all user-owned tables; existing data migrated to user ID 1. Back up before upgrading. See [upgrade guide](https://github.com/vavallee/bindery/wiki/Howto-Migrate-to-multi-user).
+- **CSRF tokens required**: browser-based API consumers must call `GET /auth/csrf` and include `X-CSRF-Token` on mutations. API-key clients unaffected.
+
+## [v0.22.0] — 2026-04-19
+
+### Fixed
+
+- **Grab FK constraint crash** — clicking Grab on a search result no longer fails with a foreign-key violation; `bookId`/`indexerId` are now treated as optional nullable fields so free-text search grabs always succeed (#285)
+- **Audiobook search details blank page** — `SearchDebug.Filters` is now initialised to an empty slice instead of `null`, preventing a JS crash in `SearchDebugPanel` that was more likely to trigger on audiobook searches (#282)
+- **ISBN lookup cryptic error** — unknown ISBNs now surface a friendly "No book found for ISBN X. Check the number, or try searching by title instead." message instead of a misleading upstream-unavailable error (#284)
+
+### Improved
+
+- **Calibre Test Connection feedback** — the Test Connection button now shows ✓/✗ prefixes and the exact plugin reachability message; stale results are cleared whenever Calibre settings are saved (#262)
+
+## [v0.21.0] — 2026-04-19
+
+### Added
+
+- **Spanish, Filipino, and Indonesian UI translations** — language switcher now offers English, Français, Deutsch, Español, Filipino, Nederlands, and Bahasa Indonesia. Browser language is auto-detected on first visit; manual override persists to localStorage.
+- **Search hourglass icon** — the Search nav item moves off the main navigation bar and becomes an hourglass icon next to the settings gear, keeping the header cleaner. On mobile it remains accessible as a text item in the hamburger dropdown.
+
+## [v0.20.3] — 2026-04-19
+
+### Security
+
+- **Trusted proxy configuration** — `BINDERY_TRUSTED_PROXY` gates `X-Forwarded-For` rewriting to a configured proxy IP/CIDR. Without it, forwarded headers are ignored and the direct peer IP is used, preventing XFF spoofing in local-only auth mode (mirrors Sonarr CVE-2026-30975).
+- **File download path validation** — the file download endpoint now verifies `book.FilePath` falls within a configured library root before serving. Paths outside `BINDERY_LIBRARY_DIR` / `BINDERY_AUDIOBOOK_DIR` return 403.
+- **CSRF header exemption for API key requests** — the `X-Requested-With` CSRF check now correctly exempts API-key-authenticated requests; only cookie-session requests are required to supply the header.
+- All fixes from v0.20.1: SSRF validation on Prowlarr URLs, path traversal protection in file renamer, strict backup filename regex, image proxy redirect re-validation, Hardcover token moved to Authorization header, OPDS rate limiting, CI hardening.
+
+## [v0.20.0] — 2026-04-18
+
+### Added
+
+- **Deluge download client** ([#263](https://github.com/vavallee/bindery/pull/263)) — adds Deluge alongside qBittorrent and Transmission as a supported torrent client. Configure under Settings → Download Clients with host, port (default 8112), password, and optional label (requires the Label plugin). Deluge authenticates with a single password and no username, which the UI reflects.
+- **Direct indexer search page** ([#266](https://github.com/vavallee/bindery/pull/266)) — a new **Search** nav item runs freeform queries across every configured indexer without needing a tracked book. Each result row has a **Grab** button that sends the release straight to the download client, bypassing the per-book decision pipeline. Useful for grabbing one-off titles or testing indexer responses.
+- **{ASIN} naming token** ([#269](https://github.com/vavallee/bindery/pull/269)) — `{ASIN}` can now be used in rename templates (e.g. `{Author}/{ASIN}/{Title}.{ext}`). ASINs are also extracted from filenames during library scans and stripped from the title, so Amazon-origin files no longer pollute title matching. Empty string when the book has no ASIN in its metadata.
+
+### Fixed
+
+- **Indexer Test probes with a real search** ([#265](https://github.com/vavallee/bindery/pull/265)) — after the caps probe, **Test** now runs a `t=search&q=book` request across the indexer's book categories. The UI surfaces an amber warning when zero results are returned, catching misconfigured API keys and category mappings that previously reported success on caps alone.
+
+## [v0.19.2] — 2026-04-18
+
+### Fixed
+
+- **Create destination directory before audiobook import** ([#255](https://github.com/vavallee/bindery/pull/255)) — import no longer fails when the target library directory does not yet exist; Bindery now creates it before attempting to move files. Resolves a silent failure that left audiobooks stranded in the download folder.
+- **Search consistency for "both" media type** ([#256](https://github.com/vavallee/bindery/pull/256)) — books monitored as `both` now run separate ebook (7xxx) and audiobook (3xxx) category searches and union the results, instead of falling through to the ebook branch only. Also normalises subtitle-heavy query strings to improve match rates on all indexers.
+
+### Added
+
+- **Unknown-language badge and pass/fail setting** ([#257](https://github.com/vavallee/bindery/pull/257)) — books whose language metadata is absent or unrecognised are now surfaced with an "unknown language" badge in the UI. A new setting controls whether unknown-language books pass or fail the language filter, giving users explicit control instead of silent rejection.
+- **Search debug panel** ([#258](https://github.com/vavallee/bindery/pull/258)) — a collapsible debug panel on the Book Search page shows every indexer that was queried, how many results each returned, and which pipeline stage (dedupe, junk filter, relevance, language, decision) dropped each candidate. The last debug payload is cached server-side so the panel survives page reloads.
+- **Push all to Calibre sync button** ([#259](https://github.com/vavallee/bindery/pull/259)) — a single button on the Calibre settings page triggers a full library sync, pushing every imported book to Calibre in one shot. Useful after initial setup or after a Calibre database restore.
+- **Global default media type and bulk author update** ([#260](https://github.com/vavallee/bindery/pull/260)) — a new global setting establishes the default media type for newly added authors. A bulk-update action on the Authors page lets you apply any media-type change across all (or selected) authors at once, eliminating tedious one-by-one edits.
+
+## [v0.19.1] — 2026-04-18
+
+Re-release of the v0.19.0 feature set plus the external-import and newznab-coverage PRs. The previously-tagged `v0.19.0` artifact predated these merges; `v0.19.1` is the authoritative release for this feature batch.
+
+### Added
+
+- **NZBGet download client** ([#233](https://github.com/vavallee/bindery/pull/233)) — adds NZBGet alongside SABnzbd as a Usenet download target. Configure under Settings → Download Clients; Bindery tracks grabs, monitors status, and imports completed downloads the same way it does for SABnzbd.
+- **External import mode for Calibre / Grimmory workflows** ([#235](https://github.com/vavallee/bindery/pull/235)) — new import mode that lets Bindery hand completed downloads off to an external importer (Calibre `calibredb add` in a sidecar, or Grimmory's ingest pipeline) instead of moving files directly into the library. Useful when another tool owns the final file layout.
+- **Series gap detection and Fill gaps** ([#234](https://github.com/vavallee/bindery/pull/234)) — the Series page now shows how many books are missing from each series ("N missing" badge) and a **Fill gaps** button that marks all non-imported entries as Wanted and kicks off indexer searches immediately. No more manually hunting for which entries you're missing.
+- **Series monitoring toggle** — mark a series as monitored so it's easy to identify which series you're actively tracking. Foundation for future automation (auto-adding new entries when they appear).
+- **Indexer Test button reports HTTP status, categories, and latency** ([#243](https://github.com/vavallee/bindery/pull/243)) — clicking Test on an indexer now returns a structured probe result (status code, category count, `bookSearch` availability, round-trip latency) instead of a bare "OK / failed" string. Makes misconfigured endpoints and slow indexers much easier to diagnose.
+- **Import failure reason surfaced in Queue and History** ([#244](https://github.com/vavallee/bindery/pull/244)) — failed imports now record and display the underlying error (permission denied, path missing, Calibre rejected the file, etc.) instead of silently disappearing. Addresses the top recurring pain point from user feedback: "silent failures make it impossible to know what went wrong."
+- **Storage paths visible in Settings UI** ([#245](https://github.com/vavallee/bindery/pull/245)) — download, incoming, and library paths are now surfaced in Settings → Storage so users can confirm where Bindery is reading from and writing to without digging through env vars or ConfigMaps.
+- **Auto-grab checkbox persists in Add Author dialog** ([#242](https://github.com/vavallee/bindery/pull/242)) — the "auto-grab on add" toggle now remembers its last value across dialog opens, so users who always (or never) want auto-grab don't have to reset it every time.
+
+### Fixed
+
+- **Indexers tab crash** ([#227](https://github.com/vavallee/bindery/pull/227)) — clicking Settings → Indexers caused a white screen for users without Prowlarr configured.
+- **Language filter now rejects books with unknown language** ([#228](https://github.com/vavallee/bindery/pull/228)) — non-English editions no longer slip through English-only metadata profiles when OpenLibrary omits language data.
+
+### Internal
+
+- **Newznab indexer client test coverage** ([#251](https://github.com/vavallee/bindery/pull/251)) — lifted `internal/indexer/newznab` coverage from 56.6% to 89.5% with focused tests for BookSearch tier fallbacks, Probe result shape, URL normalization, and error paths.
+
+## [v0.19.0] — 2026-04-18
+
+Initial tag for the above feature batch; artifact was published before the PRs it was meant to include were merged. Use `v0.19.1` or newer — this tag is retained only for historical reference.
+
+## [v0.18.3] — 2026-04-17
+
+### Fixed
+
+- **Language filter now rejects books with unknown language** ([#228](https://github.com/vavallee/bindery/pull/228)) — when a metadata profile restricts to specific languages (e.g. English-only), books with no language data are now rejected instead of passing through. OpenLibrary doesn't include language at the work level, so translated editions (Turkish, Spanish, Dutch, etc.) were silently ingested for English-only profiles. The OL client already does a best-effort search-index lookup; this closes the gap for works the index doesn't cover. Reported in [#224](https://github.com/vavallee/bindery/issues/224).
+
+## [v0.18.2] — 2026-04-17
+
+### Fixed
+
+- **Indexers tab crash** ([#227](https://github.com/vavallee/bindery/pull/227)) — clicking Settings → Indexers caused a white screen for users without a Prowlarr instance configured. The `/api/v1/prowlarr` endpoint returned JSON `null` (Go nil slice) instead of `[]`, which crashed React on render. Reported in [#225](https://github.com/vavallee/bindery/issues/225).
+
+## [v0.18.1] — 2026-04-17
+
+### Changed
+
+- **Plugin API key field UX** ([#221](https://github.com/vavallee/bindery/pull/221)) — the API key field in Settings → Calibre (plugin mode) now has a show/hide toggle (eye icon) and a **Generate** button that fills the field with a cryptographically random 32-byte hex key (`crypto.getRandomValues`). `autoComplete="off"` prevents browsers from injecting saved passwords. Paste is unrestricted.
+
+## [v0.18.0] — 2026-04-17
+
+Calibre plugin integration mode, decision engine, pending releases, and state machine for downloads.
+
+### Added
+
+- **Calibre plugin integration mode** ([#212](https://github.com/vavallee/bindery/pull/212)) — new `plugin` mode alongside `calibredb`. When selected, Bindery POSTs imported file paths to the Bindery Bridge Calibre plugin over HTTP instead of shelling out to `calibredb`. Allows Calibre to run in a separate pod/container from Bindery without requiring a shared binary or library volume. Configure via Settings → Calibre → Mode: Plugin, with Plugin URL and API Key fields.
+- **Release decision engine** ([#218](https://github.com/vavallee/bindery/pull/218)) — specification-pattern engine evaluates candidate releases against per-profile rules before grabbing, replacing ad-hoc inline checks.
+- **Pending releases table** ([#219](https://github.com/vavallee/bindery/pull/219)) — delay-held results are tracked in a dedicated pending table with UI, replacing the previous silent-drop behaviour.
+- **Prowlarr native indexer sync** ([#215](https://github.com/vavallee/bindery/pull/215)) — Bindery can now sync indexer configurations directly from a Prowlarr instance.
+- **Add book by title or ISBN** ([#216](https://github.com/vavallee/bindery/pull/216)) — search bar accepts ISBNs and free-text titles in addition to author queries.
+- **qBittorrent hash retry** ([#209](https://github.com/vavallee/bindery/pull/209)) — retries hash lookup for 10 s after torrent URL add, fixing race where hash was not yet visible after `.torrent` fetch.
+
+### Changed
+
+- **Download state machine** ([#217](https://github.com/vavallee/bindery/pull/217)) — formalises download lifecycle states; replaces ad-hoc string constants with typed enum.
+- **Calibre settings tab** ([#220](https://github.com/vavallee/bindery/pull/220)) — shared `library_path` field hoisted to top of Calibre tab for clarity.
+
+### Upgrade notes
+
+- **No breaking schema migrations** — additive only. Safe drop-in replacement.
+- **Calibre plugin mode** requires the [Bindery Bridge Calibre plugin](https://github.com/vavallee/bindery-plugins) installed in your Calibre instance.
 
 ## [v1.2.1] — 2026-04-23
 
@@ -526,6 +1340,35 @@ Initial public release.
 - Single-binary distribution with embedded React frontend.
 - Distroless Docker image and Helm chart.
 
+[v1.4.5]: https://github.com/vavallee/bindery/releases/tag/v1.4.5
+[v1.4.4]: https://github.com/vavallee/bindery/releases/tag/v1.4.4
+[v1.4.3]: https://github.com/vavallee/bindery/releases/tag/v1.4.3
+[v1.4.2]: https://github.com/vavallee/bindery/releases/tag/v1.4.2
+[v1.4.1]: https://github.com/vavallee/bindery/releases/tag/v1.4.1
+[v1.4.0]: https://github.com/vavallee/bindery/releases/tag/v1.4.0
+[v1.3.1]: https://github.com/vavallee/bindery/releases/tag/v1.3.1
+[v1.3.0]: https://github.com/vavallee/bindery/releases/tag/v1.3.0
+[v1.2.7]: https://github.com/vavallee/bindery/releases/tag/v1.2.7
+[v1.2.6]: https://github.com/vavallee/bindery/releases/tag/v1.2.6
+[v1.2.5]: https://github.com/vavallee/bindery/releases/tag/v1.2.5
+[v1.2.4]: https://github.com/vavallee/bindery/releases/tag/v1.2.4
+[v1.2.3]: https://github.com/vavallee/bindery/releases/tag/v1.2.3
+[v1.2.2]: https://github.com/vavallee/bindery/releases/tag/v1.2.2
+[v1.2.1]: https://github.com/vavallee/bindery/releases/tag/v1.2.1
+[v1.2.0]: https://github.com/vavallee/bindery/releases/tag/v1.2.0
+[v0.19.0]: https://github.com/vavallee/bindery/releases/tag/v0.19.0
+[v0.18.3]: https://github.com/vavallee/bindery/releases/tag/v0.18.3
+[v0.18.2]: https://github.com/vavallee/bindery/releases/tag/v0.18.2
+[v0.18.1]: https://github.com/vavallee/bindery/releases/tag/v0.18.1
+[v0.18.0]: https://github.com/vavallee/bindery/releases/tag/v0.18.0
+[v0.17.0]: https://github.com/vavallee/bindery/releases/tag/v0.17.0
+[v0.16.0]: https://github.com/vavallee/bindery/releases/tag/v0.16.0
+[v0.8.0]: https://github.com/vavallee/bindery/releases/tag/v0.8.0
+[v0.7.2]: https://github.com/vavallee/bindery/releases/tag/v0.7.2
+[v0.7.1]: https://github.com/vavallee/bindery/releases/tag/v0.7.1
+[v0.7.0]: https://github.com/vavallee/bindery/releases/tag/v0.7.0
+[v0.6.4]: https://github.com/vavallee/bindery/releases/tag/v0.6.4
+[v0.6.3]: https://github.com/vavallee/bindery/releases/tag/v0.6.3
 [v0.6.2]: https://github.com/vavallee/bindery/releases/tag/v0.6.2
 [v0.6.1]: https://github.com/vavallee/bindery/releases/tag/v0.6.1
 [v0.6.0]: https://github.com/vavallee/bindery/releases/tag/v0.6.0

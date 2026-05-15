@@ -50,7 +50,7 @@ export default function BooksPage() {
 
   const filtered = useMemo(() => {
     let list = books
-    if (statusFilter) list = list.filter(b => b.status === statusFilter)
+    if (statusFilter) list = list.filter(b => b.status === statusFilter && (statusFilter !== 'wanted' || b.monitored))
     if (mediaFilter) {
       list = list.filter(b => {
         const mt = b.mediaType || 'ebook'
@@ -69,14 +69,16 @@ export default function BooksPage() {
     if (sort === 'title-az') list = [...list].sort((a, b) => a.title.localeCompare(b.title))
     else if (sort === 'title-za') list = [...list].sort((a, b) => b.title.localeCompare(a.title))
     else if (sort === 'date-new') list = [...list].sort((a, b) => {
-      const da = a.releaseDate ? new Date(a.releaseDate).getTime() : 0
-      const db = b.releaseDate ? new Date(b.releaseDate).getTime() : 0
-      return db - da
+      if (!a.releaseDate && !b.releaseDate) return 0
+      if (!a.releaseDate) return 1
+      if (!b.releaseDate) return -1
+      return new Date(b.releaseDate).getTime() - new Date(a.releaseDate).getTime()
     })
     else if (sort === 'date-old') list = [...list].sort((a, b) => {
-      const da = a.releaseDate ? new Date(a.releaseDate).getTime() : 0
-      const db = b.releaseDate ? new Date(b.releaseDate).getTime() : 0
-      return da - db
+      if (!a.releaseDate && !b.releaseDate) return 0
+      if (!a.releaseDate) return 1
+      if (!b.releaseDate) return -1
+      return new Date(a.releaseDate).getTime() - new Date(b.releaseDate).getTime()
     })
     return list
   }, [books, statusFilter, mediaFilter, search, sort])
@@ -307,6 +309,14 @@ export default function BooksPage() {
                   )}
                   {book.mediaType === 'both' && (
                     <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300">{t('common.ebook')}</span>
+                  )}
+                  {!book.language && (
+                    <span
+                      className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-200 text-amber-900 dark:bg-amber-900/50 dark:text-amber-300"
+                      title="Metadata source did not report a language for this book."
+                    >
+                      ?
+                    </span>
                   )}
                 </div>
                 <div className="flex items-center justify-between mt-0.5">

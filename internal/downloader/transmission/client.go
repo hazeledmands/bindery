@@ -16,6 +16,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/vavallee/bindery/internal/downloader/nethint"
+	"github.com/vavallee/bindery/internal/downloader/urlbase"
 )
 
 // Client interacts with the Transmission RPC API.
@@ -33,7 +36,9 @@ type Client struct {
 
 // New creates a Transmission client.
 // username and password are optional for Transmission RPC authentication.
-func New(host string, port int, username, password string, useSSL bool) *Client {
+// urlBase is the optional reverse-proxy subpath appended before Transmission's
+// /transmission/rpc endpoint.
+func New(host string, port int, username, password, urlBase string, useSSL bool) *Client {
 	scheme := "http"
 	if useSSL {
 		scheme = "https"
@@ -45,7 +50,7 @@ func New(host string, port int, username, password string, useSSL bool) *Client 
 		http:     &http.Client{Timeout: 15 * time.Second},
 	}
 
-	rpcURL, err := buildRPCURL(scheme, host, port)
+	rpcURL, err := buildRPCURL(scheme, host, port, urlBase)
 	if err != nil {
 		client.initErr = err
 	} else {
@@ -64,8 +69,13 @@ func (c *Client) Test(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, err = c.doRequest(req)
-	return err
+	if _, err = c.doRequest(req); err != nil {
+		if hint := nethint.ForErr(err); hint != "" {
+			return fmt.Errorf("could not reach Transmission at %s — %w%s", c.baseURL, err, hint)
+		}
+		return err
+	}
+	return nil
 }
 
 // AddTorrent submits a magnet link or torrent URL to Transmission for download.
@@ -206,7 +216,7 @@ func (c *Client) buildRequest(ctx context.Context, method string, args map[strin
 	return req, nil
 }
 
-func buildRPCURL(scheme, host string, port int) (*url.URL, error) {
+func buildRPCURL(scheme, host string, port int, urlBase string) (*url.URL, error) {
 	if err := validateHost(host); err != nil {
 		return nil, err
 	}
@@ -217,7 +227,7 @@ func buildRPCURL(scheme, host string, port int) (*url.URL, error) {
 	return &url.URL{
 		Scheme: scheme,
 		Host:   net.JoinHostPort(host, strconv.Itoa(port)),
-		Path:   "/transmission/rpc",
+		Path:   urlbase.Normalize(urlBase) + "/transmission/rpc",
 	}, nil
 }
 
@@ -267,7 +277,10 @@ func (c *Client) doRequest(req *http.Request) ([]byte, error) {
 			}
 			defer resp2.Body.Close()
 
-			body, _ = io.ReadAll(io.LimitReader(resp2.Body, 1024*1024))
+			body, err = io.ReadAll(io.LimitReader(resp2.Body, 1024*1024))
+			if err != nil {
+				return nil, fmt.Errorf("transmission: read retry body: %w", err)
+			}
 			resp = resp2
 		}
 	}

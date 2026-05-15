@@ -2,109 +2,258 @@ package prowlarr
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/vavallee/bindery/internal/models"
 )
 
-// fakeIndexerStore records Create calls so we can inspect what was stored.
 type fakeIndexerStore struct {
-	created []*models.Indexer
-	listed  []models.Indexer
+	existing  []models.Indexer
+	created   []models.Indexer
+	updated   []models.Indexer
+	deleted   []int64
+	nextID    int64
+	listErr   error
+	createErr error
+	updateErr error
+	deleteErr error
 }
 
 func (f *fakeIndexerStore) ListByProwlarrInstance(_ context.Context, _ int64) ([]models.Indexer, error) {
-	return f.listed, nil
+	return f.existing, f.listErr
 }
 
 func (f *fakeIndexerStore) Create(_ context.Context, idx *models.Indexer) error {
-	f.created = append(f.created, idx)
+	if f.createErr != nil {
+		return f.createErr
+	}
+	f.nextID++
+	idx.ID = f.nextID
+	f.created = append(f.created, *idx)
 	return nil
 }
 
-func (f *fakeIndexerStore) Update(_ context.Context, _ *models.Indexer) error { return nil }
-func (f *fakeIndexerStore) Delete(_ context.Context, _ int64) error           { return nil }
+func (f *fakeIndexerStore) Update(_ context.Context, idx *models.Indexer) error {
+	if f.updateErr != nil {
+		return f.updateErr
+	}
+	f.updated = append(f.updated, *idx)
+	return nil
+}
 
-// fakeInstanceStore is a no-op InstanceStore.
+func (f *fakeIndexerStore) Delete(_ context.Context, id int64) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	f.deleted = append(f.deleted, id)
+	return nil
+}
+
 type fakeInstanceStore struct{}
 
-func (f *fakeInstanceStore) SetLastSyncAt(_ context.Context, _ int64, _ time.Time) error {
+func (fakeInstanceStore) SetLastSyncAt(_ context.Context, _ int64, _ time.Time) error {
 	return nil
 }
 
-// TestSyncDefaultCategoriesNoParent verifies that when Prowlarr sends an indexer
-// with no categories, the syncer stores []int{7020} (not []int{7000,7020}).
-// This is the core invariant of fix #344.
-func TestSyncDefaultCategoriesNoParent(t *testing.T) {
-	ctx := context.Background()
-	store := &fakeIndexerStore{}
-	instances := &fakeInstanceStore{}
+// prowlarrStub serves a canned /api/v1/indexer response.
+func prowlarrStub(t *testing.T, body string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/indexer" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+}
 
-	infos := []IndexerInfo{
-		{
-			ProwlarrID:     1,
-			Name:           "TestIndexer",
-			Protocol:       "torrent",
-			TorznabURL:     "http://prowlarr/1/api",
-			APIKey:         "key",
-			SupportsSearch: true,
-			Categories:     nil, // Prowlarr sent no categories
-		},
+func TestFilterCategoriesForMedia(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []int
+		want []int
+	}{
+		{"empty stays empty", []int{}, []int{}},
+		{"non-parent passes through", []int{7020, 2000, 5030}, []int{7020, 2000, 5030}},
+		{"only 7000 widens to 7020", []int{7000}, []int{7020}},
+		{"only 3000 widens to 3030", []int{3000}, []int{3030}},
+		{"both parents only widen both", []int{7000, 3000}, []int{7020, 3030}},
+		{"7000 with child drops parent", []int{7000, 7020}, []int{7020}},
+		{"3000 with child drops parent", []int{3000, 3010}, []int{3010}},
+		{"7000 with multiple children drops parent", []int{7000, 7020, 7030}, []int{7020, 7030}},
+		{"both parents with children drop both", []int{7000, 7020, 3000, 3010}, []int{7020, 3010}},
+		{"7000 with child and 3000 alone widen 3000", []int{7000, 7020, 3000}, []int{7020, 3030}},
 	}
-
-	s := &Syncer{client: nil, indexers: store, instances: instances}
-	_, err := s.reconcile(ctx, 42, infos)
-	if err != nil {
-		t.Fatalf("reconcile failed: %v", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := filterCategoriesForMedia(tc.in)
+			if len(got) != len(tc.want) {
+				t.Errorf("filterCategoriesForMedia(%v) = %v, want %v", tc.in, got, tc.want)
+				return
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("filterCategoriesForMedia(%v)[%d] = %d, want %d", tc.in, i, got[i], tc.want[i])
+				}
+			}
+		})
 	}
+}
 
-	if len(store.created) != 1 {
-		t.Fatalf("expected 1 indexer created, got %d", len(store.created))
+func TestIndexerTypeForProtocol(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"usenet", "newznab"},
+		{"torrent", "torznab"},
+		{"", "torznab"},
+		{"unknown", "torznab"},
 	}
-
-	cats := store.created[0].Categories
-	if len(cats) != 1 || cats[0] != 7020 {
-		t.Errorf("default categories = %v, want [7020] (no broad parent 7000)", cats)
-	}
-
-	// Explicit invariant: 7000 must never appear.
-	for _, c := range cats {
-		if c == 7000 {
-			t.Errorf("parent category 7000 must not appear in synced indexer categories, got %v", cats)
+	for _, c := range cases {
+		if got := indexerTypeForProtocol(c.in); got != c.want {
+			t.Errorf("indexerTypeForProtocol(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
 }
 
-// TestSyncPreservesExplicitCategories verifies that when Prowlarr does send
-// explicit categories, they are stored as-is (the syncer does not inject 7000).
-func TestSyncPreservesExplicitCategories(t *testing.T) {
-	ctx := context.Background()
+func TestSyncer_CreatesNewznabForUsenetIndexers(t *testing.T) {
+	srv := prowlarrStub(t, `[
+		{"id":1,"name":"NZBHydra","protocol":"usenet","supportsSearch":true,"categories":[{"id":7020}]},
+		{"id":2,"name":"PrivateTracker","protocol":"torrent","supportsSearch":true,"categories":[{"id":7020}]}
+	]`)
+	defer srv.Close()
+
 	store := &fakeIndexerStore{}
-	instances := &fakeInstanceStore{}
+	syncer := NewSyncer(New(srv.URL, "k"), store, fakeInstanceStore{})
 
-	infos := []IndexerInfo{
-		{
-			ProwlarrID: 2,
-			Name:       "ExplicitCats",
-			TorznabURL: "http://prowlarr/2/api",
-			APIKey:     "key",
-			Categories: []int{7020, 7030},
-		},
+	if _, err := syncer.Sync(context.Background(), 1); err != nil {
+		t.Fatalf("Sync: %v", err)
 	}
-
-	s := &Syncer{client: nil, indexers: store, instances: instances}
-	_, err := s.reconcile(ctx, 42, infos)
-	if err != nil {
-		t.Fatalf("reconcile failed: %v", err)
+	if len(store.created) != 2 {
+		t.Fatalf("created = %d, want 2", len(store.created))
 	}
+	gotType := map[string]string{}
+	for _, c := range store.created {
+		gotType[c.Name] = c.Type
+	}
+	if gotType["NZBHydra"] != "newznab" {
+		t.Errorf("NZBHydra type = %q, want newznab (regressing #320 would set this to torznab and route NZBs to qBittorrent)", gotType["NZBHydra"])
+	}
+	if gotType["PrivateTracker"] != "torznab" {
+		t.Errorf("PrivateTracker type = %q, want torznab", gotType["PrivateTracker"])
+	}
+}
 
+func TestSyncer_CorrectsMisTypedExistingIndexer(t *testing.T) {
+	// Simulate a row created by the old buggy syncer: a usenet indexer stored
+	// with Type="torznab". Next sync must flip it to "newznab".
+	pID := 42
+	instID := int64(1)
+	existing := []models.Indexer{{
+		ID:                 10,
+		Name:               "NZBHydra",
+		Type:               "torznab",
+		URL:                "http://p/42/api",
+		ProwlarrInstanceID: &instID,
+		ProwlarrIndexerID:  &pID,
+	}}
+	srv := prowlarrStub(t, `[{"id":42,"name":"NZBHydra","protocol":"usenet","supportsSearch":true,"categories":[{"id":7020}]}]`)
+	defer srv.Close()
+
+	store := &fakeIndexerStore{existing: existing}
+	syncer := NewSyncer(New(srv.URL, "k"), store, fakeInstanceStore{})
+
+	if _, err := syncer.Sync(context.Background(), 1); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if len(store.updated) != 1 {
+		t.Fatalf("updated = %d, want 1", len(store.updated))
+	}
+	if store.updated[0].Type != "newznab" {
+		t.Errorf("Type = %q, want newznab", store.updated[0].Type)
+	}
+}
+
+func TestSyncer_WidensParentOnlyCategory(t *testing.T) {
+	// Prowlarr reports [7000] only — syncer must store [7020], not [7000] or [].
+	srv := prowlarrStub(t, `[{"id":9,"name":"GenericBooks","protocol":"torrent","supportsSearch":true,"categories":[{"id":7000}]}]`)
+	defer srv.Close()
+
+	store := &fakeIndexerStore{}
+	syncer := NewSyncer(New(srv.URL, "k"), store, fakeInstanceStore{})
+
+	if _, err := syncer.Sync(context.Background(), 1); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
 	if len(store.created) != 1 {
-		t.Fatalf("expected 1 indexer created, got %d", len(store.created))
+		t.Fatalf("created = %d, want 1", len(store.created))
 	}
-
 	cats := store.created[0].Categories
-	if len(cats) != 2 || cats[0] != 7020 || cats[1] != 7030 {
-		t.Errorf("explicit categories = %v, want [7020 7030]", cats)
+	if len(cats) != 1 || cats[0] != 7020 {
+		t.Errorf("Categories = %v, want [7020] (7000 must be widened to 7020, never stored raw)", cats)
+	}
+}
+
+func TestSyncer_PropagatesChangedCategories(t *testing.T) {
+	// Existing indexer was stored with the old broad category set [7000, 7020].
+	// Prowlarr now reports [7020] only. Re-sync must update Categories to [7020].
+	pID := 10
+	instID := int64(1)
+	existing := []models.Indexer{{
+		ID:                 10,
+		Name:               "IndexerA",
+		Type:               "torznab",
+		Categories:         []int{7000, 7020},
+		ProwlarrInstanceID: &instID,
+		ProwlarrIndexerID:  &pID,
+	}}
+	srv := prowlarrStub(t, `[{"id":10,"name":"IndexerA","protocol":"torrent","supportsSearch":true,"categories":[{"id":7020}]}]`)
+	defer srv.Close()
+	existing[0].URL = srv.URL + "/10/api"
+
+	store := &fakeIndexerStore{existing: existing}
+	syncer := NewSyncer(New(srv.URL, "k"), store, fakeInstanceStore{})
+
+	if _, err := syncer.Sync(context.Background(), 1); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if len(store.updated) != 1 {
+		t.Fatalf("expected 1 update (categories changed), got %d updates", len(store.updated))
+	}
+	want := []int{7020}
+	got := store.updated[0].Categories
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Errorf("Categories = %v, want %v", got, want)
+	}
+}
+
+func TestSyncer_NoUpdateWhenNothingChanged(t *testing.T) {
+	pID := 7
+	instID := int64(1)
+	existing := []models.Indexer{{
+		ID:         11,
+		Name:       "TrackerX",
+		Type:       "torznab",
+		Categories: []int{7020},
+		// URL is computed as {base}/{id}/api by the client; match it below.
+		ProwlarrInstanceID: &instID,
+		ProwlarrIndexerID:  &pID,
+	}}
+	srv := prowlarrStub(t, `[{"id":7,"name":"TrackerX","protocol":"torrent","supportsSearch":true,"categories":[{"id":7020}]}]`)
+	defer srv.Close()
+	existing[0].URL = srv.URL + "/7/api"
+
+	store := &fakeIndexerStore{existing: existing}
+	syncer := NewSyncer(New(srv.URL, "k"), store, fakeInstanceStore{})
+
+	if _, err := syncer.Sync(context.Background(), 1); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if len(store.updated) != 0 {
+		t.Errorf("expected no updates, got %+v", store.updated)
 	}
 }

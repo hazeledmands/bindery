@@ -53,6 +53,40 @@ helm install bindery charts/bindery \
 
 See [`charts/bindery/values.yaml`](../charts/bindery/values.yaml) for all configuration options.
 
+### PodSecurityStandards namespace label
+
+The chart's `securityContext` already satisfies Kubernetes' `restricted` policy (non-root user, read-only root filesystem, all capabilities dropped, `seccomp: RuntimeDefault`). To enforce this at the namespace level so that no chart override or future operator can weaken it, label your namespace before installing:
+
+```bash
+kubectl label namespace bindery \
+  pod-security.kubernetes.io/enforce=restricted \
+  pod-security.kubernetes.io/enforce-version=latest
+```
+
+`restricted` is the recommended setting. If you run a sidecar or init container that requires elevated privileges, use `baseline` instead — it blocks only the most critical misconfigurations (host namespaces, privileged mode) while permitting containers that need capabilities Bindery itself doesn't use.
+
+The label belongs on the namespace, not in the chart, because Helm charts should not create or mutate namespaces they're installed into.
+
+## Unraid (Community Applications)
+
+Bindery ships a Community Applications template at
+[`.github/unraid/bindery.xml`](../.github/unraid/bindery.xml). Once the
+template is registered with the CA feed, Unraid users can install Bindery
+from the **Apps** tab. Until then, paste the raw URL into Apps → "Click
+here to add a missing application":
+
+```
+https://raw.githubusercontent.com/vavallee/bindery/main/.github/unraid/bindery.xml
+```
+
+Defaults the template provides: bridge networking, port `8787`,
+`--user 99:100` (Unraid's `nobody:users`), and four mounts —
+`/mnt/user/appdata/bindery → /config`, `/mnt/user/Books → /books`,
+`/mnt/user/Audiobooks → /audiobooks` (optional), and
+`/mnt/user/downloads/bindery → /downloads`. If you change `BINDERY_PUID`
+or `BINDERY_PGID`, also change the matching half of `--user` in **Extra
+Parameters** — the container fail-fast-validates the pair on startup.
+
 ## Binary
 
 Pre-built archives are attached to every [Release](https://github.com/vavallee/bindery/releases) for:
@@ -204,18 +238,36 @@ Multiple remaps are separated by commas: `BINDERY_DOWNLOAD_PATH_REMAP=/sab/compl
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BINDERY_PORT` | `8787` | HTTP server port |
+| `BINDERY_URL_BASE` | _(empty)_ | URL path prefix when hosting Bindery under a reverse-proxy subpath (e.g. `/bindery`). Accepts a bare path or full URL — only the path component is used. No trailing slash needed. See [Reverse proxy](#reverse-proxy) for Nginx / Caddy / Traefik examples. |
 | `BINDERY_DB_PATH` | `/config/bindery.db` on Linux; `%APPDATA%\Bindery\bindery.db` on Windows; `~/Library/Application Support/Bindery/bindery.db` on macOS | SQLite database path |
 | `BINDERY_DATA_DIR` | `/config` on Linux; `%APPDATA%\Bindery` on Windows; `~/Library/Application Support/Bindery` on macOS | Config directory (backups live here) |
 | `BINDERY_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `BINDERY_API_KEY` | _(empty)_ | **Seed only.** Bootstraps the initial API key on first launch if set; after that the key lives in the database and can be regenerated from the UI. |
 | `BINDERY_DOWNLOAD_DIR` | `/downloads` | Where the download client places completed downloads |
+| `BINDERY_AUDIOBOOK_DOWNLOAD_DIR` | falls back to `BINDERY_DOWNLOAD_DIR` | Separate watch folder for audiobook downloads; set this when your download client routes audiobook grabs to a dedicated category/path |
 | `BINDERY_LIBRARY_DIR` | `/books` | Destination for imported ebook files |
 | `BINDERY_AUDIOBOOK_DIR` | falls back to `BINDERY_LIBRARY_DIR` | Destination for imported audiobook folders |
+| `BINDERY_ENHANCED_HARDCOVER_API` | `true` | Set to `false` to disable token-backed Hardcover series search, linking, catalog diffs, and missing-book fill even when an admin enables the feature in Settings. |
 | `BINDERY_DOWNLOAD_PATH_REMAP` | _(empty)_ | Comma-separated `from:to` pairs rewriting paths reported by the download client into paths Bindery can access. Required when SABnzbd and Bindery mount the same storage at different paths. Longest-prefix match wins. See [Path remapping](#path-remapping-multi-container--multi-pod-setups). |
 | `BINDERY_PUID` | _(unset)_ | Sanity check — see [Running as a specific UID/GID](#running-as-a-specific-uidgid) |
 | `BINDERY_PGID` | _(unset)_ | Sanity check — same as `BINDERY_PUID` for the primary GID |
 | `BINDERY_COOKIE_SECURE` | `auto` | Session cookie `Secure` flag policy. `auto` (default) flips the flag on when TLS is detected directly or via `X-Forwarded-Proto: https`; `always` forces it on (use when your reverse proxy doesn't forward the header); `never` forces it off (legacy plain-HTTP installs). |
 | `BINDERY_NOTIFICATIONS_ALLOW_PRIVATE` | _(unset)_ | Set to `1` to flip outbound webhook SSRF policy from Strict to LAN, allowing RFC1918 targets. Use when ntfy / Home Assistant / Gotify live on your private network. Loopback, link-local, and cloud-metadata endpoints stay blocked. |
+| `BINDERY_RATE_LIMIT_MAX_FAILURES` | `5` | Maximum failed login attempts per IP before the account is locked for the rate-limit window. |
+| `BINDERY_RATE_LIMIT_WINDOW_MINUTES` | `15` | Duration in minutes of the per-IP login rate-limit window. After the window expires the failure counter resets. |
+| `BINDERY_SHUTDOWN_GRACE` | `30` | Seconds to drain in-flight HTTP requests after receiving SIGTERM or SIGINT before the process exits. Increase if your load balancer / Kubernetes sends long-lived SSE or WebSocket connections. |
+
+## Indexer / Prowlarr URLs
+
+URLs entered for **Settings → Indexers** and **Settings → Indexers → Add Prowlarr** are validated against an SSRF policy that **blocks loopback** (`127.0.0.0/8`, `::1`), link-local (`169.254/16`, `fe80::/10`), and cloud-metadata endpoints (e.g. `169.254.169.254`). RFC1918 ranges (`10/8`, `172.16/12`, `192.168/16`) are allowed.
+
+This means `http://localhost:9696` and `http://127.0.0.1:9696` are **rejected** even when Prowlarr runs on the same host. Use one of the following instead:
+
+- **Same Docker network** — use the service name: `http://prowlarr:9696`.
+- **Same host, different containers** — use the host's LAN IP: `http://192.168.x.y:9696`.
+- **Bare-metal both processes** — use the host's LAN IP, or have Prowlarr listen on a non-loopback interface.
+
+The rejection is intentional: a confused-deputy request from Bindery to a loopback URL would let any logged-in user probe services running locally on the Bindery host. There is no env-var escape hatch — if you need it for a controlled test environment, [open an issue](https://github.com/vavallee/bindery/issues/new) describing the use case.
 
 ## First-run setup
 
@@ -231,6 +283,30 @@ On first launch Bindery bootstraps itself — **no environment variables are req
 - `disabled` — no auth at all. Only safe behind a trusted reverse proxy that handles authentication upstream.
 
 ## Upgrading
+
+### ABS import deployment note
+
+**Schema:** ABS import uses migrations `029` through `033`. They create five ABS tables: `abs_import_runs`, `abs_provenance`, `abs_metadata_conflicts`, `abs_import_run_entities`, and `abs_review_queue`. Migration `031` also adds `dry_run`, `source_config_json`, and `checkpoint_json` to `abs_import_runs`; migration `033` is currently a no-op compatibility migration. Take a normal SQLite backup before upgrading, then let Bindery apply the migrations on startup.
+
+**Outbound ABS requests:** ABS probes and imports send `User-Agent: bindery/<version>` to the configured ABS server. Development or unversioned builds use `bindery/dev`.
+
+### Enhanced Hardcover series data deployment note
+
+**Schema:** enhanced series data uses migration `035`, which creates `series_hardcover_links` and backfills links for existing series whose foreign ID already points at Hardcover. Take a normal SQLite backup before upgrading, then let Bindery apply the migration on startup.
+
+**Feature flag:** token-backed Hardcover series search, manual/automatic series linking, catalog diffs, and missing-book fill are available by default at deployment time, but still require a saved Hardcover API token in **Settings -> General** and the enhanced Hardcover series toggle in the same settings section. Set `BINDERY_ENHANCED_HARDCOVER_API=false` only when you need to disable the enhanced endpoints and hide the UI controls for an entire deployment. Existing local series data keeps working when the feature is disabled.
+
+**Operational note:** the enhanced fill action can create wanted/monitored book rows from the linked Hardcover catalog and immediately queue indexer searches. Make sure outbound HTTPS to Hardcover and your configured indexers is allowed before enabling it for production users.
+
+### From v1.9.x to v1.10.0
+
+**Schema:** migration `040` adds `path_remap TEXT` to `download_clients`. Non-destructive; no action required.
+
+**Docker/container networking — qBittorrent and NZBGet** — If you previously saw qBittorrent or NZBGet silently fail to grab torrent/NZB files when using Prowlarr or other indexers with Docker-internal hostnames (e.g. `prowlarr:9696`), this is fixed. Bindery now fetches the content itself and forwards it directly to the download client — qBittorrent and NZBGet never need to resolve the indexer URL.
+
+**Graceful shutdown** — `BINDERY_SHUTDOWN_GRACE` (default `30s`) controls how long the server drains in-flight requests after SIGTERM. `kubectl rollout restart` no longer drops in-flight requests.
+
+**Log level UI toggle** — The log level toggle in Settings → System now immediately affects the log viewer (previously only `BINDERY_LOG_LEVEL` at startup worked).
 
 ### From v0.11.x to v0.12.0 (security posture)
 

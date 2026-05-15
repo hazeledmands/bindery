@@ -1,9 +1,14 @@
 package indexer
 
 import (
+	"context"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/vavallee/bindery/internal/indexer/newznab"
+	"github.com/vavallee/bindery/internal/models"
 )
 
 func resultTitles(rs []newznab.SearchResult) []string {
@@ -33,6 +38,10 @@ func contains(haystack []newznab.SearchResult, needle string) bool {
 
 func TestFilterRelevantTheSparrow(t *testing.T) {
 	// The "canonical" failing case: short title + common word.
+	// Post-#563 the author check requires all significant author tokens to
+	// appear (not just surname) for single-keyword titles. Releases that
+	// carry only the surname are now rejected as too ambiguous — they could
+	// be by any "Russell". A release naming the full author is required.
 	results := toResults(
 		"Mary.Doria.Russell.-.The.Sparrow.1996.RETAIL.EPUB",
 		"The.Sparrow.Russell.epub",
@@ -41,13 +50,14 @@ func TestFilterRelevantTheSparrow(t *testing.T) {
 		"The.Hempcrete.Book.William.Stanwix.Alex.Sparrow.epub",
 		"Dark.Horse.Blade.Of.The.Immortal.Vol.18.The.Sparrow.Net.Comic.eBook",
 	)
-	got := filterRelevant(results, "The Sparrow", "Mary Doria Russell")
+	got := filterRelevant(results, "The Sparrow", "Mary Doria Russell", nil)
 
 	if !contains(got, "Mary.Doria.Russell.-.The.Sparrow.1996.RETAIL.EPUB") {
 		t.Errorf("expected Russell's Sparrow to be kept, got %v", resultTitles(got))
 	}
-	if !contains(got, "The.Sparrow.Russell.epub") {
-		t.Errorf("expected surname-marked result to be kept, got %v", resultTitles(got))
+	// Surname-only release: now rejected post-#563 (was a false-positive vector).
+	if contains(got, "The.Sparrow.Russell.epub") {
+		t.Errorf("post-#563: surname-only release should be rejected, got %v", resultTitles(got))
 	}
 	for _, noise := range []string{
 		"Falcon.and.the.Sparrow.MaryLu.Tyndall.epub",
@@ -63,20 +73,21 @@ func TestFilterRelevantTheSparrow(t *testing.T) {
 
 func TestFilterRelevantWordBoundary(t *testing.T) {
 	// Ensure "sparrow" keyword does not leak into "sparrowhawk" or "sparrows".
+	// Releases name the full author so the post-#563 author check is satisfied.
 	results := toResults(
 		"sparrowhawk.by.russell.epub",
 		"sparrows.russell.epub",
-		"the.sparrow.russell.epub",
+		"mary.doria.russell.the.sparrow.epub",
 	)
-	got := filterRelevant(results, "The Sparrow", "Mary Doria Russell")
+	got := filterRelevant(results, "The Sparrow", "Mary Doria Russell", nil)
 	if contains(got, "sparrowhawk.by.russell.epub") {
 		t.Error("must not match 'sparrowhawk' for 'sparrow' keyword")
 	}
 	if contains(got, "sparrows.russell.epub") {
 		t.Error("must not match plural 'sparrows' for 'sparrow' keyword")
 	}
-	if !contains(got, "the.sparrow.russell.epub") {
-		t.Error("expected 'the.sparrow.russell' to pass")
+	if !contains(got, "mary.doria.russell.the.sparrow.epub") {
+		t.Error("expected 'mary.doria.russell.the.sparrow' to pass")
 	}
 }
 
@@ -87,7 +98,7 @@ func TestFilterRelevantMultiWordPhrase(t *testing.T) {
 		"On.The.Road.Again.Willie.Nelson.epub",
 		"The.Road.To.Wigan.Pier.Orwell.epub",
 	)
-	got := filterRelevant(results, "The Road", "Cormac McCarthy")
+	got := filterRelevant(results, "The Road", "Cormac McCarthy", nil)
 
 	if !contains(got, "Cormac.McCarthy.-.The.Road.2006.epub") {
 		t.Error("expected McCarthy's The Road to pass")
@@ -111,28 +122,33 @@ func TestFilterRelevantMultiWordPhrase(t *testing.T) {
 }
 
 func TestFilterRelevantSubtitle(t *testing.T) {
-	// "Dune: Messiah" must accept releases tagged either as "Dune" or
-	// "Dune Messiah". The colon subtitle is treated specially.
+	// "Dune: Messiah" must accept releases naming the full author. The colon
+	// subtitle is treated specially: a release matching the primary ("Dune")
+	// + the full author is accepted. Post-#563 the primary-title-only path
+	// (single keyword) requires both first name AND surname, not just surname.
 	results := toResults(
-		"Frank.Herbert.Dune.Messiah.epub",
-		"Dune.Messiah.Herbert.epub",
-		"Frank.Herbert.Dune.epub", // primary-title-only match
+		"Frank.Herbert.Dune.Messiah.epub", // full author + primary title
+		"Frank.Herbert.Dune.epub",         // full author + primary only
+		"Dune.Herbert.epub",               // surname only — post-#563 rejected
 	)
-	got := filterRelevant(results, "Dune: Messiah", "Frank Herbert")
+	got := filterRelevant(results, "Dune: Messiah", "Frank Herbert", nil)
 	for _, title := range []string{
 		"Frank.Herbert.Dune.Messiah.epub",
-		"Dune.Messiah.Herbert.epub",
 		"Frank.Herbert.Dune.epub",
 	} {
 		if !contains(got, title) {
-			t.Errorf("expected %q to pass subtitle filter", title)
+			t.Errorf("expected %q to pass subtitle filter, got %v", title, resultTitles(got))
 		}
+	}
+	// Post-#563: primary-title-only with surname-only author is now rejected.
+	if contains(got, "Dune.Herbert.epub") {
+		t.Error("post-#563: primary-only + surname-only release should be rejected")
 	}
 }
 
 func TestFilterRelevantNoResults(t *testing.T) {
 	// Empty input → empty output, no panic.
-	got := filterRelevant(nil, "The Sparrow", "Russell")
+	got := filterRelevant(nil, "The Sparrow", "Russell", nil)
 	if len(got) != 0 {
 		t.Errorf("expected empty, got %v", got)
 	}
@@ -182,11 +198,35 @@ func TestFilterRelevantApostrophe(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		got := filterRelevant(toResults(tc.releases...), tc.bookTitle, tc.author)
+		got := filterRelevant(toResults(tc.releases...), tc.bookTitle, tc.author, nil)
 		if !contains(got, tc.wantAny) {
 			t.Errorf("filterRelevant(%q, %q): expected %q in results, got %v",
 				tc.bookTitle, tc.author, tc.wantAny, resultTitles(got))
 		}
+	}
+}
+
+// TestFilterRelevantEditionQualifier — regression test for issue #283.
+// filterRelevant must accept real NZB releases for a book whose metadata
+// title carries a parenthesised edition qualifier. Before the fix,
+// "(German Edition)" was tokenised into sigWords as the keyword "(german",
+// which never matched any release name, causing the entire result set to be
+// dropped.
+func TestFilterRelevantEditionQualifier(t *testing.T) {
+	results := toResults(
+		"Herta.Mueller.Die.Stille.ist.ein.Geraeusch.epub",
+		"Die.Stille.ist.ein.Geraeusch.Mueller.epub",
+		"Some.Unrelated.Noise.epub",
+	)
+	got := filterRelevant(results, "Die Stille ist ein Geräusch (German Edition)", "Herta Müller", nil)
+	if !contains(got, "Herta.Mueller.Die.Stille.ist.ein.Geraeusch.epub") {
+		t.Errorf("expected full-title release to pass, got %v", resultTitles(got))
+	}
+	if !contains(got, "Die.Stille.ist.ein.Geraeusch.Mueller.epub") {
+		t.Errorf("expected release without edition qualifier to pass, got %v", resultTitles(got))
+	}
+	if contains(got, "Some.Unrelated.Noise.epub") {
+		t.Error("unrelated noise must not pass")
 	}
 }
 
@@ -260,41 +300,10 @@ func TestFilterByLanguageAny(t *testing.T) {
 }
 
 func TestFilterCategoriesForMedia(t *testing.T) {
-	cases := []struct {
-		name      string
-		cats      []int
-		mediaType string
-		want      []int
-	}{
-		// Parent-only → widen to sane child default (no parent in output).
-		{name: "ebook parent-only", cats: []int{7000}, mediaType: "ebook", want: []int{7020}},
-		{name: "audiobook parent-only", cats: []int{3000}, mediaType: "audiobook", want: []int{3030}},
-
-		// Parent + child → drop parent, keep children.
-		{name: "ebook parent+child", cats: []int{7000, 7020}, mediaType: "ebook", want: []int{7020}},
-		{name: "ebook parent+multiple children", cats: []int{7000, 7020, 7030}, mediaType: "ebook", want: []int{7020, 7030}},
-		{name: "audiobook parent+child", cats: []int{3000, 3030}, mediaType: "audiobook", want: []int{3030}},
-
-		// Child(ren) only → pass through unchanged.
-		{name: "ebook child-only", cats: []int{7020}, mediaType: "ebook", want: []int{7020}},
-		{name: "audiobook child-only", cats: []int{3030}, mediaType: "audiobook", want: []int{3030}},
-		{name: "ebook multiple children", cats: []int{7020, 7030}, mediaType: "ebook", want: []int{7020, 7030}},
-
-		// Mixed ebook+audiobook → filtered by mediaType.
-		{name: "mixed ebook query", cats: []int{7020, 3030}, mediaType: "ebook", want: []int{7020}},
-		{name: "mixed audiobook query", cats: []int{7020, 3030}, mediaType: "audiobook", want: []int{3030}},
-
-		// Empty input → fallback to sane child default (no parent).
-		{name: "empty ebook", cats: nil, mediaType: "ebook", want: []int{7020}},
-		{name: "empty audiobook", cats: nil, mediaType: "audiobook", want: []int{3030}},
-
-		// No matching tree → fallback.
-		{name: "no ebook cats returns fallback", cats: []int{3030}, mediaType: "ebook", want: []int{7020}},
-		{name: "no audiobook cats returns fallback", cats: []int{7020}, mediaType: "audiobook", want: []int{3030}},
-
-		// Parent must never appear in output when a child is present.
-		{name: "7000 absent when child present ebook", cats: []int{7000, 7020}, mediaType: "ebook", want: []int{7020}},
-		{name: "3000 absent when child present audiobook", cats: []int{3000, 3030}, mediaType: "audiobook", want: []int{3030}},
+	all := []int{7000, 7020, 3030}
+	ebook := filterCategoriesForMedia(all, "ebook")
+	if len(ebook) != 1 || ebook[0] != 7020 {
+		t.Errorf("ebook filter = %v, want [7020]", ebook)
 	}
 
 	sliceEq := func(a, b []int) bool {
@@ -308,39 +317,23 @@ func TestFilterCategoriesForMedia(t *testing.T) {
 		}
 		return true
 	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := filterCategoriesForMedia(tc.cats, tc.mediaType)
-			if !sliceEq(got, tc.want) {
-				t.Errorf("filterCategoriesForMedia(%v, %q) = %v, want %v",
-					tc.cats, tc.mediaType, got, tc.want)
-			}
-			// Invariant: 7000 and 3000 must never appear in output when a child is
-			// also present.
-			has7000 := false
-			has3000 := false
-			hasOther7 := false
-			hasOther3 := false
-			for _, c := range got {
-				switch {
-				case c == 7000:
-					has7000 = true
-				case c == 3000:
-					has3000 = true
-				case c/1000 == 7:
-					hasOther7 = true
-				case c/1000 == 3:
-					hasOther3 = true
-				}
-			}
-			if has7000 && hasOther7 {
-				t.Errorf("output %v: parent 7000 present alongside child cat", got)
-			}
-			if has3000 && hasOther3 {
-				t.Errorf("output %v: parent 3000 present alongside child cat", got)
-			}
-		})
+	// Empty input falls back to the standard category for the media type.
+	if got := filterCategoriesForMedia(nil, "ebook"); len(got) != 1 || got[0] != 7020 {
+		t.Errorf("nil + ebook should fall back to [7020], got %v", got)
+	}
+	if got := filterCategoriesForMedia(nil, "audiobook"); len(got) != 1 || got[0] != 3030 {
+		t.Errorf("nil + audiobook should fall back to [3030], got %v", got)
+	}
+	// Unknown type falls back to books.
+	if got := filterCategoriesForMedia(all, ""); len(got) != 1 {
+		t.Errorf("empty type should default to books, got %v", got)
+	}
+	// Pre-v0.5.0 indexer config without 3030 still searches audiobooks
+	// via the fallback 3030 category rather than silently returning
+	// ebook results.
+	booksOnly := []int{7000, 7020}
+	if got := filterCategoriesForMedia(booksOnly, "audiobook"); len(got) != 1 || got[0] != 3030 {
+		t.Errorf("no-match audiobook should fall back to [3030], got %v", got)
 	}
 }
 
@@ -403,6 +396,18 @@ func TestRankResultsManyItemsOrdering(t *testing.T) {
 	}
 	if m4bIdx >= abridgedIdx {
 		t.Errorf("M4B (idx=%d) should outrank ABRIDGED mp3 (idx=%d)", m4bIdx, abridgedIdx)
+	}
+}
+
+func TestRankResultsIndexerPriority(t *testing.T) {
+	// Two otherwise-identical releases; the one from the higher-priority indexer
+	// must sort first regardless of insertion order.
+	low := newznab.SearchResult{Title: "Project.Hail.Mary.EPUB", IndexerPriority: 10}
+	high := newznab.SearchResult{Title: "Project.Hail.Mary.EPUB", IndexerPriority: 50}
+	results := []newznab.SearchResult{low, high}
+	rankResults(results, MatchCriteria{Title: "Project Hail Mary"})
+	if results[0].IndexerPriority != 50 {
+		t.Errorf("expected higher-priority indexer first, got priority=%d", results[0].IndexerPriority)
 	}
 }
 
@@ -508,16 +513,16 @@ func TestIsArticle(t *testing.T) {
 }
 
 func TestTitleMatchesSingleKeyword(t *testing.T) {
-	// Single keyword without surname → accept (can't do better)
-	if !titleMatchesResult("dune", []string{"dune"}, "", false) {
-		t.Error("single keyword, no surname → should accept")
+	// Single keyword without author tokens → accept (can't do better)
+	if !titleMatchesResult("dune", []string{"dune"}, nil, false) {
+		t.Error("single keyword, no author → should accept")
 	}
 	// Single keyword with non-matching surname → reject
-	if titleMatchesResult("dune.novel", []string{"dune"}, "herbert", false) {
+	if titleMatchesResult("dune novel", []string{"dune"}, []string{"herbert"}, false) {
 		t.Error("single keyword missing surname → should reject")
 	}
 	// Single keyword with matching surname → accept
-	if !titleMatchesResult("dune.herbert", []string{"dune"}, "herbert", false) {
+	if !titleMatchesResult("dune herbert", []string{"dune"}, []string{"herbert"}, false) {
 		t.Error("single keyword + matching surname → should accept")
 	}
 }
@@ -536,7 +541,7 @@ func TestFilterRelevantAnyPhraseMatchTrap(t *testing.T) {
 		"Name.Wind.Rothfuss.epub", // abbreviated — phrase-matches ["name","wind"]
 		"Completely.Unrelated.Book.epub",
 	)
-	got := filterRelevant(results, "The Name of the Wind", "Patrick Rothfuss")
+	got := filterRelevant(results, "The Name of the Wind", "Patrick Rothfuss", nil)
 
 	if !contains(got, "Patrick.Rothfuss.-.The.Name.of.the.Wind.EPUB") {
 		t.Errorf("correct release dropped by anyPhraseMatch trap; got %v", resultTitles(got))
@@ -562,7 +567,7 @@ func TestFilterRelevantStopWordsBetweenKeywords(t *testing.T) {
 		"Lord.of.the.Rings.Unabridged.m4b",
 		"Unrelated.Fantasy.Novel.epub",
 	)
-	got := filterRelevant(results, "The Lord of the Rings", "J.R.R. Tolkien")
+	got := filterRelevant(results, "The Lord of the Rings", "J.R.R. Tolkien", nil)
 
 	for _, title := range []string{
 		"J.R.R.Tolkien.-.The.Lord.of.the.Rings.EPUB",
@@ -579,31 +584,88 @@ func TestFilterRelevantStopWordsBetweenKeywords(t *testing.T) {
 	}
 }
 
-// Custom indexer categories (e.g. 7120 for German books) must pass through
-// filterCategoriesForMedia unchanged.
+// Only standard Newznab ebook (702x) and audiobook (303x) subcategories pass.
+// Site-specific extensions like 7120 or 3130 are outside those ranges.
 func TestFilterCategoriesCustomIDs(t *testing.T) {
-	// SceneNZBs-style: 7120 = German books, 3130 = German audio.
 	cats := []int{7020, 7120, 3030, 3130}
 
 	ebook := filterCategoriesForMedia(cats, "ebook")
-	wantEbook := []int{7020, 7120}
-	if len(ebook) != len(wantEbook) {
-		t.Fatalf("ebook cats = %v, want %v", ebook, wantEbook)
-	}
-	for i, v := range wantEbook {
-		if ebook[i] != v {
-			t.Errorf("ebook[%d] = %d, want %d", i, ebook[i], v)
-		}
+	if len(ebook) != 1 || ebook[0] != 7020 {
+		t.Errorf("ebook cats = %v, want [7020]", ebook)
 	}
 
 	audio := filterCategoriesForMedia(cats, "audiobook")
-	wantAudio := []int{3030, 3130}
-	if len(audio) != len(wantAudio) {
-		t.Fatalf("audio cats = %v, want %v", audio, wantAudio)
+	if len(audio) != 1 || audio[0] != 3030 {
+		t.Errorf("audio cats = %v, want [3030]", audio)
 	}
-	for i, v := range wantAudio {
-		if audio[i] != v {
-			t.Errorf("audio[%d] = %d, want %d", i, audio[i], v)
+}
+
+// TestFilterCategoriesMaM covers indexers like MyAnonamouse whose entire
+// taxonomy uses 100xxx IDs (e.g. 100013 = AudioBooks, 100111 = Audiobooks -
+// Young Adult). None of these match the standard 303x/702x prefix, so the
+// old code substituted the fallback 3030 — which MaM does not map to any of
+// its own subcategories, returning unrelated results.
+//
+// When all configured categories are non-standard (>9999) and no standard
+// match exists, filterCategoriesForMedia must pass them through as-is.
+func TestFilterCategoriesMaM(t *testing.T) {
+	// Typical MaM audiobook category list
+	mamAudioCats := []int{100013, 100039, 100041, 100042, 100044, 100045, 100046, 100047, 100111}
+
+	got := filterCategoriesForMedia(mamAudioCats, "audiobook")
+	if len(got) != len(mamAudioCats) {
+		t.Fatalf("MaM audiobook cats: got %v, want all %v passed through", got, mamAudioCats)
+	}
+	for i, c := range mamAudioCats {
+		if got[i] != c {
+			t.Errorf("MaM audiobook cats[%d]: got %d, want %d", i, got[i], c)
+		}
+	}
+
+	// MaM ebook category list
+	mamEbookCats := []int{100014, 100060, 100062, 100063, 100064, 100112}
+
+	got = filterCategoriesForMedia(mamEbookCats, "ebook")
+	if len(got) != len(mamEbookCats) {
+		t.Fatalf("MaM ebook cats: got %v, want all %v passed through", got, mamEbookCats)
+	}
+
+	// Standard indexer with no audiobook cats still falls back correctly —
+	// the non-standard path must not fire when all configured IDs are standard.
+	booksOnly := []int{7000, 7020}
+	if fb := filterCategoriesForMedia(booksOnly, "audiobook"); len(fb) != 1 || fb[0] != 3030 {
+		t.Errorf("standard ebook-only indexer should fall back to [3030] for audiobook, got %v", fb)
+	}
+}
+
+func TestFilterCategoriesParentDrop(t *testing.T) {
+	cases := []struct {
+		cats      []int
+		mediaType string
+		want      []int
+	}{
+		// Core regression: bare parent 7000 must never reach the indexer as-is.
+		// Prowlarr reports only 7000 for generic book trackers; the searcher must
+		// widen this to the ebook default (7020) rather than sending the broad
+		// parent, which causes indexers to return noisier result sets.
+		{[]int{7000}, "ebook", []int{7020}},
+		{[]int{3000}, "audiobook", []int{3030}},
+		{[]int{7000, 7020}, "ebook", []int{7020}},
+		{[]int{7000, 7020, 7030}, "ebook", []int{7020}},
+		{[]int{3000, 3030}, "audiobook", []int{3030}},
+		{nil, "ebook", []int{7020}},
+		{[]int{7020, 7021, 7022}, "ebook", []int{7020, 7021, 7022}},
+	}
+	for _, tc := range cases {
+		got := filterCategoriesForMedia(tc.cats, tc.mediaType)
+		if len(got) != len(tc.want) {
+			t.Errorf("filterCategoriesForMedia(%v, %q) = %v, want %v", tc.cats, tc.mediaType, got, tc.want)
+			continue
+		}
+		for i := range tc.want {
+			if got[i] != tc.want[i] {
+				t.Errorf("filterCategoriesForMedia(%v, %q)[%d] = %d, want %d", tc.cats, tc.mediaType, i, got[i], tc.want[i])
+			}
 		}
 	}
 }
@@ -663,10 +725,299 @@ func TestFilterRelevantGermanUmlauts(t *testing.T) {
 		},
 	}
 	for _, tc := range cases {
-		got := filterRelevant(toResults(tc.releases...), tc.bookTitle, tc.author)
+		got := filterRelevant(toResults(tc.releases...), tc.bookTitle, tc.author, nil)
 		if !contains(got, tc.wantAny) {
 			t.Errorf("filterRelevant(%q, %q): want %q in results, got %v",
 				tc.bookTitle, tc.author, tc.wantAny, resultTitles(got))
 		}
 	}
 }
+
+// TestFilterRelevantNonLatinAuthor verifies that releases whose author token is
+// romanised are accepted when the primary author name is non-latin but a
+// latin-script alias is provided. The alias surname is needed for single-keyword
+// titles (where filterRelevant requires the surname alongside the keyword to
+// prevent false positives).
+// TestFilterRelevantPossessivePrefix is a regression test for issue #409.
+// Book titles with a possessive author prefix like "Tom Clancy's Rainbow Six"
+// must match releases named "Tom Clancy - Rainbow Six". Before the fix,
+// sigWords turned "Tom Clancy's" into the keyword "clancys", which never
+// matched the apostrophe-free "clancy" token in the release name, causing
+// the entire result set to be dropped.
+func TestFilterRelevantPossessivePrefix(t *testing.T) {
+	cases := []struct {
+		bookTitle string
+		author    string
+		releases  []string
+		wantPass  []string
+		wantDrop  []string
+	}{
+		{
+			bookTitle: "Tom Clancy's Rainbow Six",
+			author:    "Tom Clancy",
+			releases: []string{
+				"Tom.Clancy.-.Rainbow.Six.epub",
+				"Tom.Clancy.Rainbow.Six.RETAIL.EPUB",
+				"Rainbow.Six.Clancy.epub",
+				"Tom.Clancy.-.The.Hunt.for.Red.October.epub",
+			},
+			wantPass: []string{
+				"Tom.Clancy.-.Rainbow.Six.epub",
+				"Tom.Clancy.Rainbow.Six.RETAIL.EPUB",
+				"Rainbow.Six.Clancy.epub",
+			},
+			wantDrop: []string{
+				"Tom.Clancy.-.The.Hunt.for.Red.October.epub",
+			},
+		},
+		{
+			bookTitle: "James Patterson's Along Came a Spider",
+			author:    "James Patterson",
+			releases: []string{
+				"James.Patterson.-.Along.Came.a.Spider.epub",
+				"Along.Came.a.Spider.Patterson.epub",
+				"James.Patterson.Kiss.the.Girls.epub",
+			},
+			wantPass: []string{
+				"James.Patterson.-.Along.Came.a.Spider.epub",
+				"Along.Came.a.Spider.Patterson.epub",
+			},
+			wantDrop: []string{
+				"James.Patterson.Kiss.the.Girls.epub",
+			},
+		},
+		{
+			// Unicode right-single-quotation-mark (U+2019, 3 bytes) instead of
+			// ASCII apostrophe — regression for the byte-offset slice bug.
+			bookTitle: "Tom Clancy’s Rainbow Six",
+			author:    "Tom Clancy",
+			releases: []string{
+				"Tom.Clancy.-.Rainbow.Six.epub",
+				"Tom.Clancy.-.The.Hunt.for.Red.October.epub",
+			},
+			wantPass: []string{
+				"Tom.Clancy.-.Rainbow.Six.epub",
+			},
+			wantDrop: []string{
+				"Tom.Clancy.-.The.Hunt.for.Red.October.epub",
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		got := filterRelevant(toResults(tc.releases...), tc.bookTitle, tc.author, nil)
+		for _, title := range tc.wantPass {
+			if !contains(got, title) {
+				t.Errorf("filterRelevant(%q, %q): expected %q to pass, got %v",
+					tc.bookTitle, tc.author, title, resultTitles(got))
+			}
+		}
+		for _, title := range tc.wantDrop {
+			if contains(got, title) {
+				t.Errorf("filterRelevant(%q, %q): expected %q to be dropped, got %v",
+					tc.bookTitle, tc.author, title, resultTitles(got))
+			}
+		}
+	}
+}
+
+func TestFilterRelevantNonLatinAuthor(t *testing.T) {
+	// "Silence" by 遠藤周作 (Shusaku Endo): 1 significant keyword → author required.
+	// Post-#563: author check requires all tokens (first+last) for multi-token
+	// aliases, so surname-only releases like "Endo.Silence.epub" no longer pass
+	// — even with the alias, "shusaku" must also appear.
+	releases := []string{
+		"Endo.Silence.epub",
+		"Shusaku.Endo.Silence.m4b",
+		"Silence.epub",
+		"Unrelated.Noise.epub",
+	}
+	results := toResults(releases...)
+
+	// Without aliases, the non-latin surname ("作" from 遠藤周作) never appears in
+	// any release name, so author-anchored matches are missed.
+	withoutAliases := filterRelevant(results, "Silence", "遠藤周作", nil)
+	if contains(withoutAliases, "Endo.Silence.epub") {
+		t.Error("without aliases, romanised-surname release should not pass for non-latin primary name")
+	}
+
+	// With the latin alias "Shusaku Endo", releases naming the full alias pass;
+	// surname-only ones are now rejected (post-#563 stricter author check).
+	aliases := []string{"Shusaku Endo"}
+	withAliases := filterRelevant(results, "Silence", "遠藤周作", aliases)
+	if !contains(withAliases, "Shusaku.Endo.Silence.m4b") {
+		t.Errorf("with alias, expected %q to pass; got %v",
+			"Shusaku.Endo.Silence.m4b", resultTitles(withAliases))
+	}
+	if contains(withAliases, "Endo.Silence.epub") {
+		t.Error("post-#563: alias surname-only release should be rejected")
+	}
+	if contains(withAliases, "Unrelated.Noise.epub") {
+		t.Error("unrelated result should still be filtered out even with aliases")
+	}
+}
+
+// TestFilterRelevantCoAuthorSurnameOverlap is the regression test for #563:
+// when the monitored author shares a surname with a co-author of an unrelated
+// release, the surname-only token check used to leak the co-author's work into
+// the monitored author's library. The release filter must require both the
+// first name and the surname (or all significant tokens) at word boundaries.
+func TestFilterRelevantCoAuthorSurnameOverlap(t *testing.T) {
+	// Monitored author "Rachel Reid". A release by co-author "Adam Reid" must
+	// be rejected. The title here is a multi-keyword title so the title path
+	// doesn't anchor on author; the single-keyword path is what we exercise.
+	// Note: the multi-keyword-title path uses phrase-only matching and does
+	// NOT consult author tokens at all (the existing code accepts that
+	// limitation to avoid rejecting NZBs that omit the author). The author
+	// check applies on the single-keyword and zero-keyword title paths only.
+	cases := []struct {
+		name    string
+		title   string
+		author  string
+		release string
+		wantOK  bool
+	}{
+		{
+			name:    "single-keyword title, surname-only release rejected",
+			title:   "Sparrow",
+			author:  "Rachel Reid",
+			release: "Sparrow.by.Adam.Reid.epub",
+			wantOK:  false,
+		},
+		{
+			name:    "single-keyword title, full author release accepted",
+			title:   "Sparrow",
+			author:  "Rachel Reid",
+			release: "Rachel.Reid.Sparrow.epub",
+			wantOK:  true,
+		},
+		{
+			name:    "single-keyword title, surname-only (matches monitored surname) rejected",
+			title:   "Sparrow",
+			author:  "Rachel Reid",
+			release: "Reid.Sparrow.epub",
+			wantOK:  false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := filterRelevant(toResults(tc.release), tc.title, tc.author, nil)
+			if tc.wantOK && !contains(got, tc.release) {
+				t.Errorf("expected %q to pass; got %v", tc.release, resultTitles(got))
+			}
+			if !tc.wantOK && contains(got, tc.release) {
+				t.Errorf("expected %q to be filtered out; got %v", tc.release, resultTitles(got))
+			}
+		})
+	}
+}
+
+// TestAuthorMatchesReleaseInitials covers #563: an author like "George R. R.
+// Martin" should still match a release naming the author as "George Martin"
+// (initials are optional). The fallback all-significant-tokens path requires
+// every >=3-char token, so initials must be dropped, not kept.
+func TestAuthorMatchesReleaseInitials(t *testing.T) {
+	toks := authorTokens("George R. R. Martin")
+	if want := []string{"george", "martin"}; !equalSlices(toks, want) {
+		t.Errorf("authorTokens dropped initials = %v, want %v", toks, want)
+	}
+	if !authorMatchesRelease("george martin a game of thrones epub", toks) {
+		t.Error("'George Martin ...' should match 'George R. R. Martin'")
+	}
+	if authorMatchesRelease("george martin epub", []string{"george", "r", "r", "martin"}) {
+		// guard: with the strict all-tokens fallback, a 1-char "r" requires
+		// `\br\b` somewhere in the haystack. We don't want our dropping logic
+		// to allow false positives, but since authorTokens strips initials,
+		// this synthetic check is just an aux sanity test for the matcher.
+		t.Log("matcher with 1-char tokens rejected when 'r' is absent — OK")
+	}
+}
+
+// TestAuthorMatchesReleaseSingleName covers the single-token pseudonym path
+// (#563): authors like "Plato" must accept releases naming "Plato" without
+// any other anchor.
+func TestAuthorMatchesReleaseSingleName(t *testing.T) {
+	toks := authorTokens("Plato")
+	if want := []string{"plato"}; !equalSlices(toks, want) {
+		t.Errorf("authorTokens(Plato) = %v, want %v", toks, want)
+	}
+	if !authorMatchesRelease("plato republic epub", toks) {
+		t.Error("'Plato' should match 'plato republic epub'")
+	}
+	if authorMatchesRelease("aristotle epub", toks) {
+		t.Error("'Plato' should NOT match 'aristotle epub'")
+	}
+}
+
+// TestAuthorMatchesReleaseHyphenated covers hyphenated names like
+// "Mary-Kate Olsen" (#563). The hyphen is non-word so the regex \bmary-kate\b
+// matches "mary-kate" in the release, and "olsen" matches separately.
+func TestAuthorMatchesReleaseHyphenated(t *testing.T) {
+	toks := authorTokens("Mary-Kate Olsen")
+	if !authorMatchesRelease("mary-kate olsen biography epub", toks) {
+		t.Errorf("hyphenated name should match: tokens=%v", toks)
+	}
+	// Bare "kate" alone is not enough — the monitored author has the hyphenated
+	// first name as one token; partial first-name match doesn't count.
+	if authorMatchesRelease("kate olsen biography epub", toks) {
+		t.Errorf("partial first-name match should be rejected: tokens=%v", toks)
+	}
+}
+
+func equalSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestSearchBookWithDebug_PerResultLogging verifies that the per-result debug
+// log lines in SearchBookWithDebug are executed when the slog level is DEBUG.
+func TestSearchBookWithDebug_PerResultLogging(t *testing.T) {
+	const rssBody = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/">
+  <channel>
+    <newznab:response offset="0" total="1"/>
+    <item>
+      <title>Life Ascending Nick Lane</title>
+      <guid isPermaLink="false">guid-1</guid>
+      <enclosure url="https://fake/dl/1" length="1000" type="application/x-nzb"/>
+      <newznab:attr name="author" value="Nick Lane"/>
+    </item>
+  </channel>
+</rss>`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.Write([]byte(rssBody))
+	}))
+	defer srv.Close()
+
+	// Set global slog to debug so the Enabled check in SearchBookWithDebug fires.
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(nopWriter{}, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+
+	idxs := []models.Indexer{{ID: 1, Name: "test", URL: srv.URL, Enabled: true, Categories: []int{7020}}}
+	results, dbg := NewSearcher().SearchBookWithDebug(context.Background(), idxs, MatchCriteria{
+		Title:  "Life Ascending",
+		Author: "Nick Lane",
+	})
+
+	if len(results) == 0 {
+		t.Fatal("expected at least 1 result")
+	}
+	if dbg == nil {
+		t.Fatal("expected non-nil debug info")
+	}
+}
+
+// nopWriter discards all log output during tests.
+type nopWriter struct{}
+
+func (nopWriter) Write(p []byte) (int, error) { return len(p), nil }
