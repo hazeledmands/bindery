@@ -270,24 +270,13 @@ func reconcileMigrationVersions(database *sql.DB, entries []os.DirEntry) error {
 		indexToFilename[i+1] = fv
 	}
 
-	rows, err := database.Query("SELECT version FROM schema_migrations ORDER BY version")
+	// Read in a helper so the result set is fully closed before the rewrite
+	// transaction below — the pool is single-connection, so an open query
+	// would deadlock database.Begin().
+	recorded, err := readRecordedVersions(database)
 	if err != nil {
-		return fmt.Errorf("read schema_migrations for reconciliation: %w", err)
+		return err
 	}
-	var recorded []int
-	for rows.Next() {
-		var v int
-		if err := rows.Scan(&v); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan schema_migrations version: %w", err)
-		}
-		recorded = append(recorded, v)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return fmt.Errorf("iterate schema_migrations: %w", err)
-	}
-	rows.Close()
 
 	if len(recorded) == 0 {
 		return nil // fresh DB — nothing to reconcile
@@ -345,6 +334,29 @@ func reconcileMigrationVersions(database *sql.DB, entries []os.DirEntry) error {
 	}
 	slog.Info("reconciled schema_migrations to filename-based versions", "rows", len(recorded))
 	return nil
+}
+
+// readRecordedVersions returns every version in schema_migrations, ascending.
+// It exists as a separate function so the result set is closed (via defer)
+// before any caller starts a write transaction — the pool is single-connection.
+func readRecordedVersions(database *sql.DB) ([]int, error) {
+	rows, err := database.Query("SELECT version FROM schema_migrations ORDER BY version")
+	if err != nil {
+		return nil, fmt.Errorf("read schema_migrations for reconciliation: %w", err)
+	}
+	defer rows.Close()
+	var recorded []int
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			return nil, fmt.Errorf("scan schema_migrations version: %w", err)
+		}
+		recorded = append(recorded, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate schema_migrations: %w", err)
+	}
+	return recorded, nil
 }
 
 // applyMigration runs a single migration's statements and records it in

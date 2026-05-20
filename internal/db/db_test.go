@@ -1744,37 +1744,13 @@ func TestReconcileMigrationVersionsLeavesFreshDB(t *testing.T) {
 	}
 	sortEntriesForTest(entries)
 
-	before := make(map[int]bool)
-	rows, err := database.Query("SELECT version FROM schema_migrations")
-	if err != nil {
-		t.Fatalf("query: %v", err)
-	}
-	for rows.Next() {
-		var v int
-		if err := rows.Scan(&v); err != nil {
-			t.Fatalf("scan: %v", err)
-		}
-		before[v] = true
-	}
-	rows.Close()
+	before := versionSetForTest(t, database)
 
 	if err := reconcileMigrationVersions(database, entries); err != nil {
 		t.Fatalf("reconcile on already-filename-based DB: %v", err)
 	}
 
-	after := make(map[int]bool)
-	rows, err = database.Query("SELECT version FROM schema_migrations")
-	if err != nil {
-		t.Fatalf("query: %v", err)
-	}
-	for rows.Next() {
-		var v int
-		if err := rows.Scan(&v); err != nil {
-			t.Fatalf("scan: %v", err)
-		}
-		after[v] = true
-	}
-	rows.Close()
+	after := versionSetForTest(t, database)
 
 	if len(before) != len(after) {
 		t.Fatalf("reconciliation changed row count on a filename-based DB: %d -> %d", len(before), len(after))
@@ -1790,4 +1766,26 @@ func sortEntriesForTest(entries []os.DirEntry) {
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].Name() < entries[j].Name()
 	})
+}
+
+// versionSetForTest returns every version recorded in schema_migrations.
+func versionSetForTest(t *testing.T, database *sql.DB) map[int]bool {
+	t.Helper()
+	rows, err := database.Query("SELECT version FROM schema_migrations")
+	if err != nil {
+		t.Fatalf("query schema_migrations: %v", err)
+	}
+	defer rows.Close()
+	set := make(map[int]bool)
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			t.Fatalf("scan version: %v", err)
+		}
+		set[v] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate versions: %v", err)
+	}
+	return set
 }
