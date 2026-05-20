@@ -11,6 +11,8 @@ import { useAuth } from '../auth/AuthContext'
 
 type Tab = 'indexers' | 'clients' | 'notifications' | 'quality' | 'metadata' | 'general' | 'import' | 'rootfolders' | 'logs' | 'blocklist' | 'calibre' | 'abs' | 'grimmory'
 
+const ADMIN_TABS: Tab[] = ['indexers', 'clients', 'notifications', 'quality', 'metadata', 'import', 'rootfolders', 'logs', 'blocklist', 'calibre', 'abs', 'grimmory']
+
 const inputCls = 'w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600'
 const absReviewResultLimit = 10
 
@@ -123,6 +125,14 @@ export default function SettingsPage() {
     document.title = 'Settings · Bindery'
     return () => { document.title = 'Bindery' }
   }, [])
+
+  // Redirect non-admins back to the general tab if they somehow navigate to an
+  // admin-only tab (e.g. via direct link or stale state).
+  useEffect(() => {
+    if (!isAdmin && ADMIN_TABS.includes(tab)) {
+      setTab('general')
+    }
+  }, [isAdmin, tab])
 
   useEffect(() => {
     if (tab === 'notifications') api.listNotifications().then(setNotifications).catch(console.error)
@@ -2509,6 +2519,7 @@ function AddHardcoverListForm({ onSaved, onCancel }: { onSaved: (il: ImportList)
 
 function GeneralTab() {
   const { t } = useTranslation()
+  const { isAdmin } = useAuth()
   const [settings, setSettings] = useState<Record<string, string>>({})
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState<string | null>(null)
@@ -2736,6 +2747,11 @@ function GeneralTab() {
         </div>
       </section>
 
+      {/* Security — visible to all authenticated users for their own password
+          change; admin-only sub-controls are gated inside the component. */}
+      <SecuritySection />
+
+      {isAdmin && (<>
       {/* Naming */}
       <section>
         <h3 className="text-base font-semibold mb-3 text-slate-800 dark:text-zinc-200">{t('settings.general.fileNaming')}</h3>
@@ -3124,9 +3140,6 @@ function GeneralTab() {
         </div>
       </section>
 
-      {/* Security */}
-      <SecuritySection />
-
       {/* OIDC providers */}
       <AuthSettings />
 
@@ -3362,6 +3375,7 @@ function GeneralTab() {
           </p>
         </div>
       </section>
+      </>)}
     </div>
   )
 }
@@ -4590,7 +4604,7 @@ function AddNotificationForm({ onClose, onAdded }: { onClose: () => void; onAdde
 }
 
 function SecuritySection() {
-  const { status, refresh } = useAuth()
+  const { status, refresh, isAdmin } = useAuth()
   const [cfg, setCfg] = useState<AuthConfig | null>(null)
   const [showKey, setShowKey] = useState(false)
   const [regenerating, setRegenerating] = useState(false)
@@ -4645,6 +4659,7 @@ function SecuritySection() {
     <section>
       <h3 className="text-base font-semibold mb-3 text-slate-800 dark:text-zinc-200">Security</h3>
       <div className="p-4 border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900 space-y-5">
+        {isAdmin && (<>
         <div>
           <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">Authentication Mode</label>
           <p className="text-xs text-slate-600 dark:text-zinc-500 mb-2">
@@ -4683,8 +4698,10 @@ function SecuritySection() {
           </div>
         </div>
 
+        </>)}
+
         {status?.authenticated && (
-          <div className="border-t border-slate-200 dark:border-zinc-800 pt-4">
+          <div className={isAdmin ? 'border-t border-slate-200 dark:border-zinc-800 pt-4' : ''}>
             <ChangePasswordForm username={cfg.username} />
           </div>
         )}
