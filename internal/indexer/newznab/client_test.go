@@ -1045,7 +1045,7 @@ func TestBookSearch_AbortOnAuthError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "badkey")
+	c := testNew(srv.URL, "badkey")
 	_, err := c.BookSearch(context.Background(), "Dark Matter", "Blake Crouch", []int{7020})
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -1077,7 +1077,7 @@ func TestBookSearch_AbortOnRateLimitError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "somekey")
+	c := testNew(srv.URL, "somekey")
 	_, err := c.BookSearch(context.Background(), "Dark Matter", "Blake Crouch", []int{7020})
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -1112,7 +1112,7 @@ func TestBookSearch_NonHardErrorFallsThrough(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "key")
+	c := testNew(srv.URL, "key")
 	results, err := c.BookSearch(context.Background(), "Dark Matter", "Blake Crouch", []int{7020})
 	if err != nil {
 		t.Fatalf("expected success on tier 3, got err=%v", err)
