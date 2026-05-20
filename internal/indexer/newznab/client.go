@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vavallee/bindery/internal/httpsec"
 	"github.com/vavallee/bindery/internal/useragent"
 )
 
@@ -50,7 +51,37 @@ func New(baseURL, apiKey string) *Client {
 		baseURL:  parsedURL,
 		baseHost: baseHost,
 		apiKey:   resolvedAPIKey,
-		http:     &http.Client{Timeout: 30 * time.Second},
+		http:     newHTTPClient(),
+	}
+}
+
+// SetHTTPClient replaces the client's internal http.Client. Intended for tests
+// that need to reach httptest servers on loopback without triggering the SSRF
+// dialer that newHTTPClient installs by default.
+func (c *Client) SetHTTPClient(h *http.Client) {
+	c.http = h
+}
+
+// newHTTPClient returns an *http.Client whose transport re-validates the
+// resolved IP address on every new TCP connection. This prevents DNS-rebinding
+// attacks: ValidateOutboundURL runs at indexer create/update time, but an
+// attacker who controls the indexer hostname can flip its DNS record to
+// 169.254.169.254 (cloud metadata) or an RFC1918 address after the initial
+// check passes. The custom DialContext re-runs the IP validation per
+// connection, so a post-TTL rebind is caught before the kernel's connect(2)
+// is invoked. PolicyLAN is used because indexers legitimately run on LAN
+// addresses; loopback, link-local, and cloud-metadata remain blocked under
+// all policies.
+func newHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			DialContext:           httpsec.NewDialContext(httpsec.PolicyLAN),
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
 	}
 }
 

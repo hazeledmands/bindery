@@ -186,6 +186,68 @@ func isIPv6ULA(ip net.IP) bool {
 	return ip16[0]&0xfe == 0xfc
 }
 
+// ValidateIP returns an error if ip is forbidden under policy. It applies the
+// same rules as ValidateOutboundURL's per-IP checks (loopback, link-local,
+// cloud-metadata, and RFC1918/ULA depending on policy). Callers that have
+// already resolved a hostname to a net.IP — for example, a custom DialContext
+// that intercepts the resolved address — can use this to enforce the policy at
+// connection time without re-parsing a URL.
+func ValidateIP(ip net.IP, policy Policy) error {
+	return checkIP(ip, policy)
+}
+
+// NewDialContext returns a DialContext function that wraps net.Dialer and
+// re-validates every resolved IP against policy before completing the TCP
+// connection. This prevents DNS-rebinding attacks where a hostname initially
+// resolves to a public IP (passing ValidateOutboundURL at config time) but
+// later flips to a private address after the DNS TTL expires.
+//
+// The returned function preserves the caller's context and is safe for
+// concurrent use. Pass it to http.Transport.DialContext.
+func NewDialContext(policy Policy) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	dialer := &net.Dialer{}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// addr is "host:port" as provided by the HTTP transport.
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("dial: invalid address %q: %w", addr, err)
+		}
+
+		// If host is already an IP literal, validate it directly and dial.
+		if ip := net.ParseIP(host); ip != nil {
+			if err := checkIP(ip, policy); err != nil {
+				return nil, fmt.Errorf("dial %s: %w", addr, err)
+			}
+			return dialer.DialContext(ctx, network, addr)
+		}
+
+		// Resolve the hostname so we can validate each returned IP before
+		// handing control to the kernel's connect(2). This is the per-request
+		// re-validation that defeats DNS rebinding: the OS may have cached an
+		// old (allowed) IP while DNS now points at a private address.
+		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			return nil, fmt.Errorf("dial: dns lookup %q: %w", host, err)
+		}
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("dial: no addresses for %q", host)
+		}
+
+		// Validate every resolved address. Fail-closed: if any IP is forbidden
+		// we refuse the entire dial rather than trying only the allowed ones,
+		// because an attacker might arrange for one A record to be public and
+		// another to be the target address.
+		for _, ia := range ips {
+			if err := checkIP(ia.IP, policy); err != nil {
+				return nil, fmt.Errorf("dial %s: resolved %s: %w", host, ia.IP, err)
+			}
+		}
+
+		// All resolved IPs passed; dial using the first one (standard behaviour).
+		return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+	}
+}
+
 // PolicyFromEnv returns override if the given env variable is set to "1" or
 // "true" (case-insensitive), otherwise returns def. This lets callers flip
 // the strict default to LAN policy for users with on-LAN services.

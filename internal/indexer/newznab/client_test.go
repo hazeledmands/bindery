@@ -9,7 +9,18 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
+
+// testNew creates a newznab Client for use with httptest servers. It replaces
+// the hardened http.Client (whose DialContext blocks loopback) with a plain
+// one so tests can reach 127.0.0.1 without triggering the SSRF policy. Only
+// use this in tests that are not specifically testing the SSRF dialer.
+func testNew(baseURL, apiKey string) *Client {
+	c := New(baseURL, apiKey)
+	c.http = &http.Client{Timeout: 30 * time.Second}
+	return c
+}
 
 const testRSS = `<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/">
@@ -62,7 +73,7 @@ func TestParseSearchResults(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "testkey")
+	c := testNew(srv.URL, "testkey")
 	results, err := c.Search(context.Background(), "dark matter", []int{7000, 7020})
 	if err != nil {
 		t.Fatalf("search: %v", err)
@@ -100,7 +111,7 @@ func TestParseCaps(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "testkey")
+	c := testNew(srv.URL, "testkey")
 	caps, err := c.Caps(context.Background())
 	if err != nil {
 		t.Fatalf("caps: %v", err)
@@ -127,7 +138,7 @@ func TestTest(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "testkey")
+	c := testNew(srv.URL, "testkey")
 	err := c.Test(context.Background())
 	if err != nil {
 		t.Errorf("test should pass: %v", err)
@@ -177,7 +188,7 @@ func TestCapsWithFullTorznabEndpointURL(t *testing.T) {
 	defer srv.Close()
 
 	endpoint := srv.URL + "/1/api?apikey=from-url"
-	c := New(endpoint, "")
+	c := testNew(endpoint, "")
 	if _, err := c.Caps(context.Background()); err != nil {
 		t.Fatalf("caps: %v", err)
 	}
@@ -204,7 +215,7 @@ func TestCapsWithEndpointAndExplicitAPIKeyOverridesURL(t *testing.T) {
 	defer srv.Close()
 
 	endpoint := srv.URL + "/1/api?apikey=from-url"
-	c := New(endpoint, "from-field")
+	c := testNew(endpoint, "from-field")
 	if _, err := c.Caps(context.Background()); err != nil {
 		t.Fatalf("caps: %v", err)
 	}
@@ -287,7 +298,7 @@ func TestBookSearch_Tier1StructuredBook(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "testkey")
+	c := testNew(srv.URL, "testkey")
 	results, err := c.BookSearch(context.Background(), "Dark Matter: A Novel", "Blake Crouch", []int{7020})
 	if err != nil {
 		t.Fatalf("BookSearch: %v", err)
@@ -330,7 +341,7 @@ func TestBookSearch_FallsBackToSurnameTier(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "testkey")
+	c := testNew(srv.URL, "testkey")
 	results, err := c.BookSearch(context.Background(), "Dark Matter", "Blake Crouch", []int{7020})
 	if err != nil {
 		t.Fatalf("BookSearch: %v", err)
@@ -361,7 +372,7 @@ func TestBookSearch_FinalFallbackTitleOnly(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "testkey")
+	c := testNew(srv.URL, "testkey")
 	// No author supplied: tiers 1-3 should be skipped and tier 4 taken.
 	results, err := c.BookSearch(context.Background(), "Dune", "", []int{7020})
 	if err != nil {
@@ -385,7 +396,7 @@ func TestProbe_Success(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "testkey")
+	c := testNew(srv.URL, "testkey")
 	result := c.Probe(context.Background())
 	if result.Error != "" {
 		t.Fatalf("unexpected error: %s", result.Error)
@@ -417,7 +428,7 @@ func TestProbe_HTTPErrorStatus(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "wrong")
+	c := testNew(srv.URL, "wrong")
 	result := c.Probe(context.Background())
 	if result.Status != http.StatusUnauthorized {
 		t.Errorf("expected status 401, got %d", result.Status)
@@ -439,7 +450,7 @@ func TestProbe_InvalidXML(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "testkey")
+	c := testNew(srv.URL, "testkey")
 	result := c.Probe(context.Background())
 	if result.Status != http.StatusOK {
 		t.Errorf("expected status 200 even with bad body, got %d", result.Status)
@@ -456,7 +467,7 @@ func TestProbe_NetworkError(t *testing.T) {
 	// Close immediately so Do() returns a dial error.
 	srv.Close()
 
-	c := New(srv.URL, "testkey")
+	c := testNew(srv.URL, "testkey")
 	result := c.Probe(context.Background())
 	if result.Status != 0 {
 		t.Errorf("expected zero status on dial failure, got %d", result.Status)
@@ -502,7 +513,7 @@ func TestParseResults_UsesLinkWhenEnclosureMissing(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "testkey")
+	c := testNew(srv.URL, "testkey")
 	results, err := c.Search(context.Background(), "q", nil)
 	if err != nil {
 		t.Fatalf("search: %v", err)
@@ -530,7 +541,7 @@ func TestGetXML_SurfacesNon200(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "testkey")
+	c := testNew(srv.URL, "testkey")
 	_, err := c.Search(context.Background(), "anything", nil)
 	if err == nil {
 		t.Fatalf("expected error on 503, got nil")
@@ -586,7 +597,7 @@ func TestSearch_SurfacesNewznabError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "testkey")
+	c := testNew(srv.URL, "testkey")
 	_, err := c.Search(context.Background(), "anything", nil)
 	if err == nil {
 		t.Fatal("expected error on <error> response, got nil")
@@ -718,7 +729,7 @@ func TestParseResults_AppendsApikeyToEnclosure(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL+"/1/api", "the-key")
+	c := testNew(srv.URL+"/1/api", "the-key")
 	results, err := c.Search(context.Background(), "anything", nil)
 	if err != nil {
 		t.Fatalf("search: %v", err)
@@ -904,7 +915,7 @@ func TestBookSearch_Tier1FallsBackOnCannedFeed(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, "testkey")
+	c := testNew(srv.URL, "testkey")
 	results, err := c.BookSearch(context.Background(), "Life Ascending", "Nick Lane", []int{7020})
 	if err != nil {
 		t.Fatalf("BookSearch: %v", err)
@@ -921,5 +932,28 @@ func TestBookSearch_Tier1FallsBackOnCannedFeed(t *testing.T) {
 	}
 	if queries[0].Get("t") != "book" {
 		t.Errorf("expected first request to be t=book, got t=%s", queries[0].Get("t"))
+	}
+}
+
+// TestNew_HardenedDialerBlocksLoopback verifies that the http.Client returned
+// by New() uses the httpsec-hardened DialContext that blocks loopback addresses,
+// preventing DNS-rebinding attacks where a hostname resolves to 127.0.0.1 after
+// the initial ValidateOutboundURL check passes. This is the Finding 1 fix from
+// issue #711: re-validation happens per connection, not only at config time.
+func TestNew_HardenedDialerBlocksLoopback(t *testing.T) {
+	// Start a local server — its address will be on 127.0.0.1 (loopback).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	// Use New() (hardened client), NOT testNew() — the dialer must be active.
+	c := New(srv.URL, "testkey")
+	_, err := c.Caps(context.Background())
+	if err == nil {
+		t.Fatal("expected connection to loopback to be rejected by the SSRF dialer, got nil error")
+	}
+	if !strings.Contains(err.Error(), "loopback") {
+		t.Errorf("expected 'loopback' in SSRF dial error, got: %v", err)
 	}
 }

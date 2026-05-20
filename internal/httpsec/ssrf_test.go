@@ -1,8 +1,12 @@
 package httpsec
 
 import (
+	"context"
 	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -263,5 +267,91 @@ func TestPolicyFromEnv(t *testing.T) {
 	t.Setenv(key, "maybe")
 	if got := PolicyFromEnv(PolicyStrict, key); got != PolicyStrict {
 		t.Errorf("'maybe': want PolicyStrict, got %v", got)
+	}
+}
+
+// TestValidateIP exercises the exported thin wrapper around checkIP.
+func TestValidateIP(t *testing.T) {
+	// Public IP: always allowed.
+	if err := ValidateIP(mustIP("93.184.216.34"), PolicyStrict); err != nil {
+		t.Errorf("public IP blocked unexpectedly: %v", err)
+	}
+	// Loopback: always blocked.
+	if err := ValidateIP(mustIP("127.0.0.1"), PolicyStrict); err == nil {
+		t.Error("expected loopback to be blocked")
+	}
+	if err := ValidateIP(mustIP("127.0.0.1"), PolicyLAN); err == nil {
+		t.Error("expected loopback to be blocked under LAN policy")
+	}
+	// Cloud metadata: always blocked.
+	if err := ValidateIP(mustIP("169.254.169.254"), PolicyLAN); err == nil {
+		t.Error("expected cloud-metadata IP to be blocked under LAN policy")
+	}
+	// RFC1918: blocked under Strict, allowed under LAN.
+	if err := ValidateIP(mustIP("192.168.1.1"), PolicyStrict); err == nil {
+		t.Error("expected RFC1918 to be blocked under Strict")
+	}
+	if err := ValidateIP(mustIP("192.168.1.1"), PolicyLAN); err != nil {
+		t.Errorf("expected RFC1918 to be allowed under LAN, got: %v", err)
+	}
+}
+
+// TestNewDialContext_BlocksLoopback verifies the custom dialer rejects a
+// connection whose target resolves to loopback under all policies.
+func TestNewDialContext_BlocksLoopback(t *testing.T) {
+	// Start a real server on loopback so we have a valid port to dial.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	// Build an http.Client that uses the hardened dialer.
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: NewDialContext(PolicyStrict),
+		},
+	}
+
+	// srv.URL is "http://127.0.0.1:<port>" — loopback, always blocked.
+	_, err := client.Get(srv.URL) //nolint:bodyclose
+	if err == nil {
+		t.Fatal("expected dial to be rejected for loopback address, got nil error")
+	}
+	if !strings.Contains(err.Error(), "loopback") {
+		t.Errorf("expected 'loopback' in error, got: %v", err)
+	}
+}
+
+// TestNewDialContext_AllowsPublicHosts verifies the custom dialer does not
+// inject a policy error for a public IP literal. We use an immediately-expired
+// context so the TCP connect never blocks; the important assertion is that the
+// error is a context error, not a policy rejection.
+func TestNewDialContext_AllowsPublicHosts(t *testing.T) {
+	dialCtx := NewDialContext(PolicyLAN)
+	// Cancel the context immediately so the TCP handshake never blocks, but the
+	// policy check (which runs before the dial) has already completed.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	_, err := dialCtx(ctx, "tcp", "93.184.216.34:80")
+	// A policy rejection would contain "url not allowed"; a context/network
+	// error is acceptable and expected here.
+	if err != nil && strings.Contains(err.Error(), "url not allowed") {
+		t.Errorf("public IP should not be rejected by policy, got: %v", err)
+	}
+}
+
+// TestNewDialContext_BlocksRFC1918UnderStrict verifies a dial to an RFC1918
+// address is blocked by PolicyStrict but would be allowed by PolicyLAN (the
+// block is verified; the allow is not dialed since we have no LAN server).
+func TestNewDialContext_BlocksRFC1918UnderStrict(t *testing.T) {
+	dialCtx := NewDialContext(PolicyStrict)
+	ctx := context.Background()
+	_, err := dialCtx(ctx, "tcp", "192.168.1.1:80")
+	if err == nil {
+		t.Fatal("expected dial to RFC1918 to be rejected under PolicyStrict")
+	}
+	if !strings.Contains(err.Error(), "private network") {
+		t.Errorf("expected 'private network' in error, got: %v", err)
 	}
 }

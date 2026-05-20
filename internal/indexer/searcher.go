@@ -17,7 +17,13 @@ import (
 )
 
 // Searcher coordinates searches across multiple Newznab indexers.
-type Searcher struct{}
+type Searcher struct {
+	// newClient is the factory used to create per-indexer newznab clients.
+	// nil uses newznab.New, which builds a client with the SSRF-hardened
+	// transport. Tests that run against httptest servers can inject a factory
+	// that bypasses the dialer.
+	newClient func(baseURL, apiKey string) *newznab.Client
+}
 
 // NewSearcher creates a new multi-indexer searcher.
 func NewSearcher() *Searcher {
@@ -42,6 +48,15 @@ type MatchCriteria struct {
 	MediaType        string   // models.MediaTypeEbook or models.MediaTypeAudiobook
 	AllowedLanguages []string // from author's MetadataProfile; empty = no filter
 	AuthorAliases    []string // alternate names (e.g. latin-script romanisations for non-latin authors)
+}
+
+// makeClient creates a newznab client using the injected factory, falling
+// back to newznab.New (with its SSRF-hardened transport) when none is set.
+func (s *Searcher) makeClient(baseURL, apiKey string) *newznab.Client {
+	if s.newClient != nil {
+		return s.newClient(baseURL, apiKey)
+	}
+	return newznab.New(baseURL, apiKey)
 }
 
 // filterCategoriesForMedia returns the subset of configured indexer
@@ -103,7 +118,7 @@ func (s *Searcher) SearchBook(ctx context.Context, indexers []models.Indexer, c 
 		go func(idx models.Indexer) {
 			defer wg.Done()
 
-			client := newznab.New(idx.URL, idx.APIKey)
+			client := s.makeClient(idx.URL, idx.APIKey)
 			cats := filterCategoriesForMedia(idx.Categories, c.MediaType)
 			hits, err := client.BookSearch(ctx, c.Title, c.Author, cats)
 			if err != nil {
@@ -152,7 +167,7 @@ func (s *Searcher) SearchQuery(ctx context.Context, indexers []models.Indexer, q
 		go func(idx models.Indexer) {
 			defer wg.Done()
 
-			client := newznab.New(idx.URL, idx.APIKey)
+			client := s.makeClient(idx.URL, idx.APIKey)
 			hits, err := client.Search(ctx, query, idx.Categories)
 			if err != nil {
 				slog.Warn("indexer search failed", "indexer", idx.Name, "error", err)

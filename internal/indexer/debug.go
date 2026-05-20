@@ -114,7 +114,7 @@ func (s *Searcher) SearchBookWithDebug(ctx context.Context, indexers []models.In
 			defer wg.Done()
 			start := time.Now()
 
-			client := newznab.New(idx.URL, idx.APIKey)
+			client := s.makeClient(idx.URL, idx.APIKey)
 			cats := filterCategoriesForMedia(idx.Categories, c.MediaType)
 			entry.Categories = cats
 
