@@ -211,6 +211,28 @@ func (h *OIDCHandler) Callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Enforce the provider's AllowedGroups policy. When AllowedGroups is
+	// configured (non-empty), a login is only admitted if the IdP's `groups`
+	// claim intersects it; an empty AllowedGroups means "allow all" and the
+	// check is a no-op. This is fail-closed by design: if the IdP is not
+	// sending a `groups` claim, or sends a different group name than what is
+	// configured, every login is rejected — the admin must fix the IdP scope
+	// mapping or the configured group name.
+	if cfg, ok := h.mgr.ProviderConfig(providerID); ok && len(cfg.AllowedGroups) > 0 {
+		if !oidc.GroupsAllowed(cfg.AllowedGroups, claims.Groups) {
+			slog.Warn("oidc: login rejected by AllowedGroups policy",
+				"provider", providerID, // #nosec -- providerID validated by oidcProviderIDRe at handler entry
+				"sub", sanitizeLog(claims.Sub),
+				"user_groups", len(claims.Groups),
+				"allowed_groups", strings.Join(cfg.AllowedGroups, ","),
+			)
+			writeErr(w, http.StatusForbidden,
+				"access denied: your account is not a member of an allowed group for this provider "+
+					"(check the provider's allowed_groups setting and that the IdP is sending a 'groups' claim)")
+			return
+		}
+	}
+
 	// 1. Look up by (issuer, sub)
 	user, err := h.users.GetByOIDC(ctx, claims.Issuer, claims.Sub)
 	if err != nil {
@@ -219,8 +241,23 @@ func (h *OIDCHandler) Callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Email-link: try to match an existing user by email
-	if user == nil && h.oidcEmailLink && claims.Email != "" {
+	// 2. Email-link: try to match an existing user by email.
+	//
+	// SECURITY: only ever link by email when the IdP asserts the address is
+	// verified (`email_verified == true`). Linking binds the OIDC
+	// (issuer, sub) pair to an existing Bindery account — potentially an
+	// admin account — so an unverified `email` claim is an account-takeover
+	// vector: an attacker who can set an arbitrary unverified email at a
+	// trusted IdP could otherwise claim a victim's account. If the email is
+	// unverified (or the IdP omits `email_verified`), skip linking and fall
+	// through to normal provisioning-by-subject below.
+	if user == nil && h.oidcEmailLink && claims.Email != "" && !claims.EmailVerified {
+		slog.Warn("oidc: skipping email-link for unverified email claim",
+			"provider", providerID, // #nosec -- providerID validated by oidcProviderIDRe at handler entry
+			"sub", sanitizeLog(claims.Sub),
+			"reason", "IdP did not assert email_verified=true; falling through to subject-based provisioning")
+	}
+	if user == nil && h.oidcEmailLink && claims.Email != "" && claims.EmailVerified {
 		byEmail, err := h.users.GetByEmail(ctx, claims.Email)
 		if err != nil {
 			slog.Error("oidc: email lookup failed", "error", err)

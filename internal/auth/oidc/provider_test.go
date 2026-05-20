@@ -407,3 +407,120 @@ func TestSubCollisionAcrossIssuers(t *testing.T) {
 		t.Fatal("test setup error: issuers should differ")
 	}
 }
+
+// --- AllowedGroups enforcement (issue #709, finding 2) -----------------------
+
+func TestGroupsAllowed(t *testing.T) {
+	tests := []struct {
+		name          string
+		allowedGroups []string
+		userGroups    []string
+		want          bool
+	}{
+		{
+			name:          "empty AllowedGroups allows any login",
+			allowedGroups: nil,
+			userGroups:    []string{"some-random-group"},
+			want:          true,
+		},
+		{
+			name:          "empty AllowedGroups allows a login with no groups",
+			allowedGroups: []string{},
+			userGroups:    nil,
+			want:          true,
+		},
+		{
+			name:          "user in an allowed group is admitted",
+			allowedGroups: []string{"bindery-users", "bindery-admins"},
+			userGroups:    []string{"staff", "bindery-users"},
+			want:          true,
+		},
+		{
+			name:          "user not in any allowed group is rejected",
+			allowedGroups: []string{"bindery-users"},
+			userGroups:    []string{"staff", "everyone"},
+			want:          false,
+		},
+		{
+			name:          "user with no groups is rejected when AllowedGroups is set",
+			allowedGroups: []string{"bindery-users"},
+			userGroups:    nil,
+			want:          false,
+		},
+		{
+			name:          "group matching is case-sensitive",
+			allowedGroups: []string{"Bindery-Users"},
+			userGroups:    []string{"bindery-users"},
+			want:          false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := GroupsAllowed(tt.allowedGroups, tt.userGroups); got != tt.want {
+				t.Errorf("GroupsAllowed(%v, %v) = %v, want %v",
+					tt.allowedGroups, tt.userGroups, got, tt.want)
+			}
+		})
+	}
+}
+
+// --- email_verified parsing (issue #709, finding 1) -------------------------
+
+func TestParseEmailVerified(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string // raw JSON value of the email_verified claim
+		want bool
+	}{
+		{name: "absent claim is not verified", raw: ``, want: false},
+		{name: "boolean true", raw: `true`, want: true},
+		{name: "boolean false", raw: `false`, want: false},
+		{name: "string \"true\" (some IdPs serialise it this way)", raw: `"true"`, want: true},
+		{name: "string \"True\" case-insensitive", raw: `"True"`, want: true},
+		{name: "string \"false\"", raw: `"false"`, want: false},
+		{name: "empty string is not verified", raw: `""`, want: false},
+		{name: "null is not verified", raw: `null`, want: false},
+		{name: "numeric 1 is not verified (not a recognised truthy form)", raw: `1`, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var raw json.RawMessage
+			if tt.raw != "" {
+				raw = json.RawMessage(tt.raw)
+			}
+			if got := parseEmailVerified(raw); got != tt.want {
+				t.Errorf("parseEmailVerified(%q) = %v, want %v", tt.raw, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestProviderConfig_ExposesAllowedGroups verifies the manager surfaces a
+// loaded provider's config (including AllowedGroups) so the callback handler
+// can enforce the group policy after a token exchange.
+func TestProviderConfig_ExposesAllowedGroups(t *testing.T) {
+	m := NewManager()
+	if _, ok := m.ProviderConfig("missing"); ok {
+		t.Fatal("ProviderConfig should report ok=false for an unknown provider")
+	}
+
+	cfg := ProviderConfig{
+		ID:            "corp",
+		Issuer:        "https://idp.example.com",
+		ClientID:      "cid",
+		AllowedGroups: []string{"bindery-users"},
+	}
+	// Inject a loaded entry directly — discovery is exercised elsewhere and
+	// this test only cares about the config accessor.
+	m.mu.Lock()
+	m.providers["corp"] = &entry{cfg: cfg}
+	m.mu.Unlock()
+
+	got, ok := m.ProviderConfig("corp")
+	if !ok {
+		t.Fatal("ProviderConfig should report ok=true for a loaded provider")
+	}
+	if len(got.AllowedGroups) != 1 || got.AllowedGroups[0] != "bindery-users" {
+		t.Fatalf("AllowedGroups = %v, want [bindery-users]", got.AllowedGroups)
+	}
+}
