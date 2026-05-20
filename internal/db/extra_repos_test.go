@@ -666,3 +666,81 @@ func TestIndexerRepo_Update(t *testing.T) {
 		t.Error("expected Enabled=false after update")
 	}
 }
+
+// TestSettingsRepo_SetMany_WritesAllAtomically verifies SetMany persists every
+// key/value pair when the batch succeeds.
+func TestSettingsRepo_SetMany_WritesAllAtomically(t *testing.T) {
+	database, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ctx := context.Background()
+	repo := NewSettingsRepo(database)
+
+	kvs := []SettingKV{
+		{Key: "a", Value: "1"},
+		{Key: "b", Value: "2"},
+		{Key: "c", Value: "3"},
+	}
+	if err := repo.SetMany(ctx, kvs); err != nil {
+		t.Fatalf("SetMany: %v", err)
+	}
+	for _, kv := range kvs {
+		got, err := repo.Get(ctx, kv.Key)
+		if err != nil || got == nil {
+			t.Fatalf("Get(%s): %v / %v", kv.Key, got, err)
+		}
+		if got.Value != kv.Value {
+			t.Errorf("Get(%s) = %q, want %q", kv.Key, got.Value, kv.Value)
+		}
+	}
+}
+
+// TestSettingsRepo_SetMany_RollsBackOnFailure proves the batch is atomic: a
+// failure partway through leaves none of the rows written. The failure is
+// forced by cancelling the context after a successful baseline write, so the
+// next Exec inside the transaction fails and the whole batch rolls back.
+func TestSettingsRepo_SetMany_RollsBackOnFailure(t *testing.T) {
+	database, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ctx := context.Background()
+	repo := NewSettingsRepo(database)
+
+	// Seed a baseline value so we can prove the rollback also leaves a
+	// pre-existing row untouched.
+	if err := repo.Set(ctx, "abs.enabled", "false"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancel() // cancelled before SetMany runs: every Exec/Commit must fail.
+
+	err = repo.SetMany(cancelCtx, []SettingKV{
+		{Key: "abs.enabled", Value: "true"},
+		{Key: "abs.library_id", Value: "lib_new"},
+	})
+	if err == nil {
+		t.Fatal("expected SetMany to fail on cancelled context")
+	}
+
+	// The pre-existing row must be unchanged ...
+	got, err := repo.Get(ctx, "abs.enabled")
+	if err != nil || got == nil {
+		t.Fatalf("get abs.enabled: %v / %v", got, err)
+	}
+	if got.Value != "false" {
+		t.Errorf("abs.enabled = %q, want %q (rollback failed)", got.Value, "false")
+	}
+	// ... and the new row must not have been created.
+	got, err = repo.Get(ctx, "abs.library_id")
+	if err != nil {
+		t.Fatalf("get abs.library_id: %v", err)
+	}
+	if got != nil {
+		t.Errorf("abs.library_id = %+v, want nil (rollback failed)", got)
+	}
+}

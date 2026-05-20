@@ -387,6 +387,77 @@ func TestQueueDelete_FlipsBookToWanted(t *testing.T) {
 	}
 }
 
+// queueDeleteFilesProbe spins up a qBittorrent stub and runs Queue.Delete for
+// a torrent download, returning the deleteFiles form value the client sent.
+func queueDeleteFilesProbe(t *testing.T, urlSuffix string) string {
+	t.Helper()
+	var gotDeleteFiles string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/auth/login":
+			_, _ = w.Write([]byte("Ok."))
+		case "/api/v2/torrents/delete":
+			_ = r.ParseForm()
+			gotDeleteFiles = r.FormValue("deleteFiles")
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected qBittorrent path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	h, _, downloads, clients, _, ctx := queueFixture(t)
+	host, port := testServerHostPort(t, srv.URL)
+	client := &models.DownloadClient{
+		Name: "qb", Type: "qbittorrent", Host: host, Port: port,
+		Username: "user", Password: "pass", Enabled: true,
+	}
+	if err := clients.Create(ctx, client); err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	dl := &models.Download{
+		GUID: "del-guid", DownloadClientID: &client.ID, Title: "Seeding Book",
+		NZBURL: "magnet:?xt=urn:btih:abcdef", Status: models.StateCompleted,
+		Protocol: "torrent", TorrentID: strPtr("abcdef"),
+	}
+	if err := downloads.Create(ctx, dl); err != nil {
+		t.Fatalf("create download: %v", err)
+	}
+
+	path := "/api/v1/queue/" + strconv.FormatInt(dl.ID, 10) + urlSuffix
+	req := withURLParam(httptest.NewRequest(http.MethodDelete, path, nil), "id", strconv.FormatInt(dl.ID, 10))
+	rec := httptest.NewRecorder()
+	h.Delete(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	got, err := downloads.GetByGUID(ctx, "del-guid")
+	if err != nil {
+		t.Fatalf("reload download: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("download row should be deleted, got %+v", got)
+	}
+	return gotDeleteFiles
+}
+
+// TestQueueDelete_DefaultsToKeepingFiles is the data-loss guard (#715 finding 1):
+// removing an item from the queue must NOT delete downloaded data by default.
+func TestQueueDelete_DefaultsToKeepingFiles(t *testing.T) {
+	if got := queueDeleteFilesProbe(t, ""); got != "false" {
+		t.Fatalf("deleteFiles should default to false, got %q", got)
+	}
+}
+
+// TestQueueDelete_OptInDeletesFiles verifies the explicit ?deleteFiles=true
+// opt-in destroys the downloaded data.
+func TestQueueDelete_OptInDeletesFiles(t *testing.T) {
+	if got := queueDeleteFilesProbe(t, "?deleteFiles=true"); got != "true" {
+		t.Fatalf("deleteFiles should be true with opt-in, got %q", got)
+	}
+}
+
 func TestQueueListLiveOverlaySABnzbd(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api" {

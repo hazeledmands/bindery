@@ -10,6 +10,9 @@ export default function QueuePage() {
   const [grabbingPending, setGrabbingPending] = useState<number | null>(null)
   const [retryingImportIds, setRetryingImportIds] = useState<Set<number>>(() => new Set())
   const [retryImportErrors, setRetryImportErrors] = useState<Record<number, string>>({})
+  const [deleteTarget, setDeleteTarget] = useState<QueueItem | null>(null)
+  const [deleteFiles, setDeleteFiles] = useState(false)
+  const [deleting, setDeleting] = useState(false)
 
   const load = () => {
     Promise.all([
@@ -32,9 +35,32 @@ export default function QueuePage() {
     return () => { document.title = 'Bindery' }
   }, [])
 
-  const handleDelete = async (id: number) => {
-    await api.deleteFromQueue(id)
-    load()
+  // Open the remove dialog. The file-deletion choice always starts unchecked
+  // so the default action keeps downloaded data (and torrent seeds) on disk.
+  const openDeleteDialog = (item: QueueItem) => {
+    setDeleteTarget(item)
+    setDeleteFiles(false)
+  }
+
+  const closeDeleteDialog = () => {
+    if (deleting) return
+    setDeleteTarget(null)
+    setDeleteFiles(false)
+  }
+
+  const confirmDelete = async () => {
+    if (!deleteTarget) return
+    setDeleting(true)
+    try {
+      await api.deleteFromQueue(deleteTarget.id, deleteFiles)
+      setDeleteTarget(null)
+      setDeleteFiles(false)
+      load()
+    } catch (e) {
+      console.error(e)
+    } finally {
+      setDeleting(false)
+    }
   }
 
   const handleDismissPending = async (id: number) => {
@@ -232,7 +258,7 @@ export default function QueuePage() {
                       </button>
                     )}
                     <button
-                      onClick={() => handleDelete(item.id)}
+                      onClick={() => openDeleteDialog(item)}
                       className="px-3 py-2 text-xs text-red-400 hover:text-red-300 touch-manipulation"
                     >
                       {t('queue.remove')}
@@ -285,6 +311,53 @@ export default function QueuePage() {
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {deleteTarget && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          onClick={closeDeleteDialog}
+        >
+          <div
+            className="w-full max-w-md rounded-lg border border-slate-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 shadow-xl"
+            onClick={e => e.stopPropagation()}
+          >
+            <h3 className="text-lg font-semibold mb-2">{t('queue.removeTitle')}</h3>
+            <p className="text-sm text-slate-600 dark:text-zinc-400 break-words">
+              {t('queue.removeBody', { title: deleteTarget.title })}
+            </p>
+            <label className="mt-4 flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={deleteFiles}
+                onChange={e => setDeleteFiles(e.target.checked)}
+                className="mt-0.5"
+              />
+              <span className="text-sm">
+                <span className="font-medium">{t('queue.removeDeleteFiles')}</span>
+                <span className="block text-xs text-slate-500 dark:text-zinc-500">
+                  {t('queue.removeDeleteFilesHint')}
+                </span>
+              </span>
+            </label>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                onClick={closeDeleteDialog}
+                disabled={deleting}
+                className="px-3 py-2 text-xs rounded font-medium bg-slate-200 dark:bg-zinc-800 hover:bg-slate-300 dark:hover:bg-zinc-700 disabled:opacity-50"
+              >
+                {t('queue.removeCancel')}
+              </button>
+              <button
+                onClick={confirmDelete}
+                disabled={deleting}
+                className="px-3 py-2 text-xs rounded font-medium bg-red-600 hover:bg-red-500 text-white disabled:opacity-50"
+              >
+                {t('queue.removeConfirm')}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

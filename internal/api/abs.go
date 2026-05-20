@@ -163,31 +163,21 @@ func (h *ABSHandler) SetConfig(w http.ResponseWriter, r *http.Request) {
 		enabled = *req.Enabled
 	}
 
-	if err := h.settings.Set(r.Context(), SettingABSBaseURL, baseURL); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	if err := h.settings.Set(r.Context(), SettingABSLabel, label); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	if err := h.settings.Set(r.Context(), SettingABSEnabled, boolString(enabled)); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	if err := h.settings.Set(r.Context(), SettingABSLibraryID, libraryID); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	if err := h.settings.Set(r.Context(), SettingABSPathRemap, pathRemap); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
+	// Persist every settings row atomically. A mid-write failure must not
+	// leave a half-applied config (e.g. enabled=true with a stale library ID).
+	kvs := []db.SettingKV{
+		{Key: SettingABSBaseURL, Value: baseURL},
+		{Key: SettingABSLabel, Value: label},
+		{Key: SettingABSEnabled, Value: boolString(enabled)},
+		{Key: SettingABSLibraryID, Value: libraryID},
+		{Key: SettingABSPathRemap, Value: pathRemap},
 	}
 	if req.APIKey != nil && strings.TrimSpace(*req.APIKey) != "" {
-		if err := h.settings.Set(r.Context(), SettingABSAPIKey, apiKey); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-			return
-		}
+		kvs = append(kvs, db.SettingKV{Key: SettingABSAPIKey, Value: apiKey})
+	}
+	if err := h.settings.SetMany(r.Context(), kvs); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
 	}
 
 	writeJSON(w, http.StatusOK, ABSConfigResponse{
