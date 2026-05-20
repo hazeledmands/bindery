@@ -41,7 +41,7 @@ const (
 	// The CSRF and X-Requested-With guards consult this flag to decide whether
 	// to exempt the request — never the mere presence of an apikey parameter,
 	// which an attacker can forge to switch the CSRF layer off (#708).
-	viaAPIKeyCtxKey ctxKey = "auth.via_api_key"
+	viaAPIKeyCtxKey ctxKey = "auth.via_api_key" //nolint:gosec // context key name, not a credential
 )
 
 // AuthedViaAPIKey reports whether the request was authenticated by a verified
