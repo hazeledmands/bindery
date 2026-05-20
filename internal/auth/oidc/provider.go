@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -74,10 +75,18 @@ func ParseProviders(raw string) ([]ProviderConfig, error) {
 }
 
 // Claims extracted from a validated ID token.
+//
+// EmailVerified reflects the IdP's `email_verified` claim. It is only
+// meaningful when Email is non-empty; an IdP that omits the claim entirely
+// leaves it false. Callers MUST NOT treat Email as a trusted identifier for
+// account linking unless EmailVerified is true — an attacker who can set an
+// arbitrary unverified `email` at a trusted IdP could otherwise take over an
+// existing Bindery account.
 type Claims struct {
 	Sub               string
 	Issuer            string
 	Email             string
+	EmailVerified     bool
 	PreferredUsername string
 	Name              string
 	Groups            []string
@@ -253,6 +262,19 @@ func (m *Manager) Get(id string) *entry {
 	return m.providers[id]
 }
 
+// ProviderConfig returns the loaded config for a provider ID, or false if the
+// provider is not currently loaded. Used by the callback handler to read
+// policy fields (e.g. AllowedGroups) after a successful token exchange.
+func (m *Manager) ProviderConfig(id string) (ProviderConfig, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	e, ok := m.providers[id]
+	if !ok {
+		return ProviderConfig{}, false
+	}
+	return e.cfg, true
+}
+
 // List returns all configured provider configs (for the login page). Includes
 // only providers that successfully loaded — failed providers are intentionally
 // hidden from the login page since clicking their button would error out.
@@ -317,11 +339,12 @@ func (m *Manager) Exchange(ctx context.Context, redirectBase, id, code, nonce, c
 		return nil, fmt.Errorf("oidc: nonce mismatch")
 	}
 	var claims struct {
-		Sub               string   `json:"sub"`
-		Email             string   `json:"email"`
-		PreferredUsername string   `json:"preferred_username"`
-		Name              string   `json:"name"`
-		Groups            []string `json:"groups"`
+		Sub               string          `json:"sub"`
+		Email             string          `json:"email"`
+		EmailVerified     json.RawMessage `json:"email_verified"`
+		PreferredUsername string          `json:"preferred_username"`
+		Name              string          `json:"name"`
+		Groups            []string        `json:"groups"`
 	}
 	if err := idToken.Claims(&claims); err != nil {
 		return nil, fmt.Errorf("oidc: parse claims: %w", err)
@@ -330,10 +353,51 @@ func (m *Manager) Exchange(ctx context.Context, redirectBase, id, code, nonce, c
 		Sub:               claims.Sub,
 		Issuer:            idToken.Issuer,
 		Email:             claims.Email,
+		EmailVerified:     parseEmailVerified(claims.EmailVerified),
 		PreferredUsername: claims.PreferredUsername,
 		Name:              claims.Name,
 		Groups:            claims.Groups,
 	}, nil
+}
+
+// parseEmailVerified interprets the `email_verified` claim. The OIDC spec
+// defines it as a boolean, but some IdPs (and JWT libraries) serialise it as
+// the string "true"/"false". Anything that is not an explicit truthy value —
+// including an absent claim — is treated as not verified (fail-closed).
+func parseEmailVerified(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var b bool
+	if err := json.Unmarshal(raw, &b); err == nil {
+		return b
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return strings.EqualFold(strings.TrimSpace(s), "true")
+	}
+	return false
+}
+
+// GroupsAllowed reports whether a login carrying the given group claims is
+// permitted by the provider's AllowedGroups policy. When AllowedGroups is
+// empty the policy is "allow all" and this always returns true. Otherwise the
+// login is permitted only if userGroups intersects AllowedGroups. Matching is
+// exact and case-sensitive — group names from an IdP are opaque identifiers.
+func GroupsAllowed(allowedGroups, userGroups []string) bool {
+	if len(allowedGroups) == 0 {
+		return true
+	}
+	allowed := make(map[string]struct{}, len(allowedGroups))
+	for _, g := range allowedGroups {
+		allowed[g] = struct{}{}
+	}
+	for _, g := range userGroups {
+		if _, ok := allowed[g]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // --- PKCE helpers ------------------------------------------------------------
