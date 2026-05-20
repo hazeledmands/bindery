@@ -414,6 +414,151 @@ func TestBookDeleteFile_NoFilePath(t *testing.T) {
 	}
 }
 
+// TestBookUpdate_RejectsInvalidStatus is the #715 finding 3 guard: an unknown
+// status value must be rejected with 400 rather than written verbatim.
+func TestBookUpdate_RejectsInvalidStatus(t *testing.T) {
+	h, books, _, author, ctx := bookFixture(t)
+	book := &models.Book{
+		ForeignID: "B-BADSTATUS", AuthorID: author.ID, Title: "T", SortTitle: "t",
+		Status: models.BookStatusWanted, Genres: []string{},
+		MetadataProvider: "openlibrary", Monitored: true,
+	}
+	if err := books.Create(ctx, book); err != nil {
+		t.Fatal(err)
+	}
+
+	body := bytes.NewBufferString(`{"status":"bananas"}`)
+	req := withURLParam(httptest.NewRequest(http.MethodPut, "/api/v1/book/"+strconv.FormatInt(book.ID, 10), body), "id", strconv.FormatInt(book.ID, 10))
+	rec := httptest.NewRecorder()
+	h.Update(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid status, got %d: %s", rec.Code, rec.Body.String())
+	}
+	// The persisted status must be untouched.
+	got, _ := books.GetByID(ctx, book.ID)
+	if got.Status != models.BookStatusWanted {
+		t.Errorf("status should be unchanged after rejected update, got %q", got.Status)
+	}
+}
+
+// TestBookUpdate_AcceptsValidStatus confirms a known status constant still
+// passes the new validation.
+func TestBookUpdate_AcceptsValidStatus(t *testing.T) {
+	h, books, _, author, ctx := bookFixture(t)
+	book := &models.Book{
+		ForeignID: "B-OKSTATUS", AuthorID: author.ID, Title: "T", SortTitle: "t",
+		Status: models.BookStatusImported, Genres: []string{},
+		MetadataProvider: "openlibrary", Monitored: true,
+	}
+	if err := books.Create(ctx, book); err != nil {
+		t.Fatal(err)
+	}
+
+	body := bytes.NewBufferString(`{"status":"downloaded"}`)
+	req := withURLParam(httptest.NewRequest(http.MethodPut, "/api/v1/book/"+strconv.FormatInt(book.ID, 10), body), "id", strconv.FormatInt(book.ID, 10))
+	rec := httptest.NewRecorder()
+	h.Update(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for valid status, got %d: %s", rec.Code, rec.Body.String())
+	}
+	got, _ := books.GetByID(ctx, book.ID)
+	if got.Status != models.BookStatusDownloaded {
+		t.Errorf("status should be 'downloaded', got %q", got.Status)
+	}
+}
+
+// TestBookDeleteFile_FormatScopedKeepsSibling is the #715 finding 2 data-loss
+// guard: deleting ?format=ebook must leave the same-stem audiobook on disk.
+func TestBookDeleteFile_FormatScopedKeepsSibling(t *testing.T) {
+	h, books, _, author, ctx := bookFixture(t)
+	tmp := t.TempDir()
+
+	epub := filepath.Join(tmp, "Book.epub")
+	m4b := filepath.Join(tmp, "Book.m4b")
+	for _, p := range []string{epub, m4b} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	book := &models.Book{
+		ForeignID: "B-DUALFMT", AuthorID: author.ID, Title: "Dual Format", SortTitle: "df",
+		Status: models.BookStatusImported, Genres: []string{}, MediaType: models.MediaTypeBoth,
+		MetadataProvider: "openlibrary", Monitored: true,
+	}
+	if err := books.Create(ctx, book); err != nil {
+		t.Fatal(err)
+	}
+	if err := books.AddBookFile(ctx, book.ID, models.MediaTypeEbook, epub); err != nil {
+		t.Fatalf("AddBookFile(epub): %v", err)
+	}
+	if err := books.AddBookFile(ctx, book.ID, models.MediaTypeAudiobook, m4b); err != nil {
+		t.Fatalf("AddBookFile(m4b): %v", err)
+	}
+
+	req := withURLParam(
+		httptest.NewRequest(http.MethodDelete, "/api/v1/book/"+strconv.FormatInt(book.ID, 10)+"/file?format=ebook", nil),
+		"id", strconv.FormatInt(book.ID, 10))
+	rec := httptest.NewRecorder()
+	h.DeleteFile(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	if _, err := os.Stat(epub); !os.IsNotExist(err) {
+		t.Errorf("ebook should be deleted, stat err=%v", err)
+	}
+	if _, err := os.Stat(m4b); err != nil {
+		t.Errorf("audiobook sibling must survive a format-scoped ebook delete, stat err=%v", err)
+	}
+}
+
+// TestBookDeleteFile_FormatScopedAudiobookKeepsEbook is the mirror case:
+// ?format=audiobook must not destroy the same-stem ebook.
+func TestBookDeleteFile_FormatScopedAudiobookKeepsEbook(t *testing.T) {
+	h, books, _, author, ctx := bookFixture(t)
+	tmp := t.TempDir()
+
+	epub := filepath.Join(tmp, "Book.epub")
+	m4b := filepath.Join(tmp, "Book.m4b")
+	for _, p := range []string{epub, m4b} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	book := &models.Book{
+		ForeignID: "B-DUALFMT2", AuthorID: author.ID, Title: "Dual Format 2", SortTitle: "df2",
+		Status: models.BookStatusImported, Genres: []string{}, MediaType: models.MediaTypeBoth,
+		MetadataProvider: "openlibrary", Monitored: true,
+	}
+	if err := books.Create(ctx, book); err != nil {
+		t.Fatal(err)
+	}
+	if err := books.AddBookFile(ctx, book.ID, models.MediaTypeEbook, epub); err != nil {
+		t.Fatalf("AddBookFile(epub): %v", err)
+	}
+	if err := books.AddBookFile(ctx, book.ID, models.MediaTypeAudiobook, m4b); err != nil {
+		t.Fatalf("AddBookFile(m4b): %v", err)
+	}
+
+	req := withURLParam(
+		httptest.NewRequest(http.MethodDelete, "/api/v1/book/"+strconv.FormatInt(book.ID, 10)+"/file?format=audiobook", nil),
+		"id", strconv.FormatInt(book.ID, 10))
+	rec := httptest.NewRecorder()
+	h.DeleteFile(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	if _, err := os.Stat(m4b); !os.IsNotExist(err) {
+		t.Errorf("audiobook should be deleted, stat err=%v", err)
+	}
+	if _, err := os.Stat(epub); err != nil {
+		t.Errorf("ebook sibling must survive a format-scoped audiobook delete, stat err=%v", err)
+	}
+}
+
 // TestListWanted returns only wanted-status books — the Wanted page query.
 func TestListWanted(t *testing.T) {
 	h, books, _, author, ctx := bookFixture(t)

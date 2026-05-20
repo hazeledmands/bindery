@@ -264,7 +264,15 @@ func (h *BookHandler) Update(w http.ResponseWriter, r *http.Request) {
 		book.Monitored = *req.Monitored
 	}
 	if req.Status != nil {
-		book.Status = *req.Status
+		switch *req.Status {
+		case models.BookStatusWanted, models.BookStatusDownloading,
+			models.BookStatusDownloaded, models.BookStatusImported,
+			models.BookStatusSkipped:
+			book.Status = *req.Status
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "status must be one of 'wanted', 'downloading', 'downloaded', 'imported', 'skipped'"})
+			return
+		}
 	}
 	if req.MediaType != nil {
 		switch *req.MediaType {
@@ -412,10 +420,12 @@ func (h *BookHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Remove files from disk and from book_files.
+	// Remove files from disk and from book_files. When a format filter is
+	// supplied, the stem-sibling sweep is scoped to that format so deleting
+	// the ebook does not also destroy the audiobook sibling (and vice versa).
 	var deletedPaths []string
 	for _, p := range toDelete {
-		if err := removeBookPath(p); err != nil {
+		if err := removeBookPathScoped(p, format); err != nil {
 			slog.Error("failed to remove book file", "id", id, "path", p, "error", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
@@ -452,13 +462,31 @@ func (h *BookHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, book)
 }
 
-// removeBookPath deletes a file or directory at p. Audiobooks are stored as
-// folders (multi-part mp3/m4b + cover + cue); ebooks are single files.
-// For single files it also sweeps any sibling files in the same directory
-// that share the same basename (stem) and have a recognised book extension —
-// this handles dual-format downloads where epub + mobi land in one folder.
-// Returns nil if the path no longer exists — the net state is the same.
+// removeBookPath deletes a file or directory at p with an unscoped stem
+// sweep — see removeBookPathScoped. Used when no format filter is supplied.
 func removeBookPath(p string) error {
+	return removeBookPathScoped(p, "")
+}
+
+// removeBookPathScoped deletes a file or directory at p. Audiobooks are stored
+// as folders (multi-part mp3/m4b + cover + cue); ebooks are single files.
+//
+// For single files it also sweeps sibling files in the same directory that
+// share the same basename (stem) — this handles dual-format downloads where
+// epub + mobi land in one folder. The sweep is scoped by `format`:
+//
+//   - format == ""         — sweep every same-stem recognised book file
+//     (used for full-book deletes where every format goes anyway).
+//   - format == "ebook"    — sweep only same-stem *ebook* siblings; the
+//     audiobook sibling (.m4b/.mp3/...) is left intact.
+//   - format == "audiobook"— sweep only same-stem *audiobook* siblings; the
+//     ebook sibling is left intact.
+//
+// This prevents a `?format=ebook` delete from also destroying the audiobook
+// that happens to share a stem in the same folder.
+//
+// Returns nil if the path no longer exists — the net state is the same.
+func removeBookPathScoped(p, format string) error {
 	info, err := os.Stat(p)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -483,6 +511,12 @@ func removeBookPath(p string) error {
 			if !importer.IsBookFile(n) {
 				continue
 			}
+			// When a format filter is supplied, only sweep siblings whose
+			// extension belongs to that format. The explicitly targeted file
+			// p itself always matches its own format, so it is still removed.
+			if !sweepMatchesFormat(n, format) {
+				continue
+			}
 			s := strings.TrimSuffix(n, filepath.Ext(n))
 			if !strings.EqualFold(s, stem) {
 				continue
@@ -504,6 +538,24 @@ func removeBookPath(p string) error {
 		_ = os.Remove(parent) //nosec G304 -- derived from DB-stored path, not user input
 	}
 	return nil
+}
+
+// sweepMatchesFormat reports whether the sibling file `name` belongs to the
+// requested format and is therefore eligible for the stem sweep. An empty
+// format means no scoping — every recognised book file matches.
+func sweepMatchesFormat(name, format string) bool {
+	switch format {
+	case "":
+		return true
+	case models.MediaTypeAudiobook:
+		return importer.IsAudioTagFile(name)
+	case models.MediaTypeEbook:
+		return !importer.IsAudioTagFile(name)
+	default:
+		// Unknown format filter: do not sweep siblings — only the explicitly
+		// enumerated paths get removed by the caller.
+		return false
+	}
 }
 
 func (h *BookHandler) ListWanted(w http.ResponseWriter, r *http.Request) {

@@ -215,6 +215,30 @@ func TestABSSetConfig_PersistsPathRemap(t *testing.T) {
 	}
 }
 
+// TestABSSetConfig_PersistsAllRowsAtomically verifies a successful SetConfig
+// writes every settings row via the atomic SetMany batch. A partial write
+// would leave a half-applied config (issue #715 finding 6).
+func TestABSSetConfig_PersistsAllRowsAtomically(t *testing.T) {
+	client := &stubABSClient{
+		libraryResp: &abs.Library{ID: "lib_books", Name: "Books", MediaType: "book"},
+	}
+	h, repo, ctx := absFixture(t, client)
+
+	body := bytes.NewBufferString(`{"baseUrl":"https://abs.example.com/","apiKey":"secret","libraryId":"lib_books","enabled":true,"label":"Shelf","pathRemap":"/abs:/books"}`)
+	rec := httptest.NewRecorder()
+	h.SetConfig(rec, httptest.NewRequest(http.MethodPut, "/api/v1/abs/config", body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	assertSettingValue(t, repo, ctx, SettingABSBaseURL, "https://abs.example.com")
+	assertSettingValue(t, repo, ctx, SettingABSLabel, "Shelf")
+	assertSettingValue(t, repo, ctx, SettingABSEnabled, "true")
+	assertSettingValue(t, repo, ctx, SettingABSLibraryID, "lib_books")
+	assertSettingValue(t, repo, ctx, SettingABSPathRemap, "/abs:/books")
+	assertSettingValue(t, repo, ctx, SettingABSAPIKey, "secret")
+}
+
 func TestABSTestMapsUnauthorizedTo502(t *testing.T) {
 	client := &stubABSClient{
 		authorizeErr: &abs.APIError{StatusCode: http.StatusUnauthorized, Message: "bad key"},

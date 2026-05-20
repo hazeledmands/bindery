@@ -653,10 +653,15 @@ func (h *QueueHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Removing an item from the queue keeps the downloaded data on disk by
+	// default: for torrent clients this also preserves the seed. Destroying
+	// the files is opt-in via `?deleteFiles=true`, mirroring book Delete.
+	deleteFiles := r.URL.Query().Get("deleteFiles") == "true"
+
 	if target.DownloadClientID != nil {
 		client, err := h.clients.GetByID(r.Context(), *target.DownloadClientID)
 		if err == nil && client != nil {
-			if err := downloader.RemoveDownload(r.Context(), client, target, true); err != nil {
+			if err := downloader.RemoveDownload(r.Context(), client, target, deleteFiles); err != nil {
 				slog.Warn("failed to remove download from client", "download_id", target.ID, "client_id", client.ID, "error", err)
 			}
 		} else if err != nil {

@@ -40,6 +40,42 @@ func (r *SettingsRepo) Set(ctx context.Context, key, value string) error {
 	return err
 }
 
+// SettingKV is a single key/value pair for SetMany.
+type SettingKV struct {
+	Key   string
+	Value string
+}
+
+// SetMany writes several settings rows atomically inside a single transaction.
+// Either every key is persisted or, on any error, none of them are: the
+// transaction is rolled back so callers never observe a half-applied config.
+func (r *SettingsRepo) SetMany(ctx context.Context, kvs []SettingKV) error {
+	if len(kvs) == 0 {
+		return nil
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	now := time.Now().UTC()
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, kv := range kvs {
+		if _, err := stmt.ExecContext(ctx, kv.Key, kv.Value, now); err != nil {
+			return fmt.Errorf("set setting %s: %w", kv.Key, err)
+		}
+	}
+	return tx.Commit()
+}
+
 func (r *SettingsRepo) List(ctx context.Context) ([]models.Setting, error) {
 	rows, err := r.db.QueryContext(ctx, "SELECT key, value, updated_at FROM settings ORDER BY key")
 	if err != nil {

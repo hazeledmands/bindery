@@ -195,7 +195,13 @@
     "retryingImport": "Retrying…",
     "retryImportHint": "After fixing the path remap or moving the completed files in the download client, retry import to reuse the existing download.",
     "retryImportError": "Retry failed: {{error}}",
-    "remove": "Remove"
+    "remove": "Remove",
+    "removeTitle": "Remove from queue",
+    "removeBody": "Remove \"{{title}}\" from the queue?",
+    "removeDeleteFiles": "Also delete downloaded files from disk",
+    "removeDeleteFilesHint": "Deletes the data in the download client. For torrents this also stops seeding. Leave unchecked to keep the files.",
+    "removeConfirm": "Remove",
+    "removeCancel": "Cancel"
   },
   "blocklist": {
     "title": "Blocklist",
