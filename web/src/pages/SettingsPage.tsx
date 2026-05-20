@@ -2747,6 +2747,10 @@ function GeneralTab() {
         </div>
       </section>
 
+      {/* Security — visible to all authenticated users for their own password
+          change; admin-only sub-controls are gated inside the component. */}
+      <SecuritySection />
+
       {isAdmin && (<>
       {/* Naming */}
       <section>
@@ -3135,9 +3139,6 @@ function GeneralTab() {
           </div>
         </div>
       </section>
-
-      {/* Security */}
-      <SecuritySection />
 
       {/* OIDC providers */}
       <AuthSettings />
@@ -4603,7 +4604,7 @@ function AddNotificationForm({ onClose, onAdded }: { onClose: () => void; onAdde
 }
 
 function SecuritySection() {
-  const { status, refresh } = useAuth()
+  const { status, refresh, isAdmin } = useAuth()
   const [cfg, setCfg] = useState<AuthConfig | null>(null)
   const [showKey, setShowKey] = useState(false)
   const [regenerating, setRegenerating] = useState(false)
@@ -4658,6 +4659,7 @@ function SecuritySection() {
     <section>
       <h3 className="text-base font-semibold mb-3 text-slate-800 dark:text-zinc-200">Security</h3>
       <div className="p-4 border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900 space-y-5">
+        {isAdmin && (<>
         <div>
           <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">Authentication Mode</label>
           <p className="text-xs text-slate-600 dark:text-zinc-500 mb-2">
@@ -4696,8 +4698,10 @@ function SecuritySection() {
           </div>
         </div>
 
+        </>)}
+
         {status?.authenticated && (
-          <div className="border-t border-slate-200 dark:border-zinc-800 pt-4">
+          <div className={isAdmin ? 'border-t border-slate-200 dark:border-zinc-800 pt-4' : ''}>
             <ChangePasswordForm username={cfg.username} />
           </div>
         )}
