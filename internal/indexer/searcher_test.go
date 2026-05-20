@@ -6,10 +6,23 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/vavallee/bindery/internal/indexer/newznab"
 	"github.com/vavallee/bindery/internal/models"
 )
+
+// newTestSearcher returns a Searcher whose client factory bypasses the
+// SSRF-hardened DialContext so tests can target httptest servers on loopback.
+func newTestSearcher() *Searcher {
+	return &Searcher{
+		newClient: func(baseURL, apiKey string) *newznab.Client {
+			c := newznab.New(baseURL, apiKey)
+			c.SetHTTPClient(&http.Client{Timeout: 30 * time.Second})
+			return c
+		},
+	}
+}
 
 func resultTitles(rs []newznab.SearchResult) []string {
 	out := make([]string, len(rs))
@@ -996,7 +1009,7 @@ func TestSearchBookWithDebug_PerResultLogging(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(orig) })
 
 	idxs := []models.Indexer{{ID: 1, Name: "test", URL: srv.URL, Enabled: true, Categories: []int{7020}}}
-	results, dbg := NewSearcher().SearchBookWithDebug(context.Background(), idxs, MatchCriteria{
+	results, dbg := newTestSearcher().SearchBookWithDebug(context.Background(), idxs, MatchCriteria{
 		Title:  "Life Ascending",
 		Author: "Nick Lane",
 	})
