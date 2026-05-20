@@ -23,11 +23,11 @@ import (
 	"github.com/vavallee/bindery/internal/db"
 )
 
-// fakeIdP is a minimal OIDC identity provider for tests: it serves a discovery
+// fakeIDP is a minimal OIDC identity provider for tests: it serves a discovery
 // document, a JWKS, and a token endpoint that returns an RS256-signed ID token
 // whose claims the test controls. It lets the OIDC callback path be exercised
 // end to end without a real IdP.
-type fakeIdP struct {
+type fakeIDP struct {
 	server *httptest.Server
 	key    *rsa.PrivateKey
 	kid    string
@@ -35,13 +35,13 @@ type fakeIdP struct {
 	claims map[string]any
 }
 
-func newFakeIdP(t *testing.T) *fakeIdP {
+func newFakeIDP(t *testing.T) *fakeIDP {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatalf("generate RSA key: %v", err)
 	}
-	idp := &fakeIdP{key: key, kid: "test-key-1"}
+	idp := &fakeIDP{key: key, kid: "test-key-1"}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
@@ -79,7 +79,7 @@ func newFakeIdP(t *testing.T) *fakeIdP {
 func b64u(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
 
 // jwk renders the public key in JWK form for the JWKS endpoint.
-func (f *fakeIdP) jwk() map[string]any {
+func (f *fakeIDP) jwk() map[string]any {
 	pub := f.key.PublicKey
 	return map[string]any{
 		"kty": "RSA",
@@ -94,7 +94,7 @@ func (f *fakeIdP) jwk() map[string]any {
 // signIDToken builds and RS256-signs an ID token with f.claims, filling in the
 // standard registered claims (iss/aud/exp/iat) so the go-oidc verifier accepts
 // it. The "aud" claim is set to the test client ID.
-func (f *fakeIdP) signIDToken(t *testing.T, issuer string) string {
+func (f *fakeIDP) signIDToken(t *testing.T, issuer string) string {
 	t.Helper()
 	header := map[string]any{"alg": "RS256", "typ": "JWT", "kid": f.kid}
 	claims := map[string]any{
@@ -126,7 +126,7 @@ func (f *fakeIdP) signIDToken(t *testing.T, issuer string) string {
 // newCallbackTestHandler wires an OIDCHandler against a real in-memory DB and a
 // loaded provider pointing at the given fake IdP. allowedGroups and emailLink
 // configure the two policies under test.
-func newCallbackTestHandler(t *testing.T, idp *fakeIdP, allowedGroups []string, emailLink bool) (*OIDCHandler, *db.UserRepo, context.Context) {
+func newCallbackTestHandler(t *testing.T, idp *fakeIDP, allowedGroups []string, emailLink bool) (*OIDCHandler, *db.UserRepo, context.Context) {
 	t.Helper()
 	database, err := db.OpenMemory()
 	if err != nil {
@@ -193,7 +193,7 @@ func doCallback(t *testing.T, h *OIDCHandler) *httptest.ResponseRecorder {
 // TestCallback_AllowedGroups_InGroup verifies a user whose `groups` claim
 // intersects AllowedGroups is admitted (auto-provisioned, session issued).
 func TestCallback_AllowedGroups_InGroup(t *testing.T) {
-	idp := newFakeIdP(t)
+	idp := newFakeIDP(t)
 	idp.claims = map[string]any{
 		"sub":            "user-in-group",
 		"nonce":          "test-nonce",
@@ -215,7 +215,7 @@ func TestCallback_AllowedGroups_InGroup(t *testing.T) {
 // TestCallback_AllowedGroups_OutOfGroup verifies a user whose `groups` claim
 // does not intersect AllowedGroups is rejected with 403.
 func TestCallback_AllowedGroups_OutOfGroup(t *testing.T) {
-	idp := newFakeIdP(t)
+	idp := newFakeIDP(t)
 	idp.claims = map[string]any{
 		"sub":            "user-out-of-group",
 		"nonce":          "test-nonce",
@@ -238,7 +238,7 @@ func TestCallback_AllowedGroups_OutOfGroup(t *testing.T) {
 // configured but the IdP sends no `groups` claim at all, the login is rejected
 // (fail-closed) — the admin must fix the IdP scope mapping.
 func TestCallback_AllowedGroups_NoGroupsClaim(t *testing.T) {
-	idp := newFakeIdP(t)
+	idp := newFakeIDP(t)
 	idp.claims = map[string]any{
 		"sub":            "user-no-groups",
 		"nonce":          "test-nonce",
@@ -257,7 +257,7 @@ func TestCallback_AllowedGroups_NoGroupsClaim(t *testing.T) {
 // TestCallback_AllowedGroups_Empty verifies that with no AllowedGroups
 // configured, group membership is not checked and any user is admitted.
 func TestCallback_AllowedGroups_Empty(t *testing.T) {
-	idp := newFakeIdP(t)
+	idp := newFakeIDP(t)
 	idp.claims = map[string]any{
 		"sub":            "user-any",
 		"nonce":          "test-nonce",
@@ -279,7 +279,7 @@ func TestCallback_AllowedGroups_Empty(t *testing.T) {
 // and a verified email, an unknown OIDC subject is linked to the pre-existing
 // Bindery account that owns that email.
 func TestCallback_EmailLink_VerifiedEmail(t *testing.T) {
-	idp := newFakeIdP(t)
+	idp := newFakeIDP(t)
 	idp.claims = map[string]any{
 		"sub":            "attacker-or-legit-sub",
 		"nonce":          "test-nonce",
@@ -316,7 +316,7 @@ func TestCallback_EmailLink_VerifiedEmail(t *testing.T) {
 // Instead the login falls through to subject-based provisioning, creating a
 // brand-new account distinct from the victim's.
 func TestCallback_EmailLink_UnverifiedEmail(t *testing.T) {
-	idp := newFakeIdP(t)
+	idp := newFakeIDP(t)
 	idp.claims = map[string]any{
 		"sub":            "attacker-sub",
 		"nonce":          "test-nonce",
@@ -353,7 +353,7 @@ func TestCallback_EmailLink_UnverifiedEmail(t *testing.T) {
 // omits `email_verified` entirely is treated as unverified (fail-closed): no
 // linking, fall through to provisioning a separate account.
 func TestCallback_EmailLink_MissingEmailVerifiedClaim(t *testing.T) {
-	idp := newFakeIdP(t)
+	idp := newFakeIDP(t)
 	idp.claims = map[string]any{
 		"sub":   "no-emailverified-sub",
 		"nonce": "test-nonce",
