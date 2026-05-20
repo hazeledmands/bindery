@@ -410,6 +410,129 @@ func TestRegenerateAPIKey(t *testing.T) {
 	}
 }
 
+// TestRotateSessionSecret_PersistsBothKeys verifies the rotation action moves
+// the current secret into the previous slot and writes a fresh current secret,
+// persisting both atomically.
+func TestRotateSessionSecret_PersistsBothKeys(t *testing.T) {
+	h, _, settings, ctx := newAuthFixture(t)
+
+	before, _ := settings.Get(ctx, SettingAuthSessionSecret)
+	if before == nil || before.Value == "" {
+		t.Fatal("fixture should have seeded a current session secret")
+	}
+
+	rec := httptest.NewRecorder()
+	h.RotateSessionSecret(rec, httptest.NewRequest(http.MethodPost, "/auth/session-secret/rotate", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	cur, _ := settings.Get(ctx, SettingAuthSessionSecret)
+	prev, _ := settings.Get(ctx, SettingAuthSessionSecretPrevious)
+	if cur == nil || cur.Value == "" {
+		t.Fatal("current secret must be set after rotation")
+	}
+	if prev == nil || prev.Value != before.Value {
+		t.Fatalf("previous secret must equal the pre-rotation current; got %v want %q", prev, before.Value)
+	}
+	if cur.Value == before.Value {
+		t.Fatal("current secret must change on rotation")
+	}
+	// The new current secret must clear the fail-closed minimum-length guard.
+	if len(cur.Value) < 32 {
+		t.Errorf("new current secret too short for minSecretLen: %d bytes", len(cur.Value))
+	}
+}
+
+// TestRotateSessionSecret_OldCookieStillVerifies proves the rotation window:
+// a session cookie signed under the just-rotated-out secret still verifies via
+// the {current, previous} candidate set, while signing always uses the new
+// current secret.
+func TestRotateSessionSecret_OldCookieStillVerifies(t *testing.T) {
+	h, _, _, ctx := newAuthFixture(t)
+
+	oldSecret := h.sessionSecret(ctx)
+	oldCookie, err := auth.SignSession(oldSecret, 7, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("sign old cookie: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	h.RotateSessionSecret(rec, httptest.NewRequest(http.MethodPost, "/auth/session-secret/rotate", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rotate: expected 200, got %d", rec.Code)
+	}
+
+	// Old cookie still verifies during the rotation window.
+	if uid, err := auth.VerifySessionMulti(h.sessionSecrets(ctx), oldCookie); err != nil || uid != 7 {
+		t.Fatalf("rotated-out cookie: uid=%d err=%v; want 7,nil", uid, err)
+	}
+
+	// A cookie freshly signed under the new current secret also verifies.
+	newCookie, err := auth.SignSession(h.sessionSecret(ctx), 8, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("sign new cookie: %v", err)
+	}
+	if uid, err := auth.VerifySessionMulti(h.sessionSecrets(ctx), newCookie); err != nil || uid != 8 {
+		t.Fatalf("post-rotation cookie: uid=%d err=%v; want 8,nil", uid, err)
+	}
+}
+
+// TestRotateSessionSecret_StaleSecretRejected confirms a cookie signed with a
+// secret that is neither current nor previous — e.g. one rotated out two
+// rotations ago — is rejected. Verification must not be weakened.
+func TestRotateSessionSecret_StaleSecretRejected(t *testing.T) {
+	h, _, _, ctx := newAuthFixture(t)
+
+	// A secret never installed on this server.
+	staleSecret := []byte("stale-secret-never-installed-32b!")
+	staleCookie, err := auth.SignSession(staleSecret, 9, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("sign stale cookie: %v", err)
+	}
+
+	// One rotation: candidate set is {new, original}. The stale secret is
+	// neither, so its cookie must fail.
+	rec := httptest.NewRecorder()
+	h.RotateSessionSecret(rec, httptest.NewRequest(http.MethodPost, "/auth/session-secret/rotate", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rotate: expected 200, got %d", rec.Code)
+	}
+	if _, err := auth.VerifySessionMulti(h.sessionSecrets(ctx), staleCookie); err == nil {
+		t.Fatal("cookie signed with a never-installed secret must be rejected")
+	}
+
+	// A second rotation drops the original secret out of the window entirely:
+	// a cookie signed under the original is now also rejected.
+	originalSecret := []byte("test-secret-32-bytes-long-enough") // gitleaks:allow — matches fixture seed
+	originalCookie, err := auth.SignSession(originalSecret, 10, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("sign original cookie: %v", err)
+	}
+	rec2 := httptest.NewRecorder()
+	h.RotateSessionSecret(rec2, httptest.NewRequest(http.MethodPost, "/auth/session-secret/rotate", nil))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second rotate: expected 200, got %d", rec2.Code)
+	}
+	if _, err := auth.VerifySessionMulti(h.sessionSecrets(ctx), originalCookie); err == nil {
+		t.Fatal("cookie signed with the twice-rotated-out secret must be rejected")
+	}
+}
+
+// TestSessionSecrets_SingleSecretWhenNoPrevious confirms that with no previous
+// secret configured the candidate set is exactly {current} — behavior is
+// identical to single-secret verification.
+func TestSessionSecrets_SingleSecretWhenNoPrevious(t *testing.T) {
+	h, _, _, ctx := newAuthFixture(t)
+	got := h.sessionSecrets(ctx)
+	if len(got) != 1 {
+		t.Fatalf("with no previous secret, candidate set must have 1 entry, got %d", len(got))
+	}
+	if string(got[0]) != string(h.sessionSecret(ctx)) {
+		t.Fatal("the single candidate must be the current secret")
+	}
+}
+
 // TestSetup_RejectsEmptyBody just confirms the 400 path for malformed JSON;
 // a silent failure here would let a misbehaving client soft-crash setup.
 func TestSetup_RejectsEmptyBody(t *testing.T) {

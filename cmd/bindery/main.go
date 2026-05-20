@@ -563,7 +563,7 @@ func main() {
 	r.Route("/api", func(r chi.Router) {
 		r.Use(auth.Middleware(authProvider))
 		r.Use(auth.RequireXRequestedWith)
-		r.Use(auth.RequireCSRFToken(authProvider.SessionSecret))
+		r.Use(auth.RequireCSRFToken(authProvider.SessionSecrets))
 
 		r.Get("/queue", queueHandler.ListArrCompatible)
 	})
@@ -571,7 +571,7 @@ func main() {
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Use(auth.Middleware(authProvider))
 		r.Use(auth.RequireXRequestedWith)
-		r.Use(auth.RequireCSRFToken(authProvider.SessionSecret))
+		r.Use(auth.RequireCSRFToken(authProvider.SessionSecrets))
 
 		// System
 		r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
@@ -621,6 +621,7 @@ func main() {
 		r.Group(func(r chi.Router) {
 			r.Use(auth.RequireAdmin)
 			r.Post("/auth/apikey/regenerate", authHandler.RegenerateAPIKey)
+			r.Post("/auth/session-secret/rotate", authHandler.RotateSessionSecret)
 			r.Put("/auth/oidc/providers", oidcHandler.SetProviders)
 			r.Put("/auth/mode", authHandler.SetMode)
 			r.Get("/auth/users", userMgmtHandler.List)
@@ -1103,6 +1104,19 @@ func (p *dbAuthProvider) SessionSecret() []byte {
 		return nil
 	}
 	return []byte(s.Value)
+}
+
+// SessionSecrets returns the ordered verification candidate set
+// {current, previous}. The previous secret is included only when it has been
+// populated by a rotation; until then this is a single-element slice and
+// verification is identical to single-secret behavior. VerifySessionMulti
+// applies the minimum-length fail-closed guard to every entry.
+func (p *dbAuthProvider) SessionSecrets() [][]byte {
+	secrets := [][]byte{p.SessionSecret()}
+	if s, _ := p.settings.Get(context.Background(), api.SettingAuthSessionSecretPrevious); s != nil && s.Value != "" {
+		secrets = append(secrets, []byte(s.Value))
+	}
+	return secrets
 }
 
 func (p *dbAuthProvider) SetupRequired() bool {

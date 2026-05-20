@@ -201,6 +201,8 @@ export const api = {
     }),
   authRegenerateApiKey: () =>
     request<{ apiKey: string }>('/auth/apikey/regenerate', { method: 'POST' }),
+  authRotateSessionSecret: () =>
+    request<{ ok: boolean }>('/auth/session-secret/rotate', { method: 'POST' }),
   authSetMode: (mode: AuthStatus['mode']) =>
     request<{ mode: string }>('/auth/mode', {
       method: 'PUT',

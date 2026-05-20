@@ -42,7 +42,7 @@ func OPDSAuth(p auth.Provider, users *db.UserRepo, limiter *auth.LoginLimiter) f
 				return
 			}
 			if c, err := r.Cookie(auth.SessionCookieName); err == nil {
-				if _, err := auth.VerifySession(p.SessionSecret(), c.Value); err == nil {
+				if _, err := auth.VerifySessionMulti(p.SessionSecrets(), c.Value); err == nil {
 					next.ServeHTTP(w, r)
 					return
 				}

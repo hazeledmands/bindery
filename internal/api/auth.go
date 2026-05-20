@@ -35,8 +35,14 @@ func CookieSecureMode() string {
 const (
 	SettingAuthAPIKey        = "auth.api_key"        //nolint:gosec // setting key name, not a credential
 	SettingAuthSessionSecret = "auth.session_secret" //nolint:gosec // setting key name, not a credential
-	SettingAuthMode          = "auth.mode"
-	SettingOIDCProviders     = "auth.oidc.providers" //nolint:gosec // setting key name, not a credential
+	// SettingAuthSessionSecretPrevious holds the secret rotated out by the most
+	// recent rotation. It is consulted only for *verification* so a cookie
+	// signed under the just-rotated-out secret still validates during the
+	// rotation window; SignSession never uses it. Absent/empty until the first
+	// rotation, in which case verification is single-secret as before.
+	SettingAuthSessionSecretPrevious = "auth.session_secret_previous" //nolint:gosec // setting key name, not a credential
+	SettingAuthMode                  = "auth.mode"
+	SettingOIDCProviders             = "auth.oidc.providers" //nolint:gosec // setting key name, not a credential
 )
 
 // AuthHandler owns the login / setup / password / mode endpoints.
@@ -314,6 +320,46 @@ func (h *AuthHandler) RegenerateAPIKey(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, map[string]any{"apiKey": key})
 }
 
+// RotateSessionSecret rotates the session signing secret. The current secret is
+// moved into auth.session_secret_previous and a fresh 32-byte secret becomes
+// the new current; both keys are persisted atomically via SettingsRepo.SetMany
+// so a verifier never observes a half-applied rotation.
+//
+// After rotation: new logins (and re-issued CSRF tokens) sign with the new
+// secret, while existing sessions remain valid because VerifySessionMulti is
+// handed {current, previous}. The window closes on the next rotation, which
+// overwrites the previous slot — at which point cookies signed under the
+// twice-rotated-out secret stop verifying and those users must re-login.
+//
+// Admin-only: this route is mounted inside the RequireAdmin group in
+// cmd/bindery/main.go alongside /auth/apikey/regenerate.
+func (h *AuthHandler) RotateSessionSecret(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// The new current secret. RandomBase64(32) yields >= 32 bytes of base64
+	// text, comfortably clearing the minSecretLen fail-closed guard.
+	newSecret, err := auth.RandomBase64(32)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "gen: "+err.Error())
+		return
+	}
+
+	// The current secret becomes the previous one. If it is somehow absent
+	// (should not happen — bootstrapAuth seeds it before serving), we simply
+	// rotate forward without a fallback window rather than fail.
+	cur := h.sessionSecret(ctx)
+
+	if err := h.settings.SetMany(ctx, []db.SettingKV{
+		{Key: SettingAuthSessionSecretPrevious, Value: string(cur)},
+		{Key: SettingAuthSessionSecret, Value: newSecret},
+	}); err != nil {
+		writeErr(w, http.StatusInternalServerError, "save: "+err.Error())
+		return
+	}
+	slog.Info("session signing secret rotated")
+	writeOK(w, map[string]any{"ok": true})
+}
+
 // CSRF issues (or re-issues) a double-submit CSRF token bound to the caller's
 // session cookie. The token is returned as JSON and also set as a readable
 // (non-HttpOnly) cookie so the frontend JS can read it. Unauthenticated
@@ -394,6 +440,20 @@ func (h *AuthHandler) sessionSecret(ctx context.Context) []byte {
 	// Secret is stored as base64; hand back raw bytes. Accept anything on
 	// decode failure (the seed path writes valid base64).
 	return []byte(s.Value)
+}
+
+// sessionSecrets returns the ordered verification candidate set
+// {current, previous}. The previous entry is included only when it is set and
+// non-empty; when absent the result is the single-element {current} slice and
+// verification behaves exactly as it did before rotation existed. The
+// minimum-length fail-closed guard is applied downstream by VerifySessionMulti
+// for every entry, so a short previous secret cannot weaken verification.
+func (h *AuthHandler) sessionSecrets(ctx context.Context) [][]byte {
+	secrets := [][]byte{h.sessionSecret(ctx)}
+	if s, _ := h.settings.Get(ctx, SettingAuthSessionSecretPrevious); s != nil && s.Value != "" {
+		secrets = append(secrets, []byte(s.Value))
+	}
+	return secrets
 }
 
 // issueSession signs and sets the session cookie. It returns true on success.

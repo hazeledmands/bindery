@@ -236,6 +236,7 @@ type fakeProvider struct {
 	mode           Mode
 	apiKey         string
 	secret         []byte
+	prevSecret     []byte // optional rotated-out secret; nil = single-secret
 	setup          bool
 	proxyHeader    string
 	proxyProvision bool
@@ -243,9 +244,16 @@ type fakeProvider struct {
 	provisioner    UserProvisioner
 }
 
-func (f *fakeProvider) Mode() Mode                                 { return f.mode }
-func (f *fakeProvider) APIKey() string                             { return f.apiKey }
-func (f *fakeProvider) SessionSecret() []byte                      { return f.secret }
+func (f *fakeProvider) Mode() Mode            { return f.mode }
+func (f *fakeProvider) APIKey() string        { return f.apiKey }
+func (f *fakeProvider) SessionSecret() []byte { return f.secret }
+func (f *fakeProvider) SessionSecrets() [][]byte {
+	secrets := [][]byte{f.secret}
+	if len(f.prevSecret) > 0 {
+		secrets = append(secrets, f.prevSecret)
+	}
+	return secrets
+}
 func (f *fakeProvider) SetupRequired() bool                        { return f.setup }
 func (f *fakeProvider) ProxyAuthHeader() string                    { return f.proxyHeader }
 func (f *fakeProvider) ProxyAutoProvision() bool                   { return f.proxyProvision }
@@ -352,6 +360,41 @@ func TestMiddlewareAcceptsValidSessionCookie(t *testing.T) {
 	h.ServeHTTP(nopWriter{}, req)
 	if gotUID != 7 {
 		t.Errorf("uid = %d; want 7", gotUID)
+	}
+}
+
+// TestMiddlewareAcceptsCookieFromPreviousSecret confirms the middleware
+// resolves identity from a cookie signed under the rotated-out secret while the
+// provider's SessionSecrets() set is {current, previous}.
+func TestMiddlewareAcceptsCookieFromPreviousSecret(t *testing.T) {
+	prevSecret := []byte("old-rotation-secret-32-bytes-long")
+	curSecret := []byte("new-rotation-secret-32-bytes-long")
+	p := &fakeProvider{mode: ModeEnabled, secret: curSecret, prevSecret: prevSecret}
+	mw := Middleware(p)
+	var gotUID int64
+	h := mw(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		gotUID = UserIDFromContext(r.Context())
+	}))
+	req, _ := http.NewRequest("GET", "/api/v1/author", nil)
+	cookie, err := SignSession(prevSecret, 13, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: cookie})
+	h.ServeHTTP(nopWriter{}, req)
+	if gotUID != 13 {
+		t.Errorf("uid = %d; want 13 (cookie signed under previous secret must resolve)", gotUID)
+	}
+
+	// Once the rotation window closes (previous secret dropped), the same
+	// cookie must no longer resolve an identity.
+	p.prevSecret = nil
+	gotUID = 0
+	req2, _ := http.NewRequest("GET", "/api/v1/author", nil)
+	req2.AddCookie(&http.Cookie{Name: SessionCookieName, Value: cookie})
+	h.ServeHTTP(nopWriter{}, req2)
+	if gotUID != 0 {
+		t.Errorf("uid = %d; want 0 (cookie under dropped secret must not resolve)", gotUID)
 	}
 }
 
@@ -485,7 +528,7 @@ func TestMakeCSRFToken_SameInputsSameOutput(t *testing.T) {
 
 func TestRequireCSRFToken_AllowsSafeMethod(t *testing.T) {
 	secret := []byte("s")
-	mw := RequireCSRFToken(func() []byte { return secret })
+	mw := RequireCSRFToken(func() [][]byte { return [][]byte{secret} })
 	called := false
 	h := mw(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) { called = true }))
 	req, _ := http.NewRequest("GET", "/api/v1/author", nil)
@@ -497,7 +540,7 @@ func TestRequireCSRFToken_AllowsSafeMethod(t *testing.T) {
 
 func TestRequireCSRFToken_AllowsUnauthPath(t *testing.T) {
 	secret := []byte("s")
-	mw := RequireCSRFToken(func() []byte { return secret })
+	mw := RequireCSRFToken(func() [][]byte { return [][]byte{secret} })
 	called := false
 	h := mw(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) { called = true }))
 	// AllowUnauthPath routes must always pass through, even with a stale session cookie.
@@ -515,7 +558,7 @@ func TestRequireCSRFToken_BlocksMutationWithSessionButNoToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
-	mw := RequireCSRFToken(func() []byte { return secret })
+	mw := RequireCSRFToken(func() [][]byte { return [][]byte{secret} })
 	called := false
 	h := mw(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) { called = true }))
 	// Session cookie present but no CSRF token — cross-origin attack scenario.
@@ -533,7 +576,7 @@ func TestRequireCSRFToken_BlocksMutationWithSessionButNoToken(t *testing.T) {
 
 func TestRequireCSRFToken_AllowsMutationWithAPIKey(t *testing.T) {
 	secret := []byte("s")
-	mw := RequireCSRFToken(func() []byte { return secret })
+	mw := RequireCSRFToken(func() [][]byte { return [][]byte{secret} })
 	called := false
 	h := mw(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) { called = true }))
 	req, _ := http.NewRequest("POST", "/api/v1/author", nil)
@@ -558,7 +601,7 @@ func TestRequireCSRFToken_BogusAPIKeyDoesNotBypassCSRF(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
-	mw := RequireCSRFToken(func() []byte { return secret })
+	mw := RequireCSRFToken(func() [][]byte { return [][]byte{secret} })
 	called := false
 	h := mw(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) { called = true }))
 
@@ -586,7 +629,7 @@ func TestRequireCSRFToken_BogusAPIKeyHeaderDoesNotBypassCSRF(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
-	mw := RequireCSRFToken(func() []byte { return secret })
+	mw := RequireCSRFToken(func() [][]byte { return [][]byte{secret} })
 	called := false
 	h := mw(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) { called = true }))
 
@@ -611,7 +654,7 @@ func TestRequireCSRFToken_AllowsMutationWithValidToken(t *testing.T) {
 	}
 	token := MakeCSRFToken(secret, sessionVal)
 
-	mw := RequireCSRFToken(func() []byte { return secret })
+	mw := RequireCSRFToken(func() [][]byte { return [][]byte{secret} })
 	called := false
 	h := mw(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) { called = true }))
 	req, _ := http.NewRequest("DELETE", "/api/v1/author/1", nil)
@@ -630,7 +673,7 @@ func TestRequireCSRFToken_BlocksMutationWithWrongToken(t *testing.T) {
 		t.Fatalf("sign: %v", err)
 	}
 
-	mw := RequireCSRFToken(func() []byte { return secret })
+	mw := RequireCSRFToken(func() [][]byte { return [][]byte{secret} })
 	called := false
 	h := mw(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) { called = true }))
 	req, _ := http.NewRequest("PUT", "/api/v1/author/1", nil)
@@ -640,6 +683,51 @@ func TestRequireCSRFToken_BlocksMutationWithWrongToken(t *testing.T) {
 	h.ServeHTTP(w, req)
 	if called {
 		t.Fatal("PUT with wrong CSRF token must be rejected")
+	}
+	if w.status != http.StatusForbidden {
+		t.Errorf("status = %d; want 403", w.status)
+	}
+}
+
+// TestRequireCSRFToken_AcceptsTokenFromPreviousSecret proves the CSRF rotation
+// window: a token minted under the rotated-out secret still validates while the
+// verifier is handed {current, previous}, so an in-flight mutation does not 403
+// the instant the session secret is rotated.
+func TestRequireCSRFToken_AcceptsTokenFromPreviousSecret(t *testing.T) {
+	prevSecret := []byte("old-rotation-secret-32-bytes-long")
+	curSecret := []byte("new-rotation-secret-32-bytes-long")
+
+	// The session cookie itself was signed under the previous secret and is
+	// still valid in the window — bind the CSRF token to it under prevSecret.
+	sessionVal, err := SignSession(prevSecret, 1, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	tokenUnderPrev := MakeCSRFToken(prevSecret, sessionVal)
+
+	mw := RequireCSRFToken(func() [][]byte { return [][]byte{curSecret, prevSecret} })
+	called := false
+	h := mw(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) { called = true }))
+	req, _ := http.NewRequest("POST", "/api/v1/author", nil)
+	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: sessionVal})
+	req.Header.Set("X-CSRF-Token", tokenUnderPrev)
+	h.ServeHTTP(nopWriter{}, req)
+	if !called {
+		t.Fatal("CSRF token minted under the previous secret must validate during the rotation window")
+	}
+
+	// A token minted under a secret that is neither current nor previous must
+	// still be rejected — the window does not weaken verification.
+	staleSecret := []byte("stale-secret-not-in-the-window32")
+	tokenUnderStale := MakeCSRFToken(staleSecret, sessionVal)
+	called = false
+	req2, _ := http.NewRequest("POST", "/api/v1/author", nil)
+	req2.AddCookie(&http.Cookie{Name: SessionCookieName, Value: sessionVal})
+	req2.Header.Set("X-CSRF-Token", tokenUnderStale)
+	w := &captureWriter{}
+	h.ServeHTTP(w, req2)
+	if called {
+		t.Fatal("CSRF token minted under a stale secret must be rejected")
 	}
 	if w.status != http.StatusForbidden {
 		t.Errorf("status = %d; want 403", w.status)
@@ -725,7 +813,7 @@ func TestRequireXRequestedWith_AllowsMutationWithCorrectHeader(t *testing.T) {
 func buildCSRFStack(p Provider, secret []byte, inner http.Handler) http.Handler {
 	return Middleware(p)(
 		RequireXRequestedWith(
-			RequireCSRFToken(func() []byte { return secret })(inner),
+			RequireCSRFToken(func() [][]byte { return [][]byte{secret} })(inner),
 		),
 	)
 }

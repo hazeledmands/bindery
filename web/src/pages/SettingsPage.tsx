@@ -4608,6 +4608,7 @@ function SecuritySection() {
   const [cfg, setCfg] = useState<AuthConfig | null>(null)
   const [showKey, setShowKey] = useState(false)
   const [regenerating, setRegenerating] = useState(false)
+  const [rotatingSecret, setRotatingSecret] = useState(false)
   const [savingMode, setSavingMode] = useState(false)
   const [copied, setCopied] = useState(false)
 
@@ -4628,6 +4629,19 @@ function SecuritySection() {
       alert('Regenerate failed: ' + (e instanceof Error ? e.message : 'unknown'))
     } finally {
       setRegenerating(false)
+    }
+  }
+
+  const rotateSessionSecret = async () => {
+    if (!confirm('Rotate the session signing secret? Existing logins keep working during a rotation window via the previous secret; a second rotation closes that window.')) return
+    setRotatingSecret(true)
+    try {
+      await api.authRotateSessionSecret()
+      alert('Session secret rotated. New logins sign with the new secret; existing sessions remain valid until the next rotation.')
+    } catch (e) {
+      alert('Rotate failed: ' + (e instanceof Error ? e.message : 'unknown'))
+    } finally {
+      setRotatingSecret(false)
     }
   }
 
@@ -4698,6 +4712,15 @@ function SecuritySection() {
           </div>
         </div>
 
+        <div className="border-t border-slate-200 dark:border-zinc-800 pt-4">
+          <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">Session Secret</label>
+          <p className="text-xs text-slate-600 dark:text-zinc-500 mb-2">
+            Signs session cookies. Rotating it generates a new secret while keeping the previous one valid for a rotation window, so existing logins are not dropped immediately. Rotate twice to fully invalidate sessions signed with the old secret.
+          </p>
+          <button onClick={rotateSessionSecret} disabled={rotatingSecret} className="px-3 py-2 bg-amber-600 hover:bg-amber-500 rounded text-xs font-medium disabled:opacity-50">
+            {rotatingSecret ? '...' : 'Rotate session secret'}
+          </button>
+        </div>
         </>)}
 
         {status?.authenticated && (

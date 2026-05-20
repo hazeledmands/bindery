@@ -102,7 +102,16 @@ type UserProvisioner interface {
 type Provider interface {
 	Mode() Mode
 	APIKey() string
+	// SessionSecret returns the current session signing secret — the secret
+	// SignSession must always use when minting a new cookie.
 	SessionSecret() []byte
+	// SessionSecrets returns the ordered candidate set used for *verification*:
+	// {current, previous}. During a secret rotation a cookie signed under the
+	// just-rotated-out secret still verifies. When no previous secret is
+	// configured this is a one-element slice and behavior matches single-secret
+	// verification. Empty/too-short secrets are filtered downstream by
+	// VerifySessionMulti, which fails closed if none remain.
+	SessionSecrets() [][]byte
 	// SetupRequired reports whether no user exists yet (first-run). When true
 	// and the request is unauthenticated, /setup endpoints are allowed through.
 	SetupRequired() bool
@@ -167,7 +176,7 @@ func Middleware(p Provider) func(http.Handler) http.Handler {
 			ctx := r.Context()
 			cookieValid := false
 			if c, err := r.Cookie(SessionCookieName); err == nil {
-				if uid, err := VerifySession(p.SessionSecret(), c.Value); err == nil {
+				if uid, err := VerifySessionMulti(p.SessionSecrets(), c.Value); err == nil {
 					ctx = context.WithValue(ctx, userIDCtxKey, uid)
 					ctx = context.WithValue(ctx, userRoleCtxKey, p.UserRole(ctx, uid))
 					cookieValid = true

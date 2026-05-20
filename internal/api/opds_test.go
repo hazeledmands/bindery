@@ -121,6 +121,13 @@ func (p *testProvider) SessionSecret() []byte {
 	}
 	return []byte(s.Value)
 }
+func (p *testProvider) SessionSecrets() [][]byte {
+	secrets := [][]byte{p.SessionSecret()}
+	if s, _ := p.settings.Get(context.Background(), SettingAuthSessionSecretPrevious); s != nil && s.Value != "" {
+		secrets = append(secrets, []byte(s.Value))
+	}
+	return secrets
+}
 func (p *testProvider) SetupRequired() bool                        { return false }
 func (p *testProvider) ProxyAuthHeader() string                    { return "X-Forwarded-User" }
 func (p *testProvider) ProxyAutoProvision() bool                   { return false }
