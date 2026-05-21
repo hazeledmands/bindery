@@ -1303,3 +1303,388 @@ func TestTest_ServerError_NoHint_QBit(t *testing.T) {
 		}
 	}
 }
+
+// --------------------------------------------------------------------------
+// qBittorrent v4 / v5 response-shape regression fixtures (#692).
+//
+// The qBittorrent v5.x release reworked several WebUI API response shapes that
+// v4.x clients had relied on. Three were already patched after users hit them
+// (#623 auth, #641 categories/savepath, #690 add-torrent). The holistic audit
+// in #692 confirmed no further functional shape mismatches remain, but both v4
+// and v5 deployments are still in the wild — these fixtures lock in that every
+// endpoint Bindery touches parses BOTH shapes identically, so a future change
+// can't silently regress one of them.
+//
+// The official v5.0 wiki still documents the v4 shapes for /auth/login and
+// /torrents/add; the v5 shapes below are the ones observed in the field and
+// confirmed by the #623 / #690 fixes.
+// --------------------------------------------------------------------------
+
+// loginFixture is one observed /auth/login response shape.
+type loginFixture struct {
+	name   string
+	status int
+	body   string
+}
+
+// TestLogin_V4AndV5_ResponseShapes verifies every successful-login response
+// shape across qBittorrent versions is accepted:
+//   - v4.x: 200 OK + plaintext "Ok."
+//   - v5.x: 204 No Content + empty body
+//   - v5.x (some builds): 200 OK + empty body
+func TestLogin_V4AndV5_ResponseShapes(t *testing.T) {
+	fixtures := []loginFixture{
+		{name: "v4_200_Ok", status: http.StatusOK, body: "Ok."},
+		{name: "v5_204_empty", status: http.StatusNoContent, body: ""},
+		{name: "v5_200_empty", status: http.StatusOK, body: ""},
+	}
+	for _, f := range fixtures {
+		t.Run(f.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/v2/auth/login" {
+					t.Errorf("unexpected path: %s", r.URL.Path)
+				}
+				if f.status != http.StatusOK {
+					w.WriteHeader(f.status)
+				}
+				if f.body != "" {
+					_, _ = w.Write([]byte(f.body))
+				}
+			}))
+			defer srv.Close()
+
+			c := newTestClient(srv.URL, "admin", "pass")
+			if err := c.Login(context.Background()); err != nil {
+				t.Fatalf("Login should accept %s shape: %v", f.name, err)
+			}
+			if !c.loggedIn {
+				t.Errorf("loggedIn should be true after %s response", f.name)
+			}
+		})
+	}
+}
+
+// TestAddTorrent_V4AndV5_ResponseShapes verifies POST /torrents/add accepts
+// both the v4 plaintext body and the v5 JSON body on a successful add.
+//   - v4.x: plaintext "Ok." (hash resolved via the before/after poll)
+//   - v5.x: JSON {"added_torrent_ids":[...],"success_count":N} (hash inline)
+func TestAddTorrent_V4AndV5_ResponseShapes(t *testing.T) {
+	const v5Hash = "dddddddddddddddddddddddddddddddddddddddd"
+	const v4Hash = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+
+	fixtures := []struct {
+		name     string
+		body     string
+		wantHash string // exact hash expected back, empty = don't assert
+	}{
+		{name: "v4_plaintext_Ok", body: "Ok.", wantHash: v4Hash},
+		{
+			name:     "v5_json",
+			body:     `{"added_torrent_ids":["` + v5Hash + `"],"failure_count":0,"pending_count":0,"success_count":1}`,
+			wantHash: v5Hash,
+		},
+	}
+	for _, f := range fixtures {
+		t.Run(f.name, func(t *testing.T) {
+			var mu sync.Mutex
+			added := false
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/v2/auth/login":
+					_, _ = w.Write([]byte("Ok."))
+				case "/api/v2/torrents/add":
+					mu.Lock()
+					added = true
+					mu.Unlock()
+					_, _ = w.Write([]byte(f.body))
+				case "/api/v2/torrents/info":
+					mu.Lock()
+					isAdded := added
+					mu.Unlock()
+					if isAdded {
+						_, _ = w.Write([]byte(`[{"hash":"` + v4Hash + `","name":"Book","added_on":1000}]`))
+					} else {
+						_, _ = w.Write([]byte("[]"))
+					}
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer srv.Close()
+
+			indexer := newFakeIndexer(t)
+			defer indexer.Close()
+
+			c := newTestClient(srv.URL, "admin", "pass")
+			allowTorrentFetch(c)
+			c.loggedIn = true
+
+			got, err := c.AddTorrent(context.Background(), indexer.URL+"/torrent", "", "")
+			if err != nil {
+				t.Fatalf("AddTorrent should accept %s shape: %v", f.name, err)
+			}
+			if f.wantHash != "" && got != f.wantHash {
+				t.Errorf("%s: hash want %q, got %q", f.name, f.wantHash, got)
+			}
+		})
+	}
+}
+
+// TestGetTorrents_V4AndV5_StateValues verifies GET /torrents/info parses the
+// torrent-list JSON identically across versions. qBittorrent 5.0 renamed the
+// user-paused states from v4's `pausedDL`/`pausedUP` to `stoppedDL`/`stoppedUP`
+// (the WebUI "Pause" button became "Stop"). Bindery passes the state string
+// through verbatim and only special-cases `error`/`missingfiles`/`stalleddl`,
+// so the rename is non-breaking — this fixture locks that in: both vocabularies
+// decode into the same struct shape with the state preserved as-is.
+func TestGetTorrents_V4AndV5_StateValues(t *testing.T) {
+	fixtures := []struct {
+		name      string
+		body      string
+		wantState string
+	}{
+		{
+			name:      "v4_pausedUP",
+			body:      `[{"hash":"abc","name":"Book","state":"pausedUP","progress":1.0,"amount_left":0,"eta":8640000,"save_path":"/dl"}]`,
+			wantState: "pausedUP",
+		},
+		{
+			name:      "v5_stoppedUP",
+			body:      `[{"hash":"abc","name":"Book","state":"stoppedUP","progress":1.0,"amount_left":0,"eta":8640000,"save_path":"/dl"}]`,
+			wantState: "stoppedUP",
+		},
+		{
+			name:      "v4_pausedDL",
+			body:      `[{"hash":"abc","name":"Book","state":"pausedDL","progress":0.4,"amount_left":600,"eta":8640000,"save_path":"/dl"}]`,
+			wantState: "pausedDL",
+		},
+		{
+			name:      "v5_stoppedDL",
+			body:      `[{"hash":"abc","name":"Book","state":"stoppedDL","progress":0.4,"amount_left":600,"eta":8640000,"save_path":"/dl"}]`,
+			wantState: "stoppedDL",
+		},
+	}
+	for _, f := range fixtures {
+		t.Run(f.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/v2/auth/login":
+					_, _ = w.Write([]byte("Ok."))
+				case "/api/v2/torrents/info":
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(f.body))
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer srv.Close()
+
+			c := newTestClient(srv.URL, "admin", "pass")
+			torrents, err := c.GetTorrents(context.Background(), "")
+			if err != nil {
+				t.Fatalf("GetTorrents (%s): %v", f.name, err)
+			}
+			if len(torrents) != 1 {
+				t.Fatalf("%s: want 1 torrent, got %d", f.name, len(torrents))
+			}
+			if torrents[0].State != f.wantState {
+				t.Errorf("%s: state want %q, got %q", f.name, f.wantState, torrents[0].State)
+			}
+			if torrents[0].Hash != "abc" {
+				t.Errorf("%s: hash want %q, got %q", f.name, "abc", torrents[0].Hash)
+			}
+		})
+	}
+}
+
+// TestGetCategories_V4AndV5_ResponseShapes verifies GET /torrents/categories
+// parses both the v4 and v5 JSON object shapes. The endpoint has always
+// returned a name->object map; the variation across versions is the per-entry
+// save-path key (`savePath`, `save_path`, `download_path`), which
+// Category.UnmarshalJSON normalizes. This fixture exercises every observed
+// key and confirms a missing-name entry is backfilled from its map key.
+func TestGetCategories_V4AndV5_ResponseShapes(t *testing.T) {
+	fixtures := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "v5_savePath_camel",
+			body: `{"Video":{"name":"Video","savePath":"/dl/video"},"eBooks":{"name":"eBooks","savePath":"/dl/ebooks"}}`,
+		},
+		{
+			name: "v4_save_path_snake",
+			body: `{"Video":{"name":"Video","save_path":"/dl/video"},"eBooks":{"name":"eBooks","save_path":"/dl/ebooks"}}`,
+		},
+		{
+			name: "mixed_with_download_path_and_missing_name",
+			body: `{"Video":{"savePath":"/dl/video"},"eBooks":{"name":"eBooks","download_path":"/dl/ebooks"}}`,
+		},
+	}
+	for _, f := range fixtures {
+		t.Run(f.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/v2/auth/login":
+					_, _ = w.Write([]byte("Ok."))
+				case "/api/v2/torrents/categories":
+					_, _ = w.Write([]byte(f.body))
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer srv.Close()
+
+			c := newTestClient(srv.URL, "admin", "pass")
+			cats, err := c.GetCategories(context.Background())
+			if err != nil {
+				t.Fatalf("GetCategories (%s): %v", f.name, err)
+			}
+			if cats["Video"].SavePath != "/dl/video" {
+				t.Errorf("%s: Video save path = %q, want /dl/video", f.name, cats["Video"].SavePath)
+			}
+			if cats["eBooks"].SavePath != "/dl/ebooks" {
+				t.Errorf("%s: eBooks save path = %q, want /dl/ebooks", f.name, cats["eBooks"].SavePath)
+			}
+			// Name is backfilled from the map key when the entry omits it.
+			if cats["Video"].Name != "Video" {
+				t.Errorf("%s: Video name = %q, want Video (backfilled from key)", f.name, cats["Video"].Name)
+			}
+		})
+	}
+}
+
+// TestGetCategories_EmptyObject verifies an installation with no categories
+// (qBittorrent returns `{}` on both v4 and v5) decodes to an empty, non-nil-
+// usable map rather than an error.
+func TestGetCategories_EmptyObject(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/auth/login":
+			_, _ = w.Write([]byte("Ok."))
+		case "/api/v2/torrents/categories":
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, "admin", "pass")
+	cats, err := c.GetCategories(context.Background())
+	if err != nil {
+		t.Fatalf("GetCategories on empty object: %v", err)
+	}
+	if len(cats) != 0 {
+		t.Errorf("want 0 categories, got %d", len(cats))
+	}
+}
+
+// TestGetDefaultSavePath_V4AndV5 verifies GET /app/defaultSavePath is parsed
+// as a trimmed plaintext string. The endpoint returns plaintext on both v4 and
+// v5; this fixture covers a Unix path, a Windows path, and a trailing-newline
+// body (qBittorrent sometimes appends one).
+func TestGetDefaultSavePath_V4AndV5(t *testing.T) {
+	fixtures := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "unix_path", body: "/downloads", want: "/downloads"},
+		{name: "windows_path", body: `C:/Users/Dayman/Downloads`, want: `C:/Users/Dayman/Downloads`},
+		{name: "trailing_newline", body: "/downloads\n", want: "/downloads"},
+	}
+	for _, f := range fixtures {
+		t.Run(f.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/v2/auth/login":
+					_, _ = w.Write([]byte("Ok."))
+				case "/api/v2/app/defaultSavePath":
+					_, _ = w.Write([]byte(f.body))
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer srv.Close()
+
+			c := newTestClient(srv.URL, "admin", "pass")
+			got, err := c.GetDefaultSavePath(context.Background())
+			if err != nil {
+				t.Fatalf("GetDefaultSavePath (%s): %v", f.name, err)
+			}
+			if got != f.want {
+				t.Errorf("%s: want %q, got %q", f.name, f.want, got)
+			}
+		})
+	}
+}
+
+// TestDeleteTorrent_V4AndV5 verifies POST /torrents/delete succeeds on the
+// 200-with-empty-body response both versions return. v5.0 documents
+// "200 All scenarios" with no body; v4 behaved the same. The client discards
+// the body and keys only off the status code — this fixture locks that in.
+func TestDeleteTorrent_V4AndV5(t *testing.T) {
+	fixtures := []struct {
+		name string
+		body string
+	}{
+		{name: "v5_empty_body", body: ""},
+		{name: "v4_plaintext_body", body: "Ok."},
+	}
+	for _, f := range fixtures {
+		t.Run(f.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/v2/auth/login":
+					_, _ = w.Write([]byte("Ok."))
+				case "/api/v2/torrents/delete":
+					w.WriteHeader(http.StatusOK)
+					if f.body != "" {
+						_, _ = w.Write([]byte(f.body))
+					}
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer srv.Close()
+
+			c := newTestClient(srv.URL, "admin", "pass")
+			if err := c.DeleteTorrent(context.Background(), "abc123", true); err != nil {
+				t.Fatalf("DeleteTorrent should accept %s: %v", f.name, err)
+			}
+		})
+	}
+}
+
+// TestTest_V4AndV5_VersionString verifies Test() (via GET /app/version)
+// accepts both the v4 and v5 plaintext version-string bodies.
+func TestTest_V4AndV5_VersionString(t *testing.T) {
+	fixtures := []struct {
+		name string
+		body string
+	}{
+		{name: "v4_version", body: "v4.6.7"},
+		{name: "v5_version", body: "v5.0.4"},
+	}
+	for _, f := range fixtures {
+		t.Run(f.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/v2/auth/login":
+					_, _ = w.Write([]byte("Ok."))
+				case "/api/v2/app/version":
+					_, _ = w.Write([]byte(f.body))
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer srv.Close()
+
+			c := newTestClient(srv.URL, "admin", "pass")
+			if err := c.Test(context.Background()); err != nil {
+				t.Fatalf("Test should accept %s version body: %v", f.name, err)
+			}
+		})
+	}
+}
