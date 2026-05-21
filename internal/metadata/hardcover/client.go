@@ -8,12 +8,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/vavallee/bindery/internal/isbnutil"
 	"github.com/vavallee/bindery/internal/metadata"
 	"github.com/vavallee/bindery/internal/models"
 	"github.com/vavallee/bindery/internal/useragent"
@@ -29,6 +31,17 @@ const (
 	editionsMaxCount    = 1000
 
 	hardcoverSuccessResponseBodyLimit = 8 << 20
+)
+
+// Hardcover documents user_books.status_id values in its official API docs:
+// https://github.com/hardcoverapp/hardcover-docs/blob/31aaa75774ec560312222e5834322c71b79dbb5b/src/content/docs/api/GraphQL/Schemas/UserBooks.mdx#L12-L21
+const (
+	hcStatusWantToRead       = 1
+	hcStatusCurrentlyReading = 2
+	hcStatusRead             = 3
+	hcStatusPaused           = 4
+	hcStatusDidNotFinish     = 5
+	hcStatusIgnored          = 6
 )
 
 // Client implements metadata.Provider for Hardcover.app using its public GraphQL API.
@@ -195,6 +208,8 @@ func (c *Client) GetAuthorWorksByName(ctx context.Context, authorName string) ([
 			rating
 			users_count
 			audio_seconds
+			default_audio_edition_id
+			default_ebook_edition_id
 			contributions {
 				author { id name slug }
 			}
@@ -276,6 +291,8 @@ func (c *Client) GetBook(ctx context.Context, foreignID string) (*models.Book, e
 			release_year
 			ratings_count
 			rating
+			default_audio_edition_id
+			default_ebook_edition_id
 			contributions {
 				author { id name slug }
 			}
@@ -293,6 +310,8 @@ func (c *Client) GetBook(ctx context.Context, foreignID string) (*models.Book, e
 				release_year
 				ratings_count
 				rating
+				default_audio_edition_id
+				default_ebook_edition_id
 				contributions {
 					author { id name slug }
 				}
@@ -413,6 +432,8 @@ func (c *Client) GetBookByISBN(ctx context.Context, isbn string) (*models.Book, 
 				release_year
 				ratings_count
 				rating
+				default_audio_edition_id
+				default_ebook_edition_id
 				contributions {
 					author { id name slug }
 				}
@@ -451,10 +472,9 @@ func (c *Client) GetUserWishlist(ctx context.Context, limit int) ([]models.Recom
 	if limit <= 0 {
 		limit = 100
 	}
-	// status_id 1 = "Want to Read" in Hardcover's reading status enum.
-	gql := `query GetWishlist($limit: Int!) {
+	gql := `query GetWishlist($limit: Int!, $statusID: Int!) {
 		me {
-			user_books(where: {status_id: {_eq: 1}}, limit: $limit) {
+			user_books(where: {status_id: {_eq: $statusID}}, limit: $limit) {
 				book {
 					id
 					title
@@ -471,6 +491,7 @@ func (c *Client) GetUserWishlist(ctx context.Context, limit int) ([]models.Recom
 			}
 		}
 	}`
+	vars := map[string]any{"limit": limit, "statusID": hcStatusWantToRead}
 	var resp struct {
 		Data struct {
 			Me []struct {
@@ -480,7 +501,7 @@ func (c *Client) GetUserWishlist(ctx context.Context, limit int) ([]models.Recom
 			} `json:"me"`
 		} `json:"data"`
 	}
-	if err := c.query(ctx, gql, map[string]any{"limit": limit}, &resp); err != nil {
+	if err := c.query(ctx, gql, vars, &resp); err != nil {
 		return nil, fmt.Errorf("hardcover get wishlist: %w", err)
 	}
 	if len(resp.Data.Me) == 0 {
@@ -521,7 +542,10 @@ type HCList struct {
 	BooksCount int    `json:"booksCount"`
 }
 
-// hcBuiltinShelves are the four standard Hardcover reading-status shelves.
+// hcBuiltinShelves are the four Hardcover reading-status shelves Bindery exposes
+// for list sync. Hardcover also defines Paused (hcStatusPaused), which is not
+// exposed as a synthetic list because existing list sync behavior only surfaces
+// DNF.
 // They live in user_books (filtered by status_id), not in me.lists, so they
 // are injected as synthetic entries using negative IDs to avoid collision with
 // real list IDs.
@@ -536,13 +560,13 @@ var hcBuiltinShelves = []HCList{
 func hcShelfStatusID(listID int) (int, bool) {
 	switch listID {
 	case -1:
-		return 1, true
+		return hcStatusWantToRead, true
 	case -2:
-		return 2, true
+		return hcStatusCurrentlyReading, true
 	case -3:
-		return 3, true
+		return hcStatusRead, true
 	case -4:
-		return 4, true
+		return hcStatusDidNotFinish, true
 	}
 	return 0, false
 }
@@ -620,6 +644,8 @@ func (c *Client) GetListBooks(ctx context.Context, listID int) ([]models.Book, e
 					release_year
 					ratings_count
 					rating
+					default_audio_edition_id
+					default_ebook_edition_id
 					contributions {
 						author { id name slug }
 					}
@@ -663,6 +689,8 @@ func (c *Client) getShelfBooks(ctx context.Context, statusID int) ([]models.Book
 					release_year
 					ratings_count
 					rating
+					default_audio_edition_id
+					default_ebook_edition_id
 					contributions {
 						author { id name slug }
 					}
@@ -805,20 +833,26 @@ type hcContribution struct {
 }
 
 type hcBook struct {
-	ID            int              `json:"id"`
-	Title         string           `json:"title"`
-	Subtitle      string           `json:"subtitle"`
-	Slug          string           `json:"slug"`
-	Description   string           `json:"description"`
-	Image         *hcImage         `json:"image"`
-	ReleaseYear   *int             `json:"release_year"`
-	RatingsCount  int              `json:"ratings_count"`
-	Rating        float64          `json:"rating"`
-	UsersCount    int              `json:"users_count"`
-	Genres        []string         `json:"genres"`
-	AudioSeconds  *int             `json:"audio_seconds"`
-	Contributions []hcContribution `json:"contributions"`
-	AuthorNames   []string         `json:"author_names"`
+	ID                    int              `json:"id"`
+	Title                 string           `json:"title"`
+	Subtitle              string           `json:"subtitle"`
+	Slug                  string           `json:"slug"`
+	Description           string           `json:"description"`
+	Image                 *hcImage         `json:"image"`
+	ReleaseYear           *int             `json:"release_year"`
+	RatingsCount          int              `json:"ratings_count"`
+	Rating                float64          `json:"rating"`
+	UsersCount            int              `json:"users_count"`
+	Genres                []string         `json:"genres"`
+	ISBNs                 []string         `json:"isbns"`
+	HasAudiobook          bool             `json:"has_audiobook"`
+	HasEbook              bool             `json:"has_ebook"`
+	AudioSeconds          *int             `json:"audio_seconds"`
+	DefaultAudioEditionID *int             `json:"default_audio_edition_id"`
+	DefaultEbookEditionID *int             `json:"default_ebook_edition_id"`
+	Contributions         []hcContribution `json:"contributions"`
+	AuthorNames           []string         `json:"author_names"`
+	SeriesRefs            []models.SeriesRef
 }
 
 type hcEdition struct {
@@ -871,18 +905,25 @@ type hcBookSearchHit struct {
 }
 
 type hcBookSearchDocument struct {
-	ID            any                    `json:"id"`
-	Title         string                 `json:"title"`
-	Slug          string                 `json:"slug"`
-	Description   string                 `json:"description"`
-	Image         any                    `json:"image"`
-	ImageURL      string                 `json:"image_url"`
-	CachedImage   any                    `json:"cached_image"`
-	ReleaseYear   any                    `json:"release_year"`
-	RatingsCount  any                    `json:"ratings_count"`
-	Rating        any                    `json:"rating"`
-	Contributions []hcSearchContribution `json:"contributions"`
-	AuthorNames   []string               `json:"author_names"`
+	ID                     any                    `json:"id"`
+	Title                  string                 `json:"title"`
+	Slug                   string                 `json:"slug"`
+	Description            string                 `json:"description"`
+	Image                  any                    `json:"image"`
+	ImageURL               string                 `json:"image_url"`
+	CachedImage            any                    `json:"cached_image"`
+	ReleaseYear            any                    `json:"release_year"`
+	RatingsCount           any                    `json:"ratings_count"`
+	Rating                 any                    `json:"rating"`
+	ISBNs                  any                    `json:"isbns"`
+	Genres                 any                    `json:"genres"`
+	HasAudiobook           any                    `json:"has_audiobook"`
+	HasEbook               any                    `json:"has_ebook"`
+	FeaturedSeries         any                    `json:"featured_series"`
+	FeaturedSeriesID       any                    `json:"featured_series_id"`
+	FeaturedSeriesPosition any                    `json:"featured_series_position"`
+	Contributions          []hcSearchContribution `json:"contributions"`
+	AuthorNames            []string               `json:"author_names"`
 }
 
 type hcSearchContribution struct {
@@ -997,6 +1038,11 @@ func bookSearchDocumentToBook(doc hcBookSearchDocument) (hcBook, bool) {
 		ReleaseYear:   searchIntPtr(doc.ReleaseYear),
 		RatingsCount:  searchIntValue(doc.RatingsCount),
 		Rating:        searchFloatValue(doc.Rating),
+		ISBNs:         searchISBNList(doc.ISBNs),
+		Genres:        searchStringList(doc.Genres, nil),
+		HasAudiobook:  searchBool(doc.HasAudiobook),
+		HasEbook:      searchBool(doc.HasEbook),
+		SeriesRefs:    searchSeriesRefs(doc.FeaturedSeries, doc.FeaturedSeriesID, doc.FeaturedSeriesPosition),
 		Contributions: make([]hcContribution, 0, len(doc.Contributions)),
 		AuthorNames:   doc.AuthorNames,
 	}
@@ -1085,6 +1131,185 @@ func searchFloatValue(value any) float64 {
 	}
 }
 
+func searchISBNList(value any) []string {
+	return searchStringList(value, isbnutil.Normalize)
+}
+
+func searchStringList(value any, normalize func(string) string) []string {
+	var out []string
+	seen := make(map[string]struct{})
+	var add func(any)
+	add = func(item any) {
+		switch v := item.(type) {
+		case nil:
+			return
+		case []any:
+			for _, elem := range v {
+				add(elem)
+			}
+		case []string:
+			for _, elem := range v {
+				add(elem)
+			}
+		case string:
+			value := strings.TrimSpace(v)
+			if strings.HasPrefix(value, "[") {
+				var nested []any
+				if err := json.Unmarshal([]byte(value), &nested); err == nil {
+					add(nested)
+					return
+				}
+			}
+			if normalize != nil {
+				value = normalize(value)
+			}
+			value = strings.TrimSpace(value)
+			if value == "" {
+				return
+			}
+			key := strings.ToLower(value)
+			if _, ok := seen[key]; ok {
+				return
+			}
+			seen[key] = struct{}{}
+			out = append(out, value)
+		case json.Number:
+			add(v.String())
+		case float64:
+			add(strconv.FormatFloat(v, 'f', -1, 64))
+		case float32:
+			add(strconv.FormatFloat(float64(v), 'f', -1, 32))
+		case int:
+			add(strconv.Itoa(v))
+		case int8:
+			add(strconv.FormatInt(int64(v), 10))
+		case int16:
+			add(strconv.FormatInt(int64(v), 10))
+		case int32:
+			add(strconv.FormatInt(int64(v), 10))
+		case int64:
+			add(strconv.FormatInt(v, 10))
+		case uint:
+			add(strconv.FormatUint(uint64(v), 10))
+		case uint8:
+			add(strconv.FormatUint(uint64(v), 10))
+		case uint16:
+			add(strconv.FormatUint(uint64(v), 10))
+		case uint32:
+			add(strconv.FormatUint(uint64(v), 10))
+		case uint64:
+			add(strconv.FormatUint(v, 10))
+		default:
+			return
+		}
+	}
+	add(value)
+	return out
+}
+
+func searchBool(value any) bool {
+	switch v := value.(type) {
+	case nil:
+		return false
+	case bool:
+		return v
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "t", "true", "y", "yes":
+			return true
+		default:
+			return false
+		}
+	case json.Number:
+		i, err := strconv.Atoi(v.String())
+		return err == nil && i != 0
+	case float64:
+		return v != 0
+	case int:
+		return v != 0
+	default:
+		return searchBool(searchScalarString(v))
+	}
+}
+
+func searchSeriesRefs(seriesValue, idValue, positionValue any) []models.SeriesRef {
+	title, id := searchFeaturedSeries(seriesValue)
+	if id == "" {
+		id = searchNumericSeriesID(idValue)
+	}
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return nil
+	}
+	if id == "" {
+		slog.Debug("dropping Hardcover search series ref without numeric id", "title", title, "id", idValue)
+		return nil
+	}
+	return []models.SeriesRef{{
+		ForeignID: seriesIDPrefix + id,
+		Title:     title,
+		Position:  formatSeriesPosition(positionValue),
+		Primary:   true,
+	}}
+}
+
+func searchFeaturedSeries(value any) (string, string) {
+	switch v := value.(type) {
+	case nil:
+		return "", ""
+	case string:
+		return strings.TrimSpace(v), ""
+	case map[string]any:
+		title := firstNonEmpty(
+			searchScalarString(v["name"]),
+			searchScalarString(v["title"]),
+			searchScalarString(v["series"]),
+		)
+		id := firstNonEmpty(
+			searchNumericSeriesID(v["id"]),
+			searchNumericSeriesID(v["series_id"]),
+		)
+		return title, id
+	case []any:
+		for _, item := range v {
+			title, id := searchFeaturedSeries(item)
+			if strings.TrimSpace(title) != "" {
+				return title, id
+			}
+		}
+	}
+	return "", ""
+}
+
+func searchNumericSeriesID(value any) string {
+	id, ok := searchInt(value)
+	if !ok || id <= 0 {
+		return ""
+	}
+	return strconv.Itoa(id)
+}
+
+func searchScalarString(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(v)
+	case json.Number:
+		return strings.TrimSpace(v.String())
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case float32:
+		return strconv.FormatFloat(float64(v), 'f', -1, 32)
+	case int:
+		return strconv.Itoa(v)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	default:
+		return strings.TrimSpace(fmt.Sprint(v))
+	}
+}
+
 // --- Converters ---
 
 func (c *Client) toAuthor(a hcAuthor) models.Author {
@@ -1121,9 +1346,21 @@ func (c *Client) toBook(b hcBook) models.Book {
 		Monitored:        true,
 		Status:           models.BookStatusWanted,
 		Genres:           []string{},
+		ISBNs:            b.ISBNs,
+		SeriesRefs:       b.SeriesRefs,
 	}
 	if len(b.Genres) > 0 {
 		bk.Genres = b.Genres
+	}
+	hasAudiobook := b.HasAudiobook || hasPositiveInt(b.DefaultAudioEditionID)
+	hasEbook := b.HasEbook || hasPositiveInt(b.DefaultEbookEditionID)
+	switch {
+	case hasAudiobook && hasEbook:
+		bk.MediaType = models.MediaTypeBoth
+	case hasAudiobook:
+		bk.MediaType = models.MediaTypeAudiobook
+	case hasEbook:
+		bk.MediaType = models.MediaTypeEbook
 	}
 	if b.Image != nil {
 		bk.ImageURL = b.Image.URL
@@ -1153,6 +1390,10 @@ func (c *Client) toBook(b hcBook) models.Book {
 		}
 	}
 	return bk
+}
+
+func hasPositiveInt(value *int) bool {
+	return value != nil && *value > 0
 }
 
 func hardcoverEditionToModel(e hcEdition) models.Edition {
