@@ -165,8 +165,14 @@ func (i *Importer) pathAllowedForBook(ctx context.Context, author *models.Author
 }
 
 func (i *Importer) allowedRootsForBook(ctx context.Context, author *models.Author, format string) []string {
-	roots := make([]string, 0, 3)
+	roots := make([]string, 0, 4)
 	if format == models.MediaTypeAudiobook {
+		// Per-author audiobook root folder (#579), then the global audiobook
+		// dir. Both must be accepted so an audiobook stored under an author's
+		// override is recognised as inside Bindery storage.
+		if root := strings.TrimSpace(i.effectiveAudiobookDir(ctx, author)); root != "" {
+			roots = append(roots, filepath.Clean(root))
+		}
 		if root := strings.TrimSpace(i.audiobookDir); root != "" {
 			roots = append(roots, filepath.Clean(root))
 		}
@@ -180,6 +186,21 @@ func (i *Importer) allowedRootsForBook(ctx context.Context, author *models.Autho
 		}
 	}
 	return dedupeCleanPaths(roots)
+}
+
+// effectiveAudiobookDir returns the audiobook root for the given author:
+// the per-author AudiobookRootFolderID when set (#579), else the global
+// audiobookDir. It deliberately does not consult the ebook RootFolderID so an
+// ebook root folder never widens audiobook acceptance into the ebook tree
+// (#421). author may be nil (e.g. inspectFormatPath has no author context),
+// in which case only the global dir applies.
+func (i *Importer) effectiveAudiobookDir(ctx context.Context, author *models.Author) string {
+	if author != nil && author.AudiobookRootFolderID != nil && i.rootFolders != nil {
+		if root, err := i.rootFolders.GetByID(ctx, *author.AudiobookRootFolderID); err == nil && root != nil {
+			return root.Path
+		}
+	}
+	return i.audiobookDir
 }
 
 func (i *Importer) effectiveLibraryDir(ctx context.Context, author *models.Author) string {

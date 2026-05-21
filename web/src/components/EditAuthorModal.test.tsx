@@ -67,12 +67,13 @@ describe('EditAuthorModal', () => {
   })
 
   async function getSelects() {
-    // Wait for profiles to load — once they do all three selects render.
+    // Wait for profiles to load — once they do all four selects render
+    // (quality, metadata, ebook root folder, audiobook root folder).
     await screen.findByRole('option', { name: 'Any' })
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[]
-    expect(selects).toHaveLength(3)
-    const [quality, metadata, root] = selects
-    return { quality, metadata, root }
+    expect(selects).toHaveLength(4)
+    const [quality, metadata, root, audiobookRoot] = selects
+    return { quality, metadata, root, audiobookRoot }
   }
 
   it('opens with the current author values prefilled', async () => {
@@ -98,6 +99,44 @@ describe('EditAuthorModal', () => {
     const callArg = vi.mocked(api.updateAuthor).mock.calls[0][1] as Record<string, unknown>
     expect('metadataProfileId' in callArg).toBe(false)
     expect('rootFolderId' in callArg).toBe(false)
+    expect('audiobookRootFolderId' in callArg).toBe(false)
+    expect('clearAudiobookRootFolder' in callArg).toBe(false)
+  })
+
+  it('prefills the audiobook root folder and sends it when changed', async () => {
+    render(
+      <EditAuthorModal
+        author={{ ...baseAuthor, audiobookRootFolderId: 100 }}
+        onClose={onClose}
+        onSaved={onSaved}
+      />,
+    )
+
+    const { audiobookRoot } = await getSelects()
+    expect(audiobookRoot.value).toBe('100')
+
+    fireEvent.change(audiobookRoot, { target: { value: '101' } })
+    fireEvent.click(screen.getByRole('button', { name: /^save$/i }))
+
+    await waitFor(() => expect(api.updateAuthor).toHaveBeenCalledTimes(1))
+    expect(api.updateAuthor).toHaveBeenCalledWith(42, { audiobookRootFolderId: 101 })
+  })
+
+  it('sends the clear flag when the audiobook root folder is reset to the global folder', async () => {
+    render(
+      <EditAuthorModal
+        author={{ ...baseAuthor, audiobookRootFolderId: 100 }}
+        onClose={onClose}
+        onSaved={onSaved}
+      />,
+    )
+
+    const { audiobookRoot } = await getSelects()
+    fireEvent.change(audiobookRoot, { target: { value: '' } })
+    fireEvent.click(screen.getByRole('button', { name: /^save$/i }))
+
+    await waitFor(() => expect(api.updateAuthor).toHaveBeenCalledTimes(1))
+    expect(api.updateAuthor).toHaveBeenCalledWith(42, { clearAudiobookRootFolder: true })
   })
 
   it('passes the updated author to onSaved after a successful save', async () => {

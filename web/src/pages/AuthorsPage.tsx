@@ -66,7 +66,7 @@ export default function AuthorsPage() {
   }
 
   const handleToggleMonitored = async (author: Author) => {
-    await api.updateAuthor(author.id, { monitored: !author.monitored } as Partial<Author>)
+    await api.updateAuthor(author.id, { monitored: !author.monitored })
     load()
   }
 
