@@ -111,14 +111,15 @@ func (h *AuthorHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 func (h *AuthorHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ForeignID         string `json:"foreignAuthorId"`
-		Name              string `json:"authorName"`
-		QualityProfileID  *int64 `json:"qualityProfileId"`
-		MetadataProfileID *int64 `json:"metadataProfileId"`
-		RootFolderID      *int64 `json:"rootFolderId"`
-		Monitored         bool   `json:"monitored"`
-		SearchOnAdd       bool   `json:"searchOnAdd"`
-		MediaType         string `json:"mediaType"`
+		ForeignID             string `json:"foreignAuthorId"`
+		Name                  string `json:"authorName"`
+		QualityProfileID      *int64 `json:"qualityProfileId"`
+		MetadataProfileID     *int64 `json:"metadataProfileId"`
+		RootFolderID          *int64 `json:"rootFolderId"`
+		AudiobookRootFolderID *int64 `json:"audiobookRootFolderId"`
+		Monitored             bool   `json:"monitored"`
+		SearchOnAdd           bool   `json:"searchOnAdd"`
+		MediaType             string `json:"mediaType"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -158,7 +159,7 @@ func (h *AuthorHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	} else if canonical != nil {
 		if canRelinkAuthorToUpstream(canonical) {
-			if err := h.relinkExistingAuthorToUpstream(r.Context(), canonical, author, req.Name, req.Monitored, req.QualityProfileID, req.MetadataProfileID, req.RootFolderID); err != nil {
+			if err := h.relinkExistingAuthorToUpstream(r.Context(), canonical, author, req.Name, req.Monitored, req.QualityProfileID, req.MetadataProfileID, req.RootFolderID, req.AudiobookRootFolderID); err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 				return
 			}
@@ -174,7 +175,7 @@ func (h *AuthorHandler) Create(w http.ResponseWriter, r *http.Request) {
 		h.writeCanonicalAuthorConflict(w, canonical, "author name already resolves to an existing author — confirm merge")
 		return
 	}
-	applyAuthorCreateOptions(author, req.Monitored, req.QualityProfileID, req.MetadataProfileID, req.RootFolderID)
+	applyAuthorCreateOptions(author, req.Monitored, req.QualityProfileID, req.MetadataProfileID, req.RootFolderID, req.AudiobookRootFolderID)
 
 	if err := h.authors.CreateForUser(r.Context(), author, auth.UserIDFromContext(r.Context())); err != nil {
 		slog.Error("create author failed", "foreign_id", req.ForeignID, "error", err)
@@ -259,10 +260,11 @@ func (h *AuthorHandler) fetchAuthorForCreate(ctx context.Context, foreignID, fal
 	return author, nil
 }
 
-func applyAuthorCreateOptions(author *models.Author, monitored bool, qualityProfileID, metadataProfileID, rootFolderID *int64) {
+func applyAuthorCreateOptions(author *models.Author, monitored bool, qualityProfileID, metadataProfileID, rootFolderID, audiobookRootFolderID *int64) {
 	author.Monitored = monitored
 	author.QualityProfileID = qualityProfileID
 	author.RootFolderID = rootFolderID
+	author.AudiobookRootFolderID = audiobookRootFolderID
 	// Default to the seeded "Standard" profile (id=1) so the language filter
 	// has something to consult when the UI didn't send an explicit choice.
 	// The client can opt out by sending a profile whose allowed_languages is
@@ -284,7 +286,7 @@ func canRelinkAuthorToUpstream(author *models.Author) bool {
 	return foreignID == "" || strings.HasPrefix(foreignID, "abs:") || provider == "audiobookshelf"
 }
 
-func (h *AuthorHandler) relinkExistingAuthorToUpstream(ctx context.Context, author, upstream *models.Author, requestedName string, monitored bool, qualityProfileID, metadataProfileID, rootFolderID *int64) error {
+func (h *AuthorHandler) relinkExistingAuthorToUpstream(ctx context.Context, author, upstream *models.Author, requestedName string, monitored bool, qualityProfileID, metadataProfileID, rootFolderID, audiobookRootFolderID *int64) error {
 	if author == nil || upstream == nil {
 		return errors.New("author relink requires local and upstream authors")
 	}
@@ -320,7 +322,7 @@ func (h *AuthorHandler) relinkExistingAuthorToUpstream(ctx context.Context, auth
 	} else {
 		author.MetadataProvider = "openlibrary"
 	}
-	applyAuthorCreateOptions(author, monitored, qualityProfileID, metadataProfileID, rootFolderID)
+	applyAuthorCreateOptions(author, monitored, qualityProfileID, metadataProfileID, rootFolderID, audiobookRootFolderID)
 	now := time.Now().UTC()
 	author.LastMetadataRefreshAt = &now
 	if err := h.authors.Update(ctx, author); err != nil {
@@ -487,10 +489,16 @@ func (h *AuthorHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Monitored         *bool  `json:"monitored"`
-		QualityProfileID  *int64 `json:"qualityProfileId"`
-		MetadataProfileID *int64 `json:"metadataProfileId"`
-		RootFolderID      *int64 `json:"rootFolderId"`
+		Monitored             *bool  `json:"monitored"`
+		QualityProfileID      *int64 `json:"qualityProfileId"`
+		MetadataProfileID     *int64 `json:"metadataProfileId"`
+		RootFolderID          *int64 `json:"rootFolderId"`
+		AudiobookRootFolderID *int64 `json:"audiobookRootFolderId"`
+		// ClearAudiobookRootFolder lets the client explicitly reset the
+		// per-author audiobook root folder to "use the global dir". A nil
+		// AudiobookRootFolderID alone is ambiguous (omitted vs. cleared), so
+		// the UI sends this flag when the user picks the default option.
+		ClearAudiobookRootFolder bool `json:"clearAudiobookRootFolder"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -507,6 +515,11 @@ func (h *AuthorHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.RootFolderID != nil {
 		author.RootFolderID = req.RootFolderID
+	}
+	if req.AudiobookRootFolderID != nil {
+		author.AudiobookRootFolderID = req.AudiobookRootFolderID
+	} else if req.ClearAudiobookRootFolder {
+		author.AudiobookRootFolderID = nil
 	}
 
 	if err := h.authors.Update(r.Context(), author); err != nil {
@@ -576,7 +589,7 @@ func (h *AuthorHandler) RelinkUpstream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.relinkExistingAuthorToUpstream(r.Context(), author, upstream, author.Name, author.Monitored, author.QualityProfileID, author.MetadataProfileID, author.RootFolderID); err != nil {
+	if err := h.relinkExistingAuthorToUpstream(r.Context(), author, upstream, author.Name, author.Monitored, author.QualityProfileID, author.MetadataProfileID, author.RootFolderID, author.AudiobookRootFolderID); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}

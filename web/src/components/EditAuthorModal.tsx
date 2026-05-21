@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { api, Author, MetadataProfile, QualityProfile, RootFolder } from '../api/client'
+import { api, Author, MetadataProfile, QualityProfile, RootFolder, UpdateAuthorRequest } from '../api/client'
 
 interface Props {
   author: Author
@@ -18,6 +18,7 @@ export default function EditAuthorModal({ author, onClose, onSaved }: Props) {
   const [qualityProfileId, setQualityProfileId] = useState<number | null>(author.qualityProfileId ?? null)
   const [metadataProfileId, setMetadataProfileId] = useState<number | null>(author.metadataProfileId ?? null)
   const [rootFolderId, setRootFolderId] = useState<number | null>(author.rootFolderId ?? null)
+  const [audiobookRootFolderId, setAudiobookRootFolderId] = useState<number | null>(author.audiobookRootFolderId ?? null)
 
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -43,7 +44,7 @@ export default function EditAuthorModal({ author, onClose, onSaved }: Props) {
   const save = async () => {
     // Build a patch with only the fields that actually changed — sending
     // unchanged values is functionally fine but produces noisy log lines.
-    const patch: Partial<Author> = {}
+    const patch: UpdateAuthorRequest = {}
     if (qualityProfileId !== (author.qualityProfileId ?? null)) {
       patch.qualityProfileId = qualityProfileId
     }
@@ -52,6 +53,16 @@ export default function EditAuthorModal({ author, onClose, onSaved }: Props) {
     }
     if (rootFolderId !== (author.rootFolderId ?? null)) {
       patch.rootFolderId = rootFolderId
+    }
+    if (audiobookRootFolderId !== (author.audiobookRootFolderId ?? null)) {
+      // A null audiobookRootFolderId is indistinguishable from "omitted" once
+      // serialised, so resetting to the global dir is signalled by an explicit
+      // flag the backend honours separately.
+      if (audiobookRootFolderId === null) {
+        patch.clearAudiobookRootFolder = true
+      } else {
+        patch.audiobookRootFolderId = audiobookRootFolderId
+      }
     }
 
     if (Object.keys(patch).length === 0) {
@@ -125,6 +136,22 @@ export default function EditAuthorModal({ author, onClose, onSaved }: Props) {
                       <option key={rf.id} value={rf.id}>{rf.path}</option>
                     ))}
                   </select>
+                </div>
+              )}
+              {rootFolders.length > 0 && (
+                <div className="mb-3">
+                  <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">{t('editAuthorModal.audiobookRootFolder', 'Audiobook root folder')}</label>
+                  <select
+                    value={audiobookRootFolderId ?? ''}
+                    onChange={e => setAudiobookRootFolderId(e.target.value ? Number(e.target.value) : null)}
+                    className="w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-emerald-500"
+                  >
+                    <option value="">{t('editAuthorModal.audiobookRootFolderDefault', 'Use global audiobook folder')}</option>
+                    {rootFolders.map(rf => (
+                      <option key={rf.id} value={rf.id}>{rf.path}</option>
+                    ))}
+                  </select>
+                  <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">{t('editAuthorModal.audiobookRootFolderHint', "Where this author's audiobooks are stored. Separate from the ebook root folder.")}</p>
                 </div>
               )}
               {error && (

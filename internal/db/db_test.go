@@ -139,6 +139,71 @@ func TestMigrate033ABSReviewResolutionIdempotent(t *testing.T) {
 	}
 }
 
+// TestMigrate042AuthorAudiobookRootFolder verifies migration 042 adds the
+// audiobook_root_folder_id column to the authors table (#579) and that the
+// column round-trips a value through CreateForUser / GetByID.
+func TestMigrate042AuthorAudiobookRootFolder(t *testing.T) {
+	database, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("open memory db: %v", err)
+	}
+	defer database.Close()
+
+	var name string
+	if err := database.QueryRow(
+		`SELECT name FROM pragma_table_info('authors') WHERE name = 'audiobook_root_folder_id'`,
+	).Scan(&name); err != nil {
+		t.Fatalf("authors.audiobook_root_folder_id column missing after migration: %v", err)
+	}
+
+	// Re-running migrate must not fail — ALTER TABLE ADD COLUMN is not
+	// idempotent in SQLite, so this confirms the schema_migrations marker
+	// guards the re-run.
+	if err := migrate(database); err != nil {
+		t.Fatalf("rerun migrations should be idempotent: %v", err)
+	}
+
+	// Round-trip the new field through the repo.
+	ctx := context.Background()
+	rf := NewRootFolderRepo(database)
+	folder, err := rf.Create(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("create root folder: %v", err)
+	}
+
+	authors := NewAuthorRepo(database)
+	author := &models.Author{
+		ForeignID:             "OL-ab-root-042",
+		Name:                  "Audiobook Author",
+		SortName:              "Author, Audiobook",
+		AudiobookRootFolderID: &folder.ID,
+	}
+	if err := authors.Create(ctx, author); err != nil {
+		t.Fatalf("create author: %v", err)
+	}
+
+	got, err := authors.GetByID(ctx, author.ID)
+	if err != nil || got == nil {
+		t.Fatalf("get author: %v", err)
+	}
+	if got.AudiobookRootFolderID == nil || *got.AudiobookRootFolderID != folder.ID {
+		t.Fatalf("AudiobookRootFolderID not persisted: want %d, got %v", folder.ID, got.AudiobookRootFolderID)
+	}
+
+	// Updating it to nil must clear it.
+	got.AudiobookRootFolderID = nil
+	if err := authors.Update(ctx, got); err != nil {
+		t.Fatalf("update author: %v", err)
+	}
+	reloaded, err := authors.GetByID(ctx, author.ID)
+	if err != nil || reloaded == nil {
+		t.Fatalf("reload author: %v", err)
+	}
+	if reloaded.AudiobookRootFolderID != nil {
+		t.Fatalf("AudiobookRootFolderID should be nil after clear, got %v", *reloaded.AudiobookRootFolderID)
+	}
+}
+
 func migrationVersionForTest(t *testing.T, filename string) int {
 	t.Helper()
 	v, err := migrationVersion(filename)

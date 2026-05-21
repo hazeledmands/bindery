@@ -215,6 +215,210 @@ func TestEffectiveLibraryDir_AuthorRootFolderTakesPriorityOverDefault(t *testing
 	}
 }
 
+// scannerWithRootFoldersAndAudiobookDir builds a Scanner wired to a real
+// in-memory DB with a RootFolderRepo, libraryDir and a distinct audiobookDir so
+// effectiveAudiobookDir resolution can be exercised end-to-end (#579).
+func scannerWithRootFoldersAndAudiobookDir(t *testing.T, libraryDir, audiobookDir string) (*Scanner, *db.RootFolderRepo, context.Context) {
+	t.Helper()
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+
+	books := db.NewBookRepo(database)
+	authors := db.NewAuthorRepo(database)
+	history := db.NewHistoryRepo(database)
+	downloads := db.NewDownloadRepo(database)
+	clients := db.NewDownloadClientRepo(database)
+	rf := db.NewRootFolderRepo(database)
+
+	s := NewScanner(downloads, clients, books, authors, history, libraryDir, audiobookDir, "", "", "")
+	s.WithRootFolders(rf)
+	return s, rf, context.Background()
+}
+
+func TestEffectiveAudiobookDir_NilAuthor(t *testing.T) {
+	s, _, ctx := scannerWithRootFoldersAndAudiobookDir(t, "/default/lib", "/default/audiobooks")
+	got := s.effectiveAudiobookDir(ctx, nil)
+	if got != "/default/audiobooks" {
+		t.Errorf("nil author: want /default/audiobooks, got %q", got)
+	}
+}
+
+func TestEffectiveAudiobookDir_AuthorNoAudiobookRootFolder(t *testing.T) {
+	s, _, ctx := scannerWithRootFoldersAndAudiobookDir(t, "/default/lib", "/default/audiobooks")
+	author := &models.Author{AudiobookRootFolderID: nil}
+	got := s.effectiveAudiobookDir(ctx, author)
+	if got != "/default/audiobooks" {
+		t.Errorf("author with nil AudiobookRootFolderID: want /default/audiobooks, got %q", got)
+	}
+}
+
+func TestEffectiveAudiobookDir_AuthorWithAudiobookRootFolder(t *testing.T) {
+	dir := t.TempDir()
+	s, rf, ctx := scannerWithRootFoldersAndAudiobookDir(t, "/default/lib", "/default/audiobooks")
+
+	created, err := rf.Create(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	author := &models.Author{AudiobookRootFolderID: &created.ID}
+	got := s.effectiveAudiobookDir(ctx, author)
+	if got != dir {
+		t.Errorf("author with AudiobookRootFolderID: want %q, got %q", dir, got)
+	}
+}
+
+// TestEffectiveAudiobookDir_IgnoresEbookRootFolder is the #421 guarantee at the
+// resolver level: an author with an ebook RootFolderID but no audiobook
+// override must still resolve to the global audiobook dir.
+func TestEffectiveAudiobookDir_IgnoresEbookRootFolder(t *testing.T) {
+	ebookDir := t.TempDir()
+	s, rf, ctx := scannerWithRootFoldersAndAudiobookDir(t, "/default/lib", "/default/audiobooks")
+
+	ebookRF, err := rf.Create(ctx, ebookDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Ebook root folder set, audiobook root folder NOT set.
+	author := &models.Author{RootFolderID: &ebookRF.ID}
+	got := s.effectiveAudiobookDir(ctx, author)
+	if got != "/default/audiobooks" {
+		t.Errorf("ebook root folder must not redirect audiobooks (#421): want /default/audiobooks, got %q", got)
+	}
+}
+
+func TestEffectiveAudiobookDir_DeletedRootFolderFallsBack(t *testing.T) {
+	dir := t.TempDir()
+	s, rf, ctx := scannerWithRootFoldersAndAudiobookDir(t, "/default/lib", "/default/audiobooks")
+
+	created, err := rf.Create(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rf.Delete(ctx, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	author := &models.Author{AudiobookRootFolderID: &created.ID}
+	got := s.effectiveAudiobookDir(ctx, author)
+	if got != "/default/audiobooks" {
+		t.Errorf("deleted audiobook root folder: want /default/audiobooks, got %q", got)
+	}
+}
+
+func TestEffectiveAudiobookDir_NoRootFolderRepo(t *testing.T) {
+	// Scanner without WithRootFolders — should always use audiobookDir.
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+
+	books := db.NewBookRepo(database)
+	authors := db.NewAuthorRepo(database)
+	history := db.NewHistoryRepo(database)
+	downloads := db.NewDownloadRepo(database)
+	clients := db.NewDownloadClientRepo(database)
+	s := NewScanner(downloads, clients, books, authors, history, "/default/lib", "/default/audiobooks", "", "", "")
+	// No WithRootFolders call — rootFolders field is nil.
+
+	id := int64(42)
+	author := &models.Author{AudiobookRootFolderID: &id}
+	got := s.effectiveAudiobookDir(context.Background(), author)
+	if got != "/default/audiobooks" {
+		t.Errorf("no repo: want /default/audiobooks, got %q", got)
+	}
+}
+
+// TestAudiobookImport_UsesPerAuthorAudiobookRootFolder verifies the end-to-end
+// placement path: when an author has an audiobook root folder set, the imported
+// audiobook lands under it rather than the global BINDERY_AUDIOBOOK_DIR (#579).
+func TestAudiobookImport_UsesPerAuthorAudiobookRootFolder(t *testing.T) {
+	perAuthorAudiobookDir := t.TempDir() // author's audiobook root folder
+	globalAudiobookDir := t.TempDir()    // BINDERY_AUDIOBOOK_DIR
+	libraryDir := t.TempDir()
+
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+
+	books := db.NewBookRepo(database)
+	authors := db.NewAuthorRepo(database)
+	history := db.NewHistoryRepo(database)
+	downloads := db.NewDownloadRepo(database)
+	clients := db.NewDownloadClientRepo(database)
+	rf := db.NewRootFolderRepo(database)
+
+	s := NewScanner(downloads, clients, books, authors, history, libraryDir, globalAudiobookDir, "", "", "")
+	s.WithRootFolders(rf)
+
+	ctx := context.Background()
+
+	audiobookRF, err := rf.Create(ctx, perAuthorAudiobookDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	author := &models.Author{
+		ForeignID:             "OL-ab-rf-author",
+		Name:                  "Test Author",
+		SortName:              "Author, Test",
+		AudiobookRootFolderID: &audiobookRF.ID,
+	}
+	if err := authors.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+
+	book := &models.Book{
+		ForeignID: "OL-ab-rf-book",
+		AuthorID:  author.ID,
+		Title:     "Per-Author Audiobook",
+		Status:    models.BookStatusWanted,
+		MediaType: models.MediaTypeAudiobook,
+	}
+	if err := books.Create(ctx, book); err != nil {
+		t.Fatal(err)
+	}
+
+	dl := &models.Download{
+		GUID:   "guid-ab-per-author-rf",
+		Title:  book.Title,
+		BookID: &book.ID,
+		Status: models.StateCompleted,
+		NZBURL: "fake://url",
+	}
+	if err := downloads.Create(ctx, dl); err != nil {
+		t.Fatal(err)
+	}
+
+	downloadPath := t.TempDir()
+	m4bFile := filepath.Join(downloadPath, "audiobook.m4b")
+	if err := os.WriteFile(m4bFile, []byte("fake m4b"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s.tryImportInternal(ctx, dl, downloadPath, "", "", nil)
+
+	got, err := books.GetByID(ctx, book.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AudiobookFilePath == "" {
+		t.Fatal("AudiobookFilePath is empty — import did not complete")
+	}
+	if !strings.HasPrefix(got.AudiobookFilePath, perAuthorAudiobookDir) {
+		t.Errorf("audiobook landed in %q; want path under per-author audiobook root folder %q",
+			got.AudiobookFilePath, perAuthorAudiobookDir)
+	}
+	if strings.HasPrefix(got.AudiobookFilePath, globalAudiobookDir) {
+		t.Errorf("audiobook landed in global audiobook dir %q — per-author override was ignored (#579)",
+			got.AudiobookFilePath)
+	}
+}
+
 // TestAudiobookImport_UsesAudiobookDirNotEbookRoot is a regression test for
 // issue #421. When an author has a per-author ebook root folder set,
 // audiobooks must still be placed under BINDERY_AUDIOBOOK_DIR (s.audiobookDir)

@@ -151,7 +151,7 @@ export default function AuthorDetailPage() {
   const handleToggleMonitored = async () => {
     if (!author) return
     try {
-      await api.updateAuthor(author.id, { monitored: !author.monitored } as Partial<Author>)
+      await api.updateAuthor(author.id, { monitored: !author.monitored })
       setAuthor({ ...author, monitored: !author.monitored })
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Update failed')

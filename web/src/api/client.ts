@@ -256,7 +256,7 @@ export const api = {
   listAuthors: () => request<Author[]>('/author'),
   getAuthor: (id: number) => request<Author>(`/author/${id}`),
   addAuthor: (data: AddAuthorRequest) => request<Author>('/author', { method: 'POST', body: JSON.stringify(data) }),
-  updateAuthor: (id: number, data: Partial<Author>) => request<Author>(`/author/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  updateAuthor: (id: number, data: UpdateAuthorRequest) => request<Author>(`/author/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteAuthor: (id: number, deleteFiles = false) =>
     request<void>(`/author/${id}${deleteFiles ? '?deleteFiles=true' : ''}`, { method: 'DELETE' }),
   refreshAuthor: (id: number) => request<void>(`/author/${id}/refresh`, { method: 'POST' }),
@@ -536,6 +536,7 @@ export interface Author {
   qualityProfileId?: number | null
   metadataProfileId?: number | null
   rootFolderId?: number | null
+  audiobookRootFolderId?: number | null
   books?: Book[]
   statistics?: { bookCount: number; availableBookCount: number; wantedBookCount: number }
   aliases?: AuthorAlias[]
@@ -1057,6 +1058,19 @@ export interface AddAuthorRequest {
   qualityProfileId?: number | null
   rootFolderId?: number | null
   mediaType?: MediaType
+}
+
+// UpdateAuthorRequest is a partial author patch. clearAudiobookRootFolder is a
+// separate flag because a null audiobookRootFolderId is ambiguous over the wire
+// (omitted vs. cleared): the backend only resets the per-author audiobook root
+// folder when this flag is true.
+export interface UpdateAuthorRequest {
+  monitored?: boolean
+  qualityProfileId?: number | null
+  metadataProfileId?: number | null
+  rootFolderId?: number | null
+  audiobookRootFolderId?: number | null
+  clearAudiobookRootFolder?: boolean
 }
 
 export interface GrabRequest {

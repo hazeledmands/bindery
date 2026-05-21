@@ -5,19 +5,24 @@ package models
 import "time"
 
 type Author struct {
-	ID                    int64      `json:"id"`
-	ForeignID             string     `json:"foreignAuthorId"`
-	Name                  string     `json:"authorName"`
-	SortName              string     `json:"sortName"`
-	Description           string     `json:"description"`
-	ImageURL              string     `json:"imageUrl"`
-	Disambiguation        string     `json:"disambiguation"`
-	RatingsCount          int        `json:"ratingsCount"`
-	AverageRating         float64    `json:"averageRating"`
-	Monitored             bool       `json:"monitored"`
-	QualityProfileID      *int64     `json:"qualityProfileId"`
-	MetadataProfileID     *int64     `json:"metadataProfileId"`
-	RootFolderID          *int64     `json:"rootFolderId"`
+	ID                int64   `json:"id"`
+	ForeignID         string  `json:"foreignAuthorId"`
+	Name              string  `json:"authorName"`
+	SortName          string  `json:"sortName"`
+	Description       string  `json:"description"`
+	ImageURL          string  `json:"imageUrl"`
+	Disambiguation    string  `json:"disambiguation"`
+	RatingsCount      int     `json:"ratingsCount"`
+	AverageRating     float64 `json:"averageRating"`
+	Monitored         bool    `json:"monitored"`
+	QualityProfileID  *int64  `json:"qualityProfileId"`
+	MetadataProfileID *int64  `json:"metadataProfileId"`
+	RootFolderID      *int64  `json:"rootFolderId"`
+	// AudiobookRootFolderID overrides the audiobook destination for this
+	// author. Distinct from RootFolderID, which only routes ebooks: keeping
+	// them separate ensures an ebook root folder never redirects audiobooks
+	// (#421). Nil falls back to the global audiobook library dir.
+	AudiobookRootFolderID *int64     `json:"audiobookRootFolderId"`
 	MetadataProvider      string     `json:"metadataProvider"`
 	LastMetadataRefreshAt *time.Time `json:"lastMetadataRefreshAt"`
 	CreatedAt             time.Time  `json:"createdAt"`
