@@ -593,6 +593,9 @@ func main() {
 		WithAppContext(appCtx)
 	imageProxyHandler := api.NewImageProxyHandler(cfg.DataDir)
 	imageProxyHandler.StartEviction(24 * time.Hour)
+	// Proxied cover URLs must carry the path prefix so they resolve under a
+	// subpath deploy (BINDERY_URL_BASE). No-op when URLBase is empty.
+	api.SetImageProxyBase(cfg.URLBase)
 	migrateHandler := api.NewMigrateHandler(
 		authorRepo, indexerRepo, dlClientRepo, blocklistRepo, bookRepo, metaAgg,
 		// Bulk imports always populate the catalogue but never auto-grab.
@@ -998,22 +1001,32 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Build the index.html payload once at startup. The backend injects two
-	// things before </head>:
+	// Build the index.html payload once at startup. injectBaseHTML prepends two
+	// things to <head> (see that function for why position matters):
 	//   1. <base href="<URLBase>/"> so that Vite's relative asset URLs
 	//      (./assets/…) resolve correctly regardless of which SPA route the
 	//      browser navigates to directly.
-	//   2. window.__BINDERY_BASE__ so the frontend can set BrowserRouter
-	//      basename and prefix API calls without a per-deployment build.
+	//   2. window.__BINDERY_BASE__ (via __bindery_base.js) so the frontend can
+	//      set BrowserRouter basename and prefix API calls without a
+	//      per-deployment build.
 	rawIndex, err := fs.ReadFile(distFS, "index.html")
 	if err != nil {
 		slog.Error("failed to read embedded index.html", "error", err)
 		os.Exit(1)
 	}
-	baseHref := cfg.URLBase + "/"
 	baseJSON, _ := json.Marshal(cfg.URLBase)
-	injection := fmt.Sprintf(`<script>window.__BINDERY_BASE__=%s</script><base href="%s">`, baseJSON, baseHref)
-	indexHTML := []byte(strings.Replace(string(rawIndex), "</head>", injection+"</head>", 1))
+	// Expose the base via a same-origin EXTERNAL script rather than an inline
+	// <script>. The strict CSP (script-src 'self') blocks inline scripts, which
+	// would silently drop window.__BINDERY_BASE__ — harmless at root (the ""
+	// fallback is correct) but fatal under a path prefix.
+	baseScript := []byte(fmt.Sprintf("window.__BINDERY_BASE__=%s;", baseJSON))
+	indexHTML := []byte(injectBaseHTML(string(rawIndex), cfg.URLBase))
+
+	r.Get("/__bindery_base.js", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		_, _ = w.Write(baseScript)
+	})
 
 	fileServer := http.FileServer(http.FS(distFS))
 	r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
@@ -1043,7 +1056,13 @@ func main() {
 		// Redirect bare prefix (no trailing slash) to prefix/ so the SPA
 		// bootstrap and asset resolution work correctly.
 		outer.Get(cfg.URLBase, http.RedirectHandler(cfg.URLBase+"/", http.StatusMovedPermanently).ServeHTTP)
-		outer.Mount(cfg.URLBase, r)
+		// http.StripPrefix actually rewrites r.URL.Path before dispatch, so the
+		// inner router sees un-prefixed paths. chi.Mount only rewrites the
+		// routing-context path and leaves r.URL.Path prefixed, which breaks the
+		// static file handler and http.FileServer — they read r.URL.Path directly
+		// and would look up "<prefix>/assets/…" in the embedded FS, miss, and fall
+		// back to serving index.html (text/html) for every JS/CSS asset.
+		outer.Handle(cfg.URLBase+"/*", http.StripPrefix(cfg.URLBase, r))
 		handler = outer
 		slog.Info("serving under path prefix", "urlBase", cfg.URLBase)
 	}
@@ -1086,6 +1105,26 @@ func main() {
 		}
 		slog.Info("shutdown complete")
 	}
+}
+
+// injectBaseHTML rewrites the embedded index.html so the <base href> and the
+// __bindery_base.js bootstrap script are the FIRST children of <head>, ahead of
+// Vite's relative-path asset tags.
+//
+// Vite (base: './') emits the entry <script type="module"> and the stylesheet
+// <link> into <head> with relative "./assets/…" URLs. Per the HTML spec a <base>
+// element only governs relative URLs that appear AFTER it in document order, so
+// the base tag MUST precede those asset tags. Injecting it before </head> (i.e.
+// last) leaves the assets resolving against the document path: at /<base>/ that
+// coincidentally yields /<base>/assets/…, but a deep route like /<base>/author/10
+// resolves to /<base>/author/assets/… → 404 → the SPA fallback returns index.html
+// (text/html), the module load fails, and the page renders blank on reload.
+//
+// The __bindery_base.js classic script still executes before the deferred entry
+// module, so window.__BINDERY_BASE__ is set in time for the BrowserRouter basename.
+func injectBaseHTML(raw, urlBase string) string {
+	injection := fmt.Sprintf(`<base href="%s/"><script src="%s/__bindery_base.js"></script>`, urlBase, urlBase)
+	return strings.Replace(raw, "<head>", "<head>"+injection, 1)
 }
 
 func googleBooksAPIKey(ctx context.Context, settings *db.SettingsRepo) string {
