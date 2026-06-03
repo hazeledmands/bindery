@@ -6,6 +6,11 @@ All notable changes to Bindery are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Docs
+
+- **Added `docs/QUICKSTART.md`** — an in-repo zero-to-first-download walkthrough (run → first login → indexer → download client → author → grab) with the SSRF `localhost`-rejection gotcha and protocol-matching/category troubleshooting callouts. Linked from the README documentation table.
+
+- **Fixed doc/code drift:** Unraid template Overview now says MIT (was "Apache 2.0"); `BINDERY_AUDIOBOOK_DOWNLOAD_DIR` added to the README env table; `BINDERY_TRUSTED_PROXY` and `BINDERY_TELEMETRY_DISABLED` added to the DEPLOYMENT env-var reference; the broken `#reverse-proxy` anchor in `DEPLOYMENT.md` now points at the Reverse-proxy wiki; README "full reference" wording corrected to point OIDC/forward-auth vars at `docs/auth-oidc.md` / `docs/auth-proxy.md`.
 ### Changed
 
 - **A page crash no longer blanks the whole app** — page render errors are now caught by a route-scoped error boundary that shows the error inline while keeping the nav/header usable, and clears itself when you navigate to another page (no reload needed). Previously the only boundary was the root one, whose full-screen dark-mode fallback took over the entire viewport and required a manual reload to recover.
