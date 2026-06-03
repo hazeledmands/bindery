@@ -6,6 +6,9 @@ All notable changes to Bindery are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **First-run onboarding guidance on empty Authors/Books pages** — when a brand-new instance has no authors/books *and* no indexers or download clients configured, the empty state now shows a short "Getting started" block linking to **Settings → Indexers** and **Settings → Download Clients**, explaining they must be configured first (without them, adding an author or searching silently does nothing). The block only appears when both are empty and falls back to the normal empty state if the checks fail. Settings tabs are now deep-linkable via `?tab=indexers` / `?tab=clients`.
 ### Docs
 
 - **Added `docs/QUICKSTART.md`** — an in-repo zero-to-first-download walkthrough (run → first login → indexer → download client → author → grab) with the SSRF `localhost`-rejection gotcha and protocol-matching/category troubleshooting callouts. Linked from the README documentation table.
