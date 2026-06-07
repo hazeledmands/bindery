@@ -241,7 +241,6 @@ jobs:
         with:
           images: |
             ghcr.io/${{ github.repository }}
-            ${{ env.DOCKERHUB_TOKEN != '' && 'vavallee/bindery' || '' }}
           tags: |
             type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
